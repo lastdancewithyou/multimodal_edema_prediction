@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torchxrayvision as xrv
 from transformers import AutoModel
 
-from model.encoder import TransformerTSEncoder, DemographicEncoder, TSMixerEncoder
+from models.encoder import TransformerTSEncoder, DemographicEncoder, TSMixerEncoder
 from utils import timer
 
 

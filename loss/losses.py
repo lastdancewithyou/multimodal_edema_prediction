@@ -12,7 +12,7 @@ from utils import timer
 from loss.target_generation import generate_optimal_target
 
 
-OUTPUT_DIR = "/home/DAHS1/gangmin/my_research/src/output/"
+OUTPUT_DIR = "/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/output/"
 
 
 class MultiModalLoss(nn.Module):

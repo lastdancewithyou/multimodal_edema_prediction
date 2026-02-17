@@ -24,11 +24,11 @@ logging.getLogger("torch.distributed.distributed_c10d").setLevel(logging.ERROR)
 from training.run import parse_arguments
 from training.data_processing import get_dataloaders
 from training.engine import train_batch
-from training.evaluator import validate, validate_stage1, test, plot_umap_2d
-from model.main_architecture import MultiModalEncoder, MultiModalContrastiveModel, MultiModalClassificationModel
+from training.evaluator import validate, test, plot_umap_2d, validate_stage1
+from models.main_architecture import MultiModalEncoder, MultiModalContrastiveModel, MultiModalClassificationModel
 from loss.losses import MultiModalLoss
 from loss.target_metrics import visualize_target_supcon
-from utils import stage2_Earlystopping, timer, stage1_earlystopping, plot_latent_time_attention, Earlystopping
+from utils import stage2_Earlystopping, timer, plot_latent_time_attention, Earlystopping, stage1_earlystopping
 
 
 ##################################################################################################

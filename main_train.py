@@ -6,13 +6,11 @@ os.environ["TORCH_DISTRIBUTED_TIMEOUT"] = "1800"
 
 import time
 import pandas as pd
-import torch
 import torch.distributed as dist
 
-from my_research.src.train.trainer import train_multimodal_model
-from train.run import parse_arguments
-from core.utils import set_seed
-from accelerate import Accelerator
+from training.trainer import train_multimodal_model
+from training.run import parse_arguments
+from utils import set_seed
 
 root_dir = '/home/DAHS1/gangmin/my_research/'
 
@@ -23,8 +21,7 @@ def load_preprocessed_data():
     # ts_df = pd.read_feather(root_dir + 'src/test/final_ts_dataset_1228.ftr') # Min-max scaling
     ts_df = pd.read_feather(root_dir + 'src/test/final_ts_dataset_2026_0126.ftr') # Feature-specific scaling
 
-    img_df = pd.read_feather(root_dir + 'src/test/total_cxr_df_5days_20260128.ftr') # New
-    # img_df = pd.read_parquet(root_dir + 'src/test/total_cxr_df_5days_0917.parquet')
+    img_df = pd.read_feather(root_dir + 'src/test/total_cxr_df_5days_20260128.ftr')
     text_df = pd.read_feather(root_dir + 'src/test/final_text_df_20260128.ftr')
     return ts_df, img_df, text_df, demo_df
 
@@ -53,7 +50,7 @@ def main():
     finally:
         elapsed = time.time() - start_time
         h, m, s = int(elapsed // 3600), int((elapsed % 3600) // 60), int(elapsed % 60)
-        print(f"\n⏱ Total time spent on the experiment: {h}h {m}m {s}s)")
+        print(f"\nTotal time spent on the experiment: {h}h {m}m {s}s)")
 
 if __name__ == "__main__":
     main()

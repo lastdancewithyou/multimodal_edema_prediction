@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.distributed as dist
 
-from train.run import parse_arguments
+from training.run import parse_arguments
 
 # TIMER 전역 제어
 TIME_ENABLED = False # True: 작동 / False: 미작동

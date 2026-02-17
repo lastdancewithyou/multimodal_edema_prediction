@@ -6,7 +6,7 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="TSC_adoption", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="11", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="12", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
 
     # Modality Selection
@@ -44,7 +44,7 @@ def parse_arguments():
     parser.add_argument('--target_supcon_weight', type=float, default=1.0, help='Target_SupCon loss weight')
     parser.add_argument('--target_supcon_temperature', type=float, default=0.07, help='Temperature for Target_SupCon KCL')
     parser.add_argument('--target_supcon_queue_size', type=int, default=8192, help='Queue size for Target_SupCon')
-    parser.add_argument('--target_supcon_K', type=int, default=9, help='Max number of positives per anchor in Target_SupCon') # 0으로 설정 시 지도대조학습과 동일함.
+    parser.add_argument('--target_supcon_K', type=int, default=6, help='Max number of positives per anchor in Target_SupCon') # 0으로 설정 시 지도대조학습과 동일함.
     parser.add_argument('--target_supcon_tw', type=float, default=0.5, help='Weight for TSC loss in Target_SupCon')
     parser.add_argument('--target_supcon_momentum', type=float, default=0.9, help='Momentum for centroid EMA in Target_SupCon')
     parser.add_argument('--target_path', type=str, default=None, help='Path to optimal target .npy file for Target_SupCon')
@@ -100,11 +100,11 @@ def parse_arguments():
 
     ##################################################################################################################################
     # Two-Stage Training
-    parser.add_argument('--use_two_stage', type=bool, default=False, help='Use two-stage training: contrastive pretraining + classification')
+    parser.add_argument('--use_two_stage', type=bool, default=True, help='Use two-stage training: contrastive pretraining + classification')
     parser.add_argument('--stage1_only', type=bool, default=False, help='Run only stage 1 (contrastive pretraining)')
-    parser.add_argument('--stage2_only', type=bool, default=True, help='Run only stage 2 (classification from pretrained)')
+    parser.add_argument('--stage2_only', type=bool, default=False, help='Run only stage 2 (classification from pretrained)')
     parser.add_argument('--stage1_epochs', type=int, default=40, help='Number of epochs for stage 1 (contrastive pretraining)')
-    parser.add_argument('--stage2_epochs', type=int, default=40, help='Number of epochs for stage 2 (classification)')
+    parser.add_argument('--stage2_epochs', type=int, default=30, help='Number of epochs for stage 2 (classification)')
     parser.add_argument('--stage1_lr', type=float, default=1e-3, help='Learning rate for stage 1')
     parser.add_argument('--stage2_lr', type=float, default=5e-5, help='Learning rate for stage 2')
     parser.add_argument('--save_stage1_model', type=bool, default=True, help='Save stage 1 model checkpoint')
@@ -125,7 +125,7 @@ def parse_arguments():
     args = parser.parse_args([])
 
     if args.use_two_stage:
-        args.wandb_run_name = f"{args.experiment_id}: [GPU 1] LinearProbing_check/Img_Text_Tuning/Reduce_open_layers"
+        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] Optimal_hyperparam_search/Img_Text_Tuning/Reduce_open_layers"
     else:
         args.wandb_run_name = f"{args.experiment_id}: [GPU 0] Pretrained_model_stage2_check/20_epoch_Stage1"
 
@@ -145,7 +145,7 @@ def parse_arguments():
 
     # Stage 2 단독 학습시에만 실제 저장된 모델 경로로 변경
     if args.stage2_only:
-        actual_stage1_path = f'/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/output/stage1_models/experiment_{args.experiment_id}_stage1.pth'
+        actual_stage1_path = f'./output/stage1_models/experiment_{args.experiment_id}_stage1.pth'
         if os.path.exists(actual_stage1_path):
             args.stage1_model_path = actual_stage1_path
             print(f"✅ [Stage 2 Only] Using existing Stage 1 model: {actual_stage1_path}")

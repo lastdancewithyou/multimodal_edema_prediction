@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from utils import timer
+from training.engine import prepare_multiview_inputs_v2
 
 
 def validate(args, model, dataloader, loss_module, device, accelerator, dataset, epoch=None, disable_cxr=False, disable_txt=False, max_length=256):
