@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Output / checkpoints
+output/
+wandb/
+*.pth
+*.pt
+*.ckpt
+
+# Data
+*.csv
+*.json
+*.pkl
+*.parquet
+*.feather
+*.ftr
+*.npy
+*.npz
+
+# Logs
+*.log
+log/
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# Env
+.env
