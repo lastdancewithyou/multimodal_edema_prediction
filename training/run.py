@@ -6,7 +6,7 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="TSC_adoption", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="12", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="83", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
 
     # Modality Selection

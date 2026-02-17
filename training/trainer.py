@@ -30,6 +30,7 @@ from loss.losses import MultiModalLoss
 from loss.target_metrics import visualize_target_supcon
 from utils import stage2_Earlystopping, timer, plot_latent_time_attention, Earlystopping, stage1_earlystopping
 
+print("Error check 2")
 
 ##################################################################################################
 # Model Training Control Center
