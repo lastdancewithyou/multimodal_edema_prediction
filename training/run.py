@@ -5,8 +5,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
 
     # wandb
-    parser.add_argument('--project_name', type=str, default="TSC_adoption", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="83", help="Experiment ID")
+    parser.add_argument('--project_name', type=str, default="TSC_analysis", help="Wandb project name")
+    parser.add_argument('--experiment_id', type=str, default="1", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
 
     # Modality Selection
@@ -32,7 +32,7 @@ def parse_arguments():
 
     # Augmentation
     parser.add_argument('--aug_noise_type', type=str, default='gaussian', choices=['gaussian', 'uniform', 'poisson', 'laplace', 'dropout'])
-    parser.add_argument('--aug_epsilon', type=float, default=0.5, help='Noise strength for gaussian/uniform/etc augmentation (higher = more diverse views)')
+    parser.add_argument('--aug_epsilon', type=float, default=0.2, help='Noise strength for gaussian/uniform/etc augmentation (higher = more diverse views)')
 
     # Supervised Contrastive Loss (Basic SupCon) - 현재 미사용
     parser.add_argument('--use_supcon', type=bool, default=False, help='Enable supervised contrastive loss')
@@ -54,9 +54,10 @@ def parse_arguments():
     parser.add_argument('--use_ce', type=bool, default=False, help='Enable cross-entropy loss for classification')
     parser.add_argument('--ce_weight', type=float, default=1.0, help='Cross-entropy loss weight')
 
-    # learning parameter
+    # Single-Stage Training
+    # parser.add_argument('--single_stage_epochs', type=int, default=50, help='Number of epochs for single-stage training')
     # parser.add_argument('--single_learning_rate', type=float, default=1e-4, help='Learning rate at single training stage')
-    parser.add_argument('--patience', type=int, default=5, help='Early stopping patience') # Stage 1 early stopping patience
+    # parser.add_argument('--single_patience', type=int, default=5, help='Early stopping patience') # Stage 1 early stopping patience
     
     # Gradient Accumulation for Multi-GPU
     # parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help='Gradient accumulation steps - 멀티 GPU 안정성 향상')
@@ -115,17 +116,14 @@ def parse_arguments():
                         )
 
     # Stage 2 Training Strategy: Linear Probing vs Fine-tuning
-    parser.add_argument('--freeze_encoder_stage2', type=bool, default=True, help='Freeze encoder in stage 2 (Linear Probing). If not set, fine-tune encoder.')
+    parser.add_argument('--freeze_encoder_stage2', type=bool, default=False, help='Freeze encoder in stage 2 (Linear Probing). If not set, fine-tune encoder.')
     parser.add_argument('--stage2_patience', type=int, default=5, help='Early stopping patience for stage 2')
-
-    # Single-Stage Training
-    parser.add_argument('--single_stage_epochs', type=int, default=50, help='Number of epochs for single-stage training')
     ##################################################################################################################################
 
     args = parser.parse_args([])
 
     if args.use_two_stage:
-        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] Optimal_hyperparam_search/Img_Text_Tuning/Reduce_open_layers"
+        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] Optimal_hyperparam_search/Img_Text_Tuning/Fine-tuning"
     else:
         args.wandb_run_name = f"{args.experiment_id}: [GPU 0] Pretrained_model_stage2_check/20_epoch_Stage1"
 
