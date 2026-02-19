@@ -119,12 +119,12 @@ def train_representation(ts_df, img_df, text_df, demo_df, args):
         print(f"   Mixed Precision: bf16")
         print(f"{'='*80}\n")
 
-        wandb.init(
-            project=args.project_name,
-            name=f"{args.wandb_run_name}_Stage1",
-            config=vars(args),
-            tags=["stage1", "representation_learning", "TSC"]
-        )
+        # wandb.init(
+        #     project=args.project_name,
+        #     name=f"{args.wandb_run_name}_Stage1",
+        #     config=vars(args),
+        #     tags=["stage1", "representation_learning", "TSC"]
+        # )
 
     # DataLoader
     with timer("Dataset 최종 처리 완료"):
@@ -240,6 +240,8 @@ def train_representation(ts_df, img_df, text_df, demo_df, args):
         target_supcon_count = torch.zeros(1, device=device, dtype=torch.float32)
         kcl_sum = torch.zeros(1, device=device, dtype=torch.float32)
         tsc_sum = torch.zeros(1, device=device, dtype=torch.float32)
+        softmax_prob_sum = 0.0
+        softmax_prob_count = 0
 
         optimizer.zero_grad(set_to_none=True)
         train_sampler.set_epoch(epoch)
@@ -275,7 +277,9 @@ def train_representation(ts_df, img_df, text_df, demo_df, args):
                 optimizer.zero_grad(set_to_none=True)
 
             window_ct_local = torch.as_tensor(batch_counts['window_count'], device=device, dtype=torch.float32)
-            
+            softmax_prob_sum += batch_counts['softmax_self_prob']
+            softmax_prob_count += 1
+
             scl_sum += torch.as_tensor(batch_scl, device=device, dtype=torch.float32) * window_ct_local
             scl_count += window_ct_local
             target_supcon_sum += torch.as_tensor(batch_target_supcon, device=device, dtype=torch.float32) * window_ct_local
@@ -307,29 +311,49 @@ def train_representation(ts_df, img_df, text_df, demo_df, args):
 
         scheduler.step()
 
+        softmax_prob_avg = softmax_prob_sum / max(softmax_prob_count, 1)
         accelerator.print(
             f"✅ Epoch {epoch+1} - Train Stage1 Loss: {avg_stage1_loss:.4f}\n"
-            f" Target SupCon: {target_supcon_avg:.4f}, KCL: {kcl_avg:.4f}, TSC: {tsc_avg:.4f}"
-            # f"SupCon: {scl_avg:.4f}"
+            f"   Target SupCon: {target_supcon_avg:.4f}, KCL: {kcl_avg:.4f}, TSC: {tsc_avg:.4f}\n"
+            f"   Softmax self-prob (pos 0): {softmax_prob_avg:.4f}  "
+            f"[이상적: queue 크기 역수 근방 ({1/args.target_supcon_queue_size:.5f})]"
         )
 
         gc.collect()
         torch.cuda.empty_cache()
 
-        # ==================== Target Effect Visualization ====================
+        # ==================== Embedding Visualization ====================
         if accelerator.is_main_process and args.use_target_supcon:
-            # 전체 epoch의 절반은 KCL 단독 작동을 통한 warmup
             tsc_activated = (epoch >= args.stage1_epochs // 2)
             tsc_first_epoch = (epoch == args.stage1_epochs // 2)
+            kcl_only = not tsc_activated
 
-            # 5 epoch마다 시각화하며 처음과 마지막 epoch에도 시각화함.
-            should_visualize = tsc_activated and (tsc_first_epoch or (epoch + 1) % 5 == 0 or epoch == args.stage1_epochs - 1)
+            # KCL 구간: 5 epoch마다 + 마지막 KCL epoch
+            kcl_last_epoch = (epoch == args.stage1_epochs // 2 - 1)
+            should_visualize_kcl = kcl_only and ((epoch + 1) % 5 == 0 or kcl_last_epoch)
 
-            if should_visualize:
-                vis_save_path = f'{args.umap_save_dir}/stage1_target_supcon_epoch{epoch+1}.png'
-                print(f"🎨 Generating Target Effect Visualization (Epoch {epoch+1})")
+            # TSC 구간: 첫 epoch + 5 epoch마다 + 마지막 epoch
+            should_visualize_tsc = tsc_activated and (tsc_first_epoch or (epoch + 1) % 5 == 0 or epoch == args.stage1_epochs - 1)
+
+            if should_visualize_kcl:
+                vis_save_path = f'{args.umap_save_dir}/stage1_kcl_only_epoch{epoch+1}.png'
+                print(f"🎨 Generating KCL-only Visualization (Epoch {epoch+1})")
                 os.makedirs(os.path.dirname(vis_save_path), exist_ok=True)
+                visualize_target_supcon(
+                    model=model,
+                    dataloader=train_loader,
+                    loss_module=loss_module,
+                    device=accelerator.device,
+                    save_path=vis_save_path,
+                    max_samples=3000,
+                    epoch=epoch+1,
+                    use_target=False,
+                )
 
+            if should_visualize_tsc:
+                vis_save_path = f'{args.umap_save_dir}/stage1_target_supcon_epoch{epoch+1}.png'
+                print(f"🎨 Generating TSC Visualization (Epoch {epoch+1})")
+                os.makedirs(os.path.dirname(vis_save_path), exist_ok=True)
                 visualize_target_supcon(
                     model=model,
                     dataloader=train_loader,
@@ -340,13 +364,13 @@ def train_representation(ts_df, img_df, text_df, demo_df, args):
                     epoch=epoch+1
                 )
         
-            wandb.log({
-                "epoch": epoch + 1,
-                "train_loss": avg_stage1_loss,
-                "target_supcon_avg":target_supcon_avg,
-                "kcl_avg": kcl_avg,
-                "tsc_avg": tsc_avg
-            })
+            # wandb.log({
+            #     "epoch": epoch + 1,
+            #     "train_loss": avg_stage1_loss,
+            #     "target_supcon_avg":target_supcon_avg,
+            #     "kcl_avg": kcl_avg,
+            #     "tsc_avg": tsc_avg
+            # })
 
     os.makedirs(os.path.dirname(args.stage1_model_path), exist_ok=True)
 

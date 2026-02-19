@@ -50,7 +50,7 @@ def main():
     finally:
         elapsed = time.time() - start_time
         h, m, s = int(elapsed // 3600), int((elapsed % 3600) // 60), int(elapsed % 60)
-        print(f"\nTotal time spent on the experiment: {h}h {m}m {s}s)")
+        print(f"\nTotal time spent on the experiment: {h}h {m}m {s}s")
 
 if __name__ == "__main__":
     main()

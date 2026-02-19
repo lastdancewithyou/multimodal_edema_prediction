@@ -1,5 +1,6 @@
-#!/bin/bash
 set -e
+
+# cd my_research/clinical_multimodal_learning/
 
 # GPU 2개
 # accelerate launch \

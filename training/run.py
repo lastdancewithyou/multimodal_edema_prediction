@@ -6,7 +6,7 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="TSC_analysis", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="1", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="5", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
 
     # Modality Selection
@@ -30,9 +30,9 @@ def parse_arguments():
     parser.add_argument('--window_size', type=int, default=24, help='Sliding window size')
     parser.add_argument('--stride', type=int, default=1, help='Sliding window moving stride')
 
-    # Augmentation
-    parser.add_argument('--aug_noise_type', type=str, default='gaussian', choices=['gaussian', 'uniform', 'poisson', 'laplace', 'dropout'])
-    parser.add_argument('--aug_epsilon', type=float, default=0.2, help='Noise strength for gaussian/uniform/etc augmentation (higher = more diverse views)')
+    # Augmentation (Gaussian noise on fused window embeddings)
+    parser.add_argument('--aug_noise_type', type=str, default='gaussian', help='Noise type for augmentation: gaussian | uniform | laplace')
+    parser.add_argument('--aug_epsilon', type=float, default=0.2, help='Noise scale for augmentation (controls cosine similarity between views)')
 
     # Supervised Contrastive Loss (Basic SupCon) - 현재 미사용
     parser.add_argument('--use_supcon', type=bool, default=False, help='Enable supervised contrastive loss')
@@ -42,11 +42,11 @@ def parse_arguments():
     # Target-based Supervised Contrastive Loss
     parser.add_argument('--use_target_supcon', type=bool, default=True, help='Enable Target_SupCon loss (KCL + TSC)')
     parser.add_argument('--target_supcon_weight', type=float, default=1.0, help='Target_SupCon loss weight')
-    parser.add_argument('--target_supcon_temperature', type=float, default=0.07, help='Temperature for Target_SupCon KCL')
-    parser.add_argument('--target_supcon_queue_size', type=int, default=8192, help='Queue size for Target_SupCon')
+    parser.add_argument('--target_supcon_temperature', type=float, default=0.2, help='Temperature for Target_SupCon KCL')
+    parser.add_argument('--target_supcon_queue_size', type=int, default=2048, help='Queue size for Target_SupCon')
     parser.add_argument('--target_supcon_K', type=int, default=6, help='Max number of positives per anchor in Target_SupCon') # 0으로 설정 시 지도대조학습과 동일함.
     parser.add_argument('--target_supcon_tw', type=float, default=0.5, help='Weight for TSC loss in Target_SupCon')
-    parser.add_argument('--target_supcon_momentum', type=float, default=0.9, help='Momentum for centroid EMA in Target_SupCon')
+    parser.add_argument('--target_supcon_momentum', type=float, default=0.7, help='Momentum for centroid EMA in Target_SupCon')
     parser.add_argument('--target_path', type=str, default=None, help='Path to optimal target .npy file for Target_SupCon')
     parser.add_argument('--target_supcon_tr', type=int, default=1, help="Target vector")
 
@@ -101,8 +101,8 @@ def parse_arguments():
 
     ##################################################################################################################################
     # Two-Stage Training
-    parser.add_argument('--use_two_stage', type=bool, default=True, help='Use two-stage training: contrastive pretraining + classification')
-    parser.add_argument('--stage1_only', type=bool, default=False, help='Run only stage 1 (contrastive pretraining)')
+    parser.add_argument('--use_two_stage', type=bool, default=False, help='Use two-stage training: contrastive pretraining + classification')
+    parser.add_argument('--stage1_only', type=bool, default=True, help='Run only stage 1 (contrastive pretraining)')
     parser.add_argument('--stage2_only', type=bool, default=False, help='Run only stage 2 (classification from pretrained)')
     parser.add_argument('--stage1_epochs', type=int, default=40, help='Number of epochs for stage 1 (contrastive pretraining)')
     parser.add_argument('--stage2_epochs', type=int, default=30, help='Number of epochs for stage 2 (classification)')
@@ -123,9 +123,9 @@ def parse_arguments():
     args = parser.parse_args([])
 
     if args.use_two_stage:
-        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] Optimal_hyperparam_search/Img_Text_Tuning/Fine-tuning"
+        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] temp=0.7/Optimal_hyperparam_search/Img_Text_Tuning/Fine-tuning"
     else:
-        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] Pretrained_model_stage2_check/20_epoch_Stage1"
+        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] TSC_analysis_1/Improve_stage1_representation"
 
     # ===================================================================================================
 

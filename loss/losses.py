@@ -152,11 +152,13 @@ class MultiModalLoss(nn.Module):
                 target_supcon_loss = loss_dict["loss"]  # KCL + TSC combined
                 loss_kcl = loss_dict["loss_kcl"]        # KCL only (for logging)
                 loss_tsc = loss_dict["loss_tsc"]        # TSC only (for logging)
+                softmax_self_prob = loss_dict["softmax_self_prob"]  # self-positive 포화도
 
         else:
             target_supcon_loss = torch.tensor(0.0, device=device, requires_grad=False)
             loss_kcl = torch.tensor(0.0, device=device, requires_grad=False)
             loss_tsc = torch.tensor(0.0, device=device, requires_grad=False)
+            softmax_self_prob = 0.0
 
         # -------------------- NaN Detection --------------------
         if torch.isnan(ce_loss) or torch.isinf(ce_loss):
@@ -175,7 +177,7 @@ class MultiModalLoss(nn.Module):
             target_supcon_weight * target_supcon_loss  # KCL + TSC combined
         )
 
-        return total_loss, ce_loss, scl_loss, target_supcon_loss, loss_kcl, loss_tsc
+        return total_loss, ce_loss, scl_loss, target_supcon_loss, loss_kcl, loss_tsc, softmax_self_prob
     
     # validation & test
     def inference(self, classification_input, logits, labels, window_mask):
@@ -213,7 +215,7 @@ class TSCwithQueue(nn.Module):
     def forward(self, v, v_tilde, y, update_queue=True, current_epoch=None, total_epochs=None):
         queue_v, queue_labels = self.queue.get()
 
-        logits, _, q, loss, loss_class, loss_target = self.kcl(
+        logits, _, q, loss, loss_class, loss_target, softmax_self_prob = self.kcl(
             v=v,
             v_tilde=v_tilde,
             y=y,
@@ -233,6 +235,7 @@ class TSCwithQueue(nn.Module):
             "loss_tsc": loss_target,
             "logits": logits,
             "embeddings": q,
+            "softmax_self_prob": softmax_self_prob,
         }
 
 
@@ -269,6 +272,12 @@ class TSCQueue(nn.Module):
         B = z.size(0)                     # 모델에 들어온 배치 크기
         ptr = int(self.queue_ptr.item())  # 현재 queue에 쓰기 시작할 위치
         Q = self.queue_size               # 전체 queue 크기
+
+        # B >= Q인 경우: 배치가 queue 전체보다 크므로 최신 Q개만 사용 (FIFO)
+        if B >= Q:
+            z = z[-Q:]
+            labels = labels[-Q:]
+            B = Q
 
         # circular enqueue
         if ptr + B <= Q:
@@ -416,13 +425,64 @@ class KCL(nn.Module):
         l_pos = torch.einsum("bd,bd->b", q, k).unsqueeze(1) # [B, 1] - anchor와 self positive 간의 유사도 (logit 0번으로 고정함)
         l_neg_queue = torch.matmul(q, qneg.t())             # [B, K] - anchor q_i와 queue에 저장된 모든 과거 임베딩과의 유사도
 
-        # 증강을 통한 임베딩의 변화 측정함.
-        if not hasattr(self, '_debug_printed'):
-            print(f"\n[KCL DEBUG] Positive pair similarity (l_pos):")
-            print(f"  Mean: {l_pos.mean().item():.4f}")
-            print(f"  Min: {l_pos.min().item():.4f}")
-            print(f"  Max: {l_pos.max().item():.4f}")
-            self._debug_printed = True
+        # ==================== KCL 진단 로그 (매 forward) ====================
+        if not hasattr(self, '_kcl_log_step'):
+            self._kcl_log_step = 0
+        self._kcl_log_step += 1
+
+        log_interval = 50  # 50 step마다 출력
+        if self._kcl_log_step % log_interval == 1:
+            with torch.no_grad():
+                # (1) Augmentation 품질: self-positive similarity
+                pos_sim = l_pos.squeeze(1)  # [B]
+
+                # (2) Queue 내 같은/다른 클래스 similarity
+                y_flat = y.view(-1)  # [B]
+                qlab_flat = qlab     # [Q]
+                valid_queue = (qlab_flat != -100)  # -100은 미초기화 슬롯
+                queue_fill = valid_queue.sum().item()
+                queue_total = qlab_flat.numel()
+
+                # 클래스별 positive 개수 (queue 기준)
+                pos_counts = []
+                neg_sims_list = []
+                pos_sims_list = []
+                for cls in torch.unique(y_flat):
+                    cls_int = int(cls.item())
+                    if cls_int < 0:
+                        continue
+                    anchor_sel = (y_flat == cls_int)
+                    queue_pos_sel = (qlab_flat == cls_int) & valid_queue
+                    queue_neg_sel = (qlab_flat != cls_int) & valid_queue
+
+                    n_pos = queue_pos_sel.sum().item()
+                    pos_counts.append((cls_int, anchor_sel.sum().item(), n_pos))
+
+                    if anchor_sel.any() and queue_pos_sel.any():
+                        sim_pos = l_neg_queue[anchor_sel][:, queue_pos_sel]
+                        pos_sims_list.append(sim_pos.mean().item())
+                    if anchor_sel.any() and queue_neg_sel.any():
+                        sim_neg = l_neg_queue[anchor_sel][:, queue_neg_sel]
+                        neg_sims_list.append(sim_neg.mean().item())
+
+                pos_neg_gap = (
+                    (sum(pos_sims_list) / len(pos_sims_list)) -
+                    (sum(neg_sims_list) / len(neg_sims_list))
+                ) if pos_sims_list and neg_sims_list else float('nan')
+
+                print(f"\n{'='*70}")
+                print(f"[KCL LOG | step {self._kcl_log_step}] use_target={use_target}")
+                print(f"  Queue: {queue_fill}/{queue_total} filled ({100*queue_fill/queue_total:.1f}%)")
+                print(f"  Self-positive sim (aug quality):  mean={pos_sim.mean():.4f}  min={pos_sim.min():.4f}  max={pos_sim.max():.4f}")
+                if pos_sims_list:
+                    print(f"  Queue same-class sim (pos):       mean={sum(pos_sims_list)/len(pos_sims_list):.4f}")
+                if neg_sims_list:
+                    print(f"  Queue diff-class sim (neg):       mean={sum(neg_sims_list)/len(neg_sims_list):.4f}")
+                print(f"  Pos-Neg gap:                       {pos_neg_gap:.4f}  (클수록 좋음)")
+                print(f"  Class-wise positive count in queue:")
+                for cls_int, n_anchor, n_pos in pos_counts:
+                    print(f"    Class {cls_int}: anchors={n_anchor}, queue_positives={n_pos}")
+                print(f"{'='*70}\n")
 
         if use_target:
             tgt = F.normalize(self.optimal_target.to(device), dim=1)  # [Tn, D]    - [n_cls, D]짜리 원형 target을 각 클래스마다 tr번 repeat해서 만듦.
@@ -595,7 +655,11 @@ class KCL(nn.Module):
         loss_target = loss_target * self.tw
         loss = loss_class + loss_target
 
-        return logits, labels_ce, q, loss, loss_class, loss_target
+        # softmax 포화도 모니터링: self-positive(pos 0)가 softmax 확률 중 차지하는 비율
+        with torch.no_grad():
+            softmax_self_prob = F.softmax(logits, dim=1)[:, 0].mean().item()
+
+        return logits, labels_ce, q, loss, loss_class, loss_target, softmax_self_prob
 
 ################################################################################################################################
 ################################################################################################################################

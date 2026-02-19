@@ -77,7 +77,7 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
             # window_time_indices = torch.arange(W, device=device).unsqueeze(0).expand(B, W)
 
             with timer("Main loss 연산", accelerator):
-                total_batch_loss, ce_loss_t, scl_loss_t, target_supcon_t, loss_kcl_t, loss_tsc_t = loss_module(
+                total_batch_loss, ce_loss_t, scl_loss_t, target_supcon_t, loss_kcl_t, loss_tsc_t, softmax_self_prob_t = loss_module(
                     classification_input=classification_input,
                     seq_valid_mask=seq_valid_mask,
                     logits=logits,
@@ -122,7 +122,8 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
 
     batch_counts = {
         'ce_count': ce_count,
-        'window_count': window_count
+        'window_count': window_count,
+        'softmax_self_prob': softmax_self_prob_t,
     }
 
     return total_batch_loss, batch_ce, batch_scl, batch_target_supcon, batch_kcl, batch_tsc, batch_outputs, batch_counts
