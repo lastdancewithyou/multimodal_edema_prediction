@@ -316,7 +316,6 @@ def train_representation(ts_df, img_df, text_df, demo_df, args):
             f"✅ Epoch {epoch+1} - Train Stage1 Loss: {avg_stage1_loss:.4f}\n"
             f"   Target SupCon: {target_supcon_avg:.4f}, KCL: {kcl_avg:.4f}, TSC: {tsc_avg:.4f}\n"
             f"   Softmax self-prob (pos 0): {softmax_prob_avg:.4f}  "
-            f"[이상적: queue 크기 역수 근방 ({1/args.target_supcon_queue_size:.5f})]"
         )
 
         gc.collect()
@@ -345,7 +344,7 @@ def train_representation(ts_df, img_df, text_df, demo_df, args):
                     loss_module=loss_module,
                     device=accelerator.device,
                     save_path=vis_save_path,
-                    max_samples=3000,
+                    max_samples=5000,
                     epoch=epoch+1,
                     use_target=False,
                 )

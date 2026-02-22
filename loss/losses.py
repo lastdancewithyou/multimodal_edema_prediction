@@ -9,7 +9,6 @@ import torch.nn.functional as F
 
 from training.run import parse_arguments
 from utils import timer
-from loss.target_generation import generate_optimal_target
 
 
 OUTPUT_DIR = "/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/output/"
@@ -443,6 +442,13 @@ class KCL(nn.Module):
                 queue_fill = valid_queue.sum().item()
                 queue_total = qlab_flat.numel()
 
+                # # 🔍 Queue embedding norm 체크 (normalize 제대로 되었는지)
+                # if valid_queue.any():
+                #     queue_norms = qneg[valid_queue].norm(dim=1)
+                # else:
+                #     queue_norms = None
+                # anchor_norms = q.norm(dim=1)
+
                 # 클래스별 positive 개수 (queue 기준)
                 pos_counts = []
                 neg_sims_list = []
@@ -473,6 +479,12 @@ class KCL(nn.Module):
                 print(f"\n{'='*70}")
                 print(f"[KCL LOG | step {self._kcl_log_step}] use_target={use_target}")
                 print(f"  Queue: {queue_fill}/{queue_total} filled ({100*queue_fill/queue_total:.1f}%)")
+                # print(f"  🔍 Normalization Check:")
+                # print(f"     Anchor norms:  mean={anchor_norms.mean():.4f}  min={anchor_norms.min():.4f}  max={anchor_norms.max():.4f}")
+                # if queue_norms is not None:
+                #     print(f"     Queue norms:   mean={queue_norms.mean():.4f}  min={queue_norms.min():.4f}  max={queue_norms.max():.4f}")
+                # else:
+                #     print(f"     Queue norms:   N/A (queue empty)")
                 print(f"  Self-positive sim (aug quality):  mean={pos_sim.mean():.4f}  min={pos_sim.min():.4f}  max={pos_sim.max():.4f}")
                 if pos_sims_list:
                     print(f"  Queue same-class sim (pos):       mean={sum(pos_sims_list)/len(pos_sims_list):.4f}")
@@ -554,18 +566,23 @@ class KCL(nn.Module):
                 dist = torch.matmul(cent, otu).detach().float().cpu().numpy()  # [n_cls, n_cls] (similarity) - cast to float32 before numpy
                 row_ind, col_ind = linear_sum_assignment(-dist)                # maximize similarity
 
-                if not hasattr(self, '_hungarian_logged') or not self._hungarian_logged:
-                    print(f"\n{'='*80}")
-                    print(f"🔍 Hungarian Matching Result:")
-                    print(f"   Centroid-Target Similarity Matrix:")
-                    for i in range(self.n_cls):
-                        print(f"   Centroid {i}: {dist[i]}")
-                    print(f"   Assignment: {list(zip(row_ind, col_ind))}")
-                    for cls, tgt_idx in zip(row_ind, col_ind):
-                        print(f"   Class {cls} → Target {tgt_idx} (similarity: {dist[cls, tgt_idx]:.4f})")
-                    print(f"   Centroid norms: {cent.norm(dim=1).cpu().numpy()}")
-                    print(f"{'='*80}\n")
-                    self._hungarian_logged = True
+                # 🔍 ALWAYS PRINT Hungarian Matching (디버깅용)
+                print(f"\n{'='*80}")
+                print(f"🔍 Hungarian Matching Result (Step {self._kcl_log_step}):")
+                print(f"   Centroid-Target Similarity Matrix (값이 높을수록 유사):")
+                for i in range(self.n_cls):
+                    print(f"   Centroid {i}: {dist[i]}")
+                print(f"   Assignment: {list(zip(row_ind, col_ind))}")
+                for cls, tgt_idx in zip(row_ind, col_ind):
+                    print(f"   Class {cls} → Target {tgt_idx} (similarity: {dist[cls, tgt_idx]:.4f})")
+                print(f"   Centroid norms: {cent.norm(dim=1).cpu().numpy()}")
+
+                # Target 벡터 자체 확인
+                tgt_unique_cpu = otu.t().cpu()  # [n_cls, D]
+                print(f"\n   Target vector preview (first 5 dims):")
+                for i in range(self.n_cls):
+                    print(f"   Target {i}: {tgt_unique_cpu[i, :5].numpy()}")
+                print(f"{'='*80}\n")
 
                 # ==================== Matched Target을 Positive로 추가 ====================
                 for cls, tgt_idx in zip(row_ind, col_ind):

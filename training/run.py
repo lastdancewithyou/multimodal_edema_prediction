@@ -6,7 +6,7 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="TSC_analysis", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="5", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="6", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
 
     # Modality Selection
@@ -44,11 +44,11 @@ def parse_arguments():
     parser.add_argument('--target_supcon_weight', type=float, default=1.0, help='Target_SupCon loss weight')
     parser.add_argument('--target_supcon_temperature', type=float, default=0.2, help='Temperature for Target_SupCon KCL')
     parser.add_argument('--target_supcon_queue_size', type=int, default=2048, help='Queue size for Target_SupCon')
-    parser.add_argument('--target_supcon_K', type=int, default=6, help='Max number of positives per anchor in Target_SupCon') # 0으로 설정 시 지도대조학습과 동일함.
+    parser.add_argument('--target_supcon_K', type=int, default=6, help='Max number of positives per anchor in Target_SupCon')       # 0으로 설정 시 지도대조학습과 동일함.
     parser.add_argument('--target_supcon_tw', type=float, default=0.5, help='Weight for TSC loss in Target_SupCon')
-    parser.add_argument('--target_supcon_momentum', type=float, default=0.7, help='Momentum for centroid EMA in Target_SupCon')
+    parser.add_argument('--target_supcon_momentum', type=float, default=0.9, help='Momentum for centroid EMA in Target_SupCon')
     parser.add_argument('--target_path', type=str, default=None, help='Path to optimal target .npy file for Target_SupCon')
-    parser.add_argument('--target_supcon_tr', type=int, default=1, help="Target vector")
+    parser.add_argument('--target_supcon_tr', type=int, default=9, help="Target vector")
 
     # Cross-Entropy Loss (Stage 2)
     parser.add_argument('--use_ce', type=bool, default=False, help='Enable cross-entropy loss for classification')
@@ -77,7 +77,7 @@ def parse_arguments():
     # cross attention
     parser.add_argument('--num_latents', type=int, default=6, help='number of rows in latent matrix of cross attention module')
     parser.add_argument('--num_iterations', type=int, default=2, help='cross attention iteration number')
-    
+
     ## Projection_head
     parser.add_argument('--use_projection', type=bool, default=True, help='Use projection head for contrastive learning in Stage 1. If False, use encoder output (z) directly.')
     parser.add_argument('--head_input_dim', type=int, default=256, help='projection head input dim')  # Updated for Perceiver-TS (512-dim output)
@@ -106,7 +106,7 @@ def parse_arguments():
     parser.add_argument('--stage2_only', type=bool, default=False, help='Run only stage 2 (classification from pretrained)')
     parser.add_argument('--stage1_epochs', type=int, default=40, help='Number of epochs for stage 1 (contrastive pretraining)')
     parser.add_argument('--stage2_epochs', type=int, default=30, help='Number of epochs for stage 2 (classification)')
-    parser.add_argument('--stage1_lr', type=float, default=1e-3, help='Learning rate for stage 1')
+    parser.add_argument('--stage1_lr', type=float, default=1e-4, help='Learning rate for stage 1')
     parser.add_argument('--stage2_lr', type=float, default=5e-5, help='Learning rate for stage 2')
     parser.add_argument('--save_stage1_model', type=bool, default=True, help='Save stage 1 model checkpoint')
     parser.add_argument('--stage1_model_path', type=str, 
