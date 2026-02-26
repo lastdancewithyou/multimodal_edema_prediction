@@ -10,13 +10,19 @@ import torch.distributed as dist
 from utils import timer
 
 # 단일 배치 학습 함수
-def train_batch(args, model, batch, loss_module, device, accelerator, dataset, disable_cxr=False, disable_txt=False, max_length=256, ce_weight=None, current_epoch=None, total_epochs=None):
+def train_batch(args, model, batch, loss_module, device, accelerator, dataset, disable_cxr=False, disable_txt=False, max_length=256,
+                bce_weight=None, ce_weight=None, ucl_weight=None
+    ):
+    
     model.train()
 
     # ==================== 1. 배치 데이터 GPU 전송 ====================
     with timer("Batch Data preparation", accelerator):
-        for k in ['labels', 'window_mask', 'valid_seq_mask']:
+        # New multi-task format
+        for k in ['edema_labels', 'subtype_labels', 'window_mask', 'valid_seq_mask']:
             batch[k] = batch[k].to(device, non_blocking=True)
+        edema_labels = batch['edema_labels']
+        subtype_labels = batch['subtype_labels']
 
         demo_features = batch.get('demo_features')
         if demo_features is not None:
@@ -27,7 +33,6 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
         has_cxr = (img_index_tensor != -1).long().to(device, non_blocking=True)   # [B, W, T]
         has_text = (txt_index_tensor != -1).long().to(device, non_blocking=True)  # [B, W, T]
 
-        labels = batch['labels']
         window_mask = batch['window_mask']
         seq_valid_mask = batch['valid_seq_mask']
         stay_ids = torch.tensor(batch['stay_ids'], dtype=torch.long, device=device)  # [B]
@@ -52,81 +57,53 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
             model_type = type(model).__name__ # 모델 타입에 따라 forward 분리 수행.
 
             if "Contrastive" in model_type:  # Stage 1: MultiModalContrastiveModel
-                projected_embeddings_multiview = model(
-                    args, ts_series, cxr_views, text_series, has_cxr, has_text, window_mask, seq_valid_mask, demo_features, time_steps=time_steps
-                )
-                # Stage 1: No logits, no classification_input
-                logits = None
-                classification_input = None  # Not used in Stage 1
-
-            elif "Classification" in model_type:  # Stage 2: MultiModalClassificationModel
-                window_embeddings, logits = model(
-                    args, ts_series, cxr_views, text_series, has_cxr, has_text, window_mask, seq_valid_mask, demo_features, time_steps=time_steps
-                )
-                # Stage 2: No multi-view projections
-                projected_embeddings_multiview = None
-                classification_input = window_embeddings
-
-            else:  # Old MultiModalModel (코드 정리 이전)
-                classification_input, time_flat, logits, ts_encoded, projected_embeddings_multiview = model(
-                    args, ts_series, cxr_views, text_series, has_cxr, has_text, window_mask, seq_valid_mask, demo_features, time_steps=time_steps
+                model_outputs = model(
+                    args, ts_series, cxr_views, text_series, has_cxr, has_text,
+                    window_mask, seq_valid_mask, demo_features, time_steps=time_steps
                 )
 
-            # Window_time_indices (현재 미사용 중)
-            # B, W = labels.shape[0], labels.shape[1]
-            # window_time_indices = torch.arange(W, device=device).unsqueeze(0).expand(B, W)
+                # Unpack model outputs
+                edema_logits = model_outputs['edema_logits']          # [B, W, 1]
+                subtype_logits = model_outputs['subtype_logits']       # [B, W, 2]
+                valid_embeddings = model_outputs['valid_embeddings']   # [Nwin, 256]
+                window_time_indices = model_outputs['window_time_indices']  # [Nwin]
+                batch_indices = model_outputs['batch_indices']         # [Nwin]
 
             with timer("Main loss 연산", accelerator):
-                total_batch_loss, ce_loss_t, scl_loss_t, target_supcon_t, loss_kcl_t, loss_tsc_t, softmax_self_prob_t = loss_module(
-                    classification_input=classification_input,
-                    seq_valid_mask=seq_valid_mask,
-                    logits=logits,
-                    labels=labels,
+                total_batch_loss, bce_loss_t, ce_loss_t, ucl_loss_t = loss_module(
+                    edema_logits = edema_logits,
+                    subtype_logits = subtype_logits,
+                    valid_embeddings = valid_embeddings,
+                    window_time_indices = window_time_indices,
+                    batch_indices = batch_indices,
+                    edema_labels=edema_labels,
+                    subtype_labels=subtype_labels,
                     window_mask=window_mask,
-                    stay_ids=stay_ids,
+                    bce_weight=bce_weight,
                     ce_weight=ce_weight,
-                    scl_weight=args.scl_weight,
-                    target_supcon_weight=args.target_supcon_weight,
-                    # window_time_indices=window_time_indices,
-                    accelerator=accelerator,
-                    projected_embeddings_multiview=projected_embeddings_multiview,  # Multi-view for TSC
-                    current_epoch=current_epoch,
-                    total_epochs=total_epochs,
-                    device=device
+                    ucl_weight=ucl_weight,
+                    device=device,
+                    accelerator=accelerator
                 )
 
-    # ==================== 4. Predictions 계산 (Only Stage 2) ====================
-    with torch.no_grad():
-        if logits is not None:
-            probs = F.softmax(logits, dim=-1)
-            predictions = torch.argmax(probs, dim=-1)
-        else:
-            # Stage 1: No predictions
-            probs = None
-            predictions = None
-
     # ==================== 5. Metrics 수집 ====================
-    ce_count = (labels != -1).sum().item()
     window_count = window_mask.sum().item()
-    batch_ce  = float(ce_loss_t.detach().item())
-    batch_scl = float(scl_loss_t.detach().item())
-    batch_target_supcon = float(target_supcon_t.detach().item())
-    batch_kcl = float(loss_kcl_t.detach().item())
-    batch_tsc = float(loss_tsc_t.detach().item())
+    batch_bce = float(bce_loss_t.detach().item())
+    batch_ce = float(ce_loss_t.detach().item())
+    batch_ucl = float(ucl_loss_t.detach().item())
 
     batch_outputs = {
-        'labels': labels,
-        'predictions': predictions,
-        'logits': logits
+        'edema_labels': edema_labels,
+        'subtype_labels': subtype_labels,
+        'edema_logits': edema_logits,
+        'subtype_logits': subtype_logits
     }
 
     batch_counts = {
-        'ce_count': ce_count,
         'window_count': window_count,
-        'softmax_self_prob': softmax_self_prob_t,
     }
 
-    return total_batch_loss, batch_ce, batch_scl, batch_target_supcon, batch_kcl, batch_tsc, batch_outputs, batch_counts
+    return total_batch_loss, batch_bce, batch_ce, batch_ucl, batch_outputs, batch_counts
 
 
 def prepare_multiview_inputs_v2(batch, device, has_cxr, has_text, dataset, disable_cxr=False, disable_txt=False, max_length=256):

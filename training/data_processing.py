@@ -26,7 +26,7 @@ class SCL_Multi_Dataset(Dataset):
         self.stay_groups = self.merged_df.groupby('stay_id') # stay_id 식별자를 기준으로 grouping
         self.stay_ids = list(self.stay_groups.groups.keys())
 
-        exclude_cols = ['hadm_id', 'stay_id', 'hour_slot', 'label', 'cxr_flag', 'hash_path', 'text_flag', 'tokenized_text']
+        exclude_cols = ['hadm_id', 'stay_id', 'hour_slot', 'Edema', 'subtype_label', 'cxr_flag', 'hash_path', 'text_flag', 'tokenized_text']
         all_feature_cols = [col for col in self.merged_df.columns if col not in exclude_cols]
 
         self.ts_features = all_feature_cols  # Includes both features and observed_mask
@@ -61,7 +61,12 @@ class SCL_Multi_Dataset(Dataset):
 
         for idx, meta in enumerate(self.label_metadata):
             stay_id = meta["stay_id"]
-            window_count = len(meta["label_series"])
+            # Use edema_label_series for window count (main task)
+            if "edema_label_series" in meta:
+                window_count = len(meta["edema_label_series"])
+            else:
+                # Fallback to legacy label_series for backward compatibility
+                window_count = len(meta.get("label_series", []))
 
             if window_count > 0:
                 new_stay_index_map[stay_id] = len(valid_stay_ids)
@@ -164,7 +169,8 @@ class SCL_Multi_Dataset(Dataset):
         stay_data = self.stay_groups.get_group(stay_id).sort_values('hour_slot')
 
         hour_slots = stay_data['hour_slot'].to_numpy()
-        labels = stay_data['label'].to_numpy()
+        edema_labels = stay_data['Edema'].to_numpy()  # Binary edema label (0, 1, or -1)
+        subtype_labels = stay_data['subtype_label'].to_numpy()  # Subtype label (1, 2, or -1) - will be converted to (0, 1, or -1)
         # Time-series features 추출 (observed_mask 포함)
         ts_feature_values = torch.tensor(stay_data[self.ts_features].astype(np.float32).to_numpy(), dtype=torch.float32)
 
@@ -172,7 +178,7 @@ class SCL_Multi_Dataset(Dataset):
         img_index_series = [t if t in self.image_map[stay_id] else -1 for t in hour_slots]
         text_index_series = [t if t in self.text_map[stay_id] else -1 for t in hour_slots]
 
-        sequence_series, label_series, has_cxr_series, has_text_series, valid_mask_series = [], [], [], [], []
+        sequence_series, edema_label_series, subtype_label_series, has_cxr_series, has_text_series, valid_mask_series = [], [], [], [], [], []
         L = len(stay_data)
 
         # ========== Sliding Window 생성 ==========
@@ -203,15 +209,23 @@ class SCL_Multi_Dataset(Dataset):
                 has_text_series.append([int(x != -1) for x in window_text])     # 1 if text exists
                 valid_mask_series.append([1] * self.window_size)
 
-                # 라벨 할당
+                # 라벨 할당 (both edema and subtype)
                 label_idx = i + self.window_size + self.prediction_horizon - 1
-                if label_idx < len(labels):
-                    future_label = labels[label_idx]
-                    if np.isnan(future_label):
-                        future_label = -1
+                if label_idx < len(edema_labels):
+                    future_edema = edema_labels[label_idx]
+                    future_subtype = subtype_labels[label_idx]
+                    if np.isnan(future_edema):
+                        future_edema = -1
+                    if np.isnan(future_subtype):
+                        future_subtype = -1
+                    # Convert subtype labels from {1, 2} to {0, 1} for CE loss
+                    elif future_subtype in [1, 2]:
+                        future_subtype = future_subtype - 1
                 else:
-                    future_label = -1
-                label_series.append(future_label)
+                    future_edema = -1
+                    future_subtype = -1
+                edema_label_series.append(future_edema)
+                subtype_label_series.append(future_subtype)
 
         # 생성된 모든 window는 유효함 (window_mask=1) - 이후 collate_fn에서 배치 간 length를 맞춰줄 때 window_mask에 0을 할당함.
         window_mask = [1] * len(sequence_series)
@@ -230,10 +244,11 @@ class SCL_Multi_Dataset(Dataset):
             'modality_series': sequence_series,
             'has_cxr': has_cxr_series,
             'has_text': has_text_series,
-            'label_series': label_series,
+            'edema_label_series': edema_label_series,
+            'subtype_label_series': subtype_label_series,
             'window_mask': window_mask,
             'valid_mask_series' : valid_mask_series,
-            'demo_features': demo_features 
+            'demo_features': demo_features
         }
     
     def collate_fn(self, batch):
@@ -245,7 +260,8 @@ class SCL_Multi_Dataset(Dataset):
         args = self.args
         stay_ids = [item['stay_id'] for item in batch]
         modality_series_list = [item['modality_series'] for item in batch]
-        label_series_list = [item['label_series'] for item in batch]
+        edema_label_series_list = [item['edema_label_series'] for item in batch]
+        subtype_label_series_list = [item['subtype_label_series'] for item in batch]
         window_mask_list = [item['window_mask'] for item in batch]
         valid_seq_mask_list = [item['valid_mask_series'] for item in batch]
 
@@ -299,7 +315,8 @@ class SCL_Multi_Dataset(Dataset):
         )
 
         # 각 window의 라벨 (-1은 패딩이거나 유효하지 않은 경우)
-        label_tensor = torch.full((len(batch), max_windows), fill_value=-1, dtype=torch.long)
+        edema_label_tensor = torch.full((len(batch), max_windows), fill_value=-1, dtype=torch.long)
+        subtype_label_tensor = torch.full((len(batch), max_windows), fill_value=-1, dtype=torch.long)
 
         # ==================== 실제 값 채우기 ====================
         for i, item in enumerate(batch):
@@ -323,7 +340,8 @@ class SCL_Multi_Dataset(Dataset):
                         text_index_tensor[i, j, t] = txt_key_to_idx[txt_key]
 
             window_mask_tensor[i, :num_windows] = torch.tensor(window_mask_list[i][:num_windows], dtype=torch.bool)
-            label_tensor[i, :num_windows] = torch.tensor(label_series_list[i], dtype=torch.long)
+            edema_label_tensor[i, :num_windows] = torch.tensor(edema_label_series_list[i], dtype=torch.long)
+            subtype_label_tensor[i, :num_windows] = torch.tensor(subtype_label_series_list[i], dtype=torch.long)
 
         # ==================== Demographic features ====================
         demo_features_list = [item['demo_features'] for item in batch]
@@ -341,7 +359,8 @@ class SCL_Multi_Dataset(Dataset):
             'unique_txt_keys': unique_txt_keys,          # List[(stay_id, hour_slot)] - 배치 내 고유 텍스트 키 (길이 M)
             'window_mask': window_mask_tensor,           # [B, W]
             'valid_seq_mask': valid_seq_mask_tensor,     # [B, W, T]
-            'labels': label_tensor,                      # [B, W]
+            'edema_labels': edema_label_tensor,          # [B, W] - Binary edema labels
+            'subtype_labels': subtype_label_tensor,      # [B, W] - Subtype labels (0, 1, 2, or -1)
             'demo_features': demographic_tensor          # [B, D_demo] or None
         }
 
@@ -355,9 +374,11 @@ class SCL_Multi_Dataset(Dataset):
         for idx in range(len(self.stay_ids)):
             stay_id = self.stay_ids[idx]
             stay_data = self.stay_groups.get_group(stay_id).sort_values('hour_slot')
-            labels = stay_data['label'].to_numpy()
+            edema_labels = stay_data['Edema'].to_numpy()
+            subtype_labels = stay_data['subtype_label'].to_numpy()
 
-            window_labels = []
+            window_edema_labels = []
+            window_subtype_labels = []
             L = len(stay_data)
 
             # 환자별 윈도우 슬라이싱
@@ -370,12 +391,20 @@ class SCL_Multi_Dataset(Dataset):
                     future_label_idx = i + self.window_size + self.prediction_horizon - 1
 
                     if future_label_idx < L:
-                        lab = labels[future_label_idx]
-                        if np.isnan(lab):
-                            lab = -1
-                        window_labels.append(lab)
+                        edema_lab = edema_labels[future_label_idx]
+                        subtype_lab = subtype_labels[future_label_idx]
+                        if np.isnan(edema_lab):
+                            edema_lab = -1
+                        if np.isnan(subtype_lab):
+                            subtype_lab = -1
+                        window_edema_labels.append(edema_lab)
+                        window_subtype_labels.append(subtype_lab)
 
-            label_meta.append({'stay_id': stay_id, 'label_series': window_labels})
+            label_meta.append({
+                'stay_id': stay_id,
+                'edema_label_series': window_edema_labels,
+                'subtype_label_series': window_subtype_labels
+            })
         return label_meta
     
     def __len__(self): 
@@ -484,42 +513,39 @@ def get_dataloaders(ts_df, cxr_df, text_df, demo_df, args, accelerator=None):
             worker_init_fn=seed_worker
         )
 
-    # 윈도우 레벨 라벨 비율 비교
-    print("\n" + "="*60)
-    print("Window-level Label Ratio Comparison")
-    print("="*60)
-    print(f"{'Dataset':<12} {'Cardio':>10} {'Non-cardio':>12} {'Negative':>10} {'Unlabeled':>10}")
-    print("-"*60)
+    # # 윈도우 레벨 라벨 비율 비교
+    # print("\n" + "="*60)
+    # print("Window-level Label Ratio Comparison")
+    # print("="*60)
+    # print(f"{'Dataset':<12} {'Cardio':>10} {'Non-cardio':>12} {'Negative':>10} {'Unlabeled':>10}")
+    # print("-"*60)
 
-    for name, dist in [("Train", train_dist), ("Validation", val_dist), ("Test", test_dist)]:
-        total = dist['total']
-        cardio_pct = dist['cardio'] / total * 100
-        noncardio_pct = dist['noncardio'] / total * 100
-        negative_pct = dist['negative'] / total * 100
-        unlabeled_pct = dist['unlabeled'] / total * 100
-        print(f"{name:<12} {cardio_pct:>9.2f}% {noncardio_pct:>11.2f}% {negative_pct:>9.2f}% {unlabeled_pct:>9.2f}%")
+    # for name, dist in [("Train", train_dist), ("Validation", val_dist), ("Test", test_dist)]:
+    #     total = dist['total']
+    #     cardio_pct = dist['cardio'] / total * 100
+    #     noncardio_pct = dist['noncardio'] / total * 100
+    #     negative_pct = dist['negative'] / total * 100
+    #     unlabeled_pct = dist['unlabeled'] / total * 100
+    #     print(f"{name:<12} {cardio_pct:>9.2f}% {noncardio_pct:>11.2f}% {negative_pct:>9.2f}% {unlabeled_pct:>9.2f}%")
 
-    print("="*60 + "\n")
+    # print("="*60 + "\n")
 
-    # 윈도우 레벨 모달리티 조합 비율 비교
-    print("\n" + "="*70)
-    print("Window-level Modality Combination Ratio Comparison")
-    print("="*70)
-    print(f"{'Dataset':<12} {'TS only':>12} {'TS+Image':>12} {'TS+Text':>12} {'TS+Img+Text':>14}")
-    print("-"*70)
+    # # 윈도우 레벨 모달리티 조합 비율 비교
+    # print("\n" + "="*70)
+    # print("Window-level Modality Combination Ratio Comparison")
+    # print("="*70)
+    # print(f"{'Dataset':<12} {'TS only':>12} {'TS+Image':>12} {'TS+Text':>12} {'TS+Img+Text':>14}")
+    # print("-"*70)
 
-    for name, dist in [("Train", train_modality_dist), ("Validation", val_modality_dist), ("Test", test_modality_dist)]:
-        total = dist['total']
-        ts_only_pct = dist['ts_only'] / total * 100
-        ts_img_pct = dist['ts_img'] / total * 100
-        ts_text_pct = dist['ts_text'] / total * 100
-        ts_img_text_pct = dist['ts_img_text'] / total * 100
-        print(f"{name:<12} {ts_only_pct:>11.2f}% {ts_img_pct:>11.2f}% {ts_text_pct:>11.2f}% {ts_img_text_pct:>13.2f}%")
+    # for name, dist in [("Train", train_modality_dist), ("Validation", val_modality_dist), ("Test", test_modality_dist)]:
+    #     total = dist['total']
+    #     ts_only_pct = dist['ts_only'] / total * 100
+    #     ts_img_pct = dist['ts_img'] / total * 100
+    #     ts_text_pct = dist['ts_text'] / total * 100
+    #     ts_img_text_pct = dist['ts_img_text'] / total * 100
+    #     print(f"{name:<12} {ts_only_pct:>11.2f}% {ts_img_pct:>11.2f}% {ts_text_pct:>11.2f}% {ts_img_text_pct:>13.2f}%")
 
-    print("="*70 + "\n")
-
-    # with timer("배치별 라벨 분포 분석"):
-    #     analyze_batch_label_distribution(train_dataloader, "Train", num_batches=10)
+    # print("="*70 + "\n")
 
     return train_dataloader, val_dataloader, test_dataloader, train_sampler
 
@@ -543,43 +569,111 @@ def stable_hash(s):
 def calculate_window_label_distribution(dataset, dataset_name="Dataset"):
     """
     - 데이터셋의 window-level 라벨 분포를 계산하고 출력
+    - Multi-task: Edema와 Subtype 분포를 모두 출력
     """
-    cardio_windows = 0
-    noncardio_windows = 0
-    negative_windows = 0
-    unlabeled_windows = 0
+    # Check if multi-task (edema_label_series exists)
+    if len(dataset.label_metadata) > 0 and 'edema_label_series' in dataset.label_metadata[0]:
+        # Multi-task distribution
+        edema_0_windows = 0
+        edema_1_windows = 0
+        edema_unlabeled_windows = 0
 
-    for meta in dataset.label_metadata:
-        for label in meta['label_series']:
-            if label == 2:
-                cardio_windows += 1
-            elif label == 1:
-                noncardio_windows += 1
-            elif label == 0:
-                negative_windows += 1
-            else:  # -1 or NaN
-                unlabeled_windows += 1
+        subtype_1_windows = 0  # non-cardiogenic
+        subtype_2_windows = 0  # cardiogenic
+        subtype_unlabeled_windows = 0
 
-    total_windows = cardio_windows + noncardio_windows + negative_windows + unlabeled_windows
+        for meta in dataset.label_metadata:
+            edema_labels = meta['edema_label_series']
+            subtype_labels = meta['subtype_label_series']
 
-    print(f"\n{'='*60}")
-    print(f"[{dataset_name}] Window-level Label Distribution")
-    print(f"{'='*60}")
-    print(f"Cardio windows:        {cardio_windows:>6} ({cardio_windows/total_windows*100:>5.2f}%)")
-    print(f"Non-cardio windows:    {noncardio_windows:>6} ({noncardio_windows/total_windows*100:>5.2f}%)")
-    print(f"Negative windows:      {negative_windows:>6} ({negative_windows/total_windows*100:>5.2f}%)")
-    print(f"Unlabeled windows:     {unlabeled_windows:>6} ({unlabeled_windows/total_windows*100:>5.2f}%)")
-    print(f"{'─'*60}")
-    print(f"Total windows:         {total_windows:>6}")
-    print(f"{'='*60}\n")
+            for edema_label, subtype_label in zip(edema_labels, subtype_labels):
+                # Count edema distribution
+                if edema_label == 0:
+                    edema_0_windows += 1
+                elif edema_label == 1:
+                    edema_1_windows += 1
+                else:
+                    edema_unlabeled_windows += 1
 
-    return {
-        'cardio': cardio_windows,
-        'noncardio': noncardio_windows,
-        'negative': negative_windows,
-        'unlabeled': unlabeled_windows,
-        'total': total_windows
-    }
+                # Count subtype distribution (only for edema=1)
+                # Subtype labels: 1 (non-cardiogenic), 2 (cardiogenic)
+                if edema_label == 1:
+                    if subtype_label == 1:
+                        subtype_1_windows += 1
+                    elif subtype_label == 2:
+                        subtype_2_windows += 1
+                    else:
+                        # -1 or NaN (unlabeled)
+                        subtype_unlabeled_windows += 1
+
+        total_windows = edema_0_windows + edema_1_windows + edema_unlabeled_windows
+
+        print(f"\n{'='*60}")
+        print(f"[{dataset_name}] Window-level Label Distribution (Multi-task)")
+        print(f"{'='*60}")
+        print(f"Edema Distribution:")
+        print(f"  No edema (0):        {edema_0_windows:>6} ({edema_0_windows/total_windows*100:>5.2f}%)")
+        print(f"  Has edema (1):       {edema_1_windows:>6} ({edema_1_windows/total_windows*100:>5.2f}%)")
+        print(f"  Unlabeled:           {edema_unlabeled_windows:>6} ({edema_unlabeled_windows/total_windows*100:>5.2f}%)")
+        print(f"{'─'*60}")
+        print(f"Subtype Distribution (among edema=1):")
+        edema_1_total = subtype_1_windows + subtype_2_windows + subtype_unlabeled_windows
+        if edema_1_total > 0:
+            print(f"  Non-cardiogenic (1): {subtype_1_windows:>6} ({subtype_1_windows/edema_1_total*100:>5.2f}%)")
+            print(f"  Cardiogenic (2):     {subtype_2_windows:>6} ({subtype_2_windows/edema_1_total*100:>5.2f}%)")
+            print(f"  Unlabeled:           {subtype_unlabeled_windows:>6} ({subtype_unlabeled_windows/edema_1_total*100:>5.2f}%)")
+        print(f"{'─'*60}")
+        print(f"Total windows:         {total_windows:>6}")
+        print(f"{'='*60}\n")
+
+        return {
+            'edema_0': edema_0_windows,
+            'edema_1': edema_1_windows,
+            'edema_unlabeled': edema_unlabeled_windows,
+            'subtype_1': subtype_1_windows,
+            'subtype_2': subtype_2_windows,
+            'subtype_unlabeled': subtype_unlabeled_windows,
+            'total': total_windows
+        }
+
+    else:
+        # Legacy distribution (3-class)
+        cardio_windows = 0
+        noncardio_windows = 0
+        negative_windows = 0
+        unlabeled_windows = 0
+
+        for meta in dataset.label_metadata:
+            for label in meta['label_series']:
+                if label == 2:
+                    cardio_windows += 1
+                elif label == 1:
+                    noncardio_windows += 1
+                elif label == 0:
+                    negative_windows += 1
+                else:  # -1 or NaN
+                    unlabeled_windows += 1
+
+        total_windows = cardio_windows + noncardio_windows + negative_windows + unlabeled_windows
+
+        print(f"\n{'='*60}")
+        print(f"[{dataset_name}] Window-level Label Distribution")
+        print(f"{'='*60}")
+        print(f"Cardio windows:        {cardio_windows:>6} ({cardio_windows/total_windows*100:>5.2f}%)")
+        print(f"Non-cardio windows:    {noncardio_windows:>6} ({noncardio_windows/total_windows*100:>5.2f}%)")
+        print(f"Negative windows:      {negative_windows:>6} ({negative_windows/total_windows*100:>5.2f}%)")
+        print(f"Unlabeled windows:     {unlabeled_windows:>6} ({unlabeled_windows/total_windows*100:>5.2f}%)")
+        print(f"{'─'*60}")
+        print(f"Total windows:         {total_windows:>6}")
+        print(f"{'='*60}\n")
+
+        return {
+            'cardio': cardio_windows,
+            'noncardio': noncardio_windows,
+            'negative': negative_windows,
+            'unlabeled': unlabeled_windows,
+            'total': total_windows
+        }
 
 
 def calculate_modality_distribution(dataset, dataset_name="Dataset"):
@@ -743,28 +837,47 @@ def analyze_batch_label_distribution(dataloader, dataset_name="Dataset", num_bat
     return batch_stats
 
 
-# dataset split with stratification
 def split_dataset(merged_df, train_ratio, val_ratio, random_seed=0):
     """
     환자 레벨에서 층화추출을 수행하여 train/val/test split
-    각 환자의 라벨을 고려하여 분할하여 각 split의 라벨 비율을 균등하게 유지
+    Multi-task learning: Edema 라벨을 기준으로 층화추출
+    (Main task: Edema detection, Sub task: Subtype classification)
     """
     stay_ids = merged_df['stay_id'].unique()
 
-    # 각 환자의 대표 라벨 결정 (우선순위: cardio > noncardio > negative > unlabeled)
-    stay_labels = []
-    for stay_id in stay_ids:
-        stay_data = merged_df[merged_df['stay_id'] == stay_id]
-        labels = stay_data['label'].to_numpy()
+    # Check if Edema column exists (multi-task) or use legacy label column
+    use_multitask = 'Edema' in merged_df.columns
 
-        if np.any(labels == 2):  # Cardio
-            stay_labels.append(2)
-        elif np.any(labels == 1):  # Non-cardio
-            stay_labels.append(1)
-        elif np.any(labels == 0):  # Negative
-            stay_labels.append(0)
-        else:  # Unlabeled (all NaN or -1)
-            stay_labels.append(-1)
+    if use_multitask:
+        print("[Dataset Split] Using Edema-based stratification for multi-task learning")
+        # 각 환자의 대표 Edema 라벨 결정 (우선순위: edema=1 > edema=0 > unlabeled)
+        stay_labels = []
+        for stay_id in stay_ids:
+            stay_data = merged_df[merged_df['stay_id'] == stay_id]
+            edema_labels = stay_data['Edema'].to_numpy()
+
+            if np.any(edema_labels == 1):  # Has edema
+                stay_labels.append(1)
+            elif np.any(edema_labels == 0):  # No edema
+                stay_labels.append(0)
+            else:  # Unlabeled (all NaN or -1)
+                stay_labels.append(-1)
+    else:
+        print("[Dataset Split] Using legacy label-based stratification")
+        # 각 환자의 대표 라벨 결정 (우선순위: cardio > noncardio > negative > unlabeled)
+        stay_labels = []
+        for stay_id in stay_ids:
+            stay_data = merged_df[merged_df['stay_id'] == stay_id]
+            labels = stay_data['label'].to_numpy()
+
+            if np.any(labels == 2):  # Cardio
+                stay_labels.append(2)
+            elif np.any(labels == 1):  # Non-cardio
+                stay_labels.append(1)
+            elif np.any(labels == 0):  # Negative
+                stay_labels.append(0)
+            else:  # Unlabeled (all NaN or -1)
+                stay_labels.append(-1)
 
     # 층화추출로 train/temp split
     train_stay_ids, temp_stay_ids = train_test_split(
@@ -778,16 +891,25 @@ def split_dataset(merged_df, train_ratio, val_ratio, random_seed=0):
     temp_stay_labels = []
     for stay_id in temp_stay_ids:
         stay_data = merged_df[merged_df['stay_id'] == stay_id]
-        labels = stay_data['label'].to_numpy()
 
-        if np.any(labels == 2):
-            temp_stay_labels.append(2)
-        elif np.any(labels == 1):
-            temp_stay_labels.append(1)
-        elif np.any(labels == 0):
-            temp_stay_labels.append(0)
+        if use_multitask:
+            edema_labels = stay_data['Edema'].to_numpy()
+            if np.any(edema_labels == 1):
+                temp_stay_labels.append(1)
+            elif np.any(edema_labels == 0):
+                temp_stay_labels.append(0)
+            else:
+                temp_stay_labels.append(-1)
         else:
-            temp_stay_labels.append(-1)
+            labels = stay_data['label'].to_numpy()
+            if np.any(labels == 2):
+                temp_stay_labels.append(2)
+            elif np.any(labels == 1):
+                temp_stay_labels.append(1)
+            elif np.any(labels == 0):
+                temp_stay_labels.append(0)
+            else:
+                temp_stay_labels.append(-1)
 
     val_size = val_ratio / (1 - train_ratio)
 
@@ -808,7 +930,95 @@ def split_dataset(merged_df, train_ratio, val_ratio, random_seed=0):
     print(f"Val patients:   {len(val_stay_ids)}")
     print(f"Test patients:  {len(test_stay_ids)}")
 
+    # Print label distribution for multi-task
+    if use_multitask:
+        for split_name, split_df in [('Train', train_df), ('Val', val_df), ('Test', test_df)]:
+            edema_0 = (split_df['Edema'] == 0).sum()
+            edema_1 = (split_df['Edema'] == 1).sum()
+            edema_unlabeled = (split_df['Edema'] == -1).sum()
+
+            # Among edema=1, count subtype distribution
+            edema_1_df = split_df[split_df['Edema'] == 1]
+            # subtype_0 = (edema_1_df['subtype_label'] == 0).sum() if 'subtype_label' in split_df.columns else 0
+            subtype_1 = (edema_1_df['subtype_label'] == 1).sum() if 'subtype_label' in split_df.columns else 0
+            subtype_2 = (edema_1_df['subtype_label'] == 2).sum() if 'subtype_label' in split_df.columns else 0
+            # subtype_unlabeled = (edema_1_df['subtype_label'] == -1).sum() if 'subtype_label' in split_df.columns else 0 # 지금 NA 처리되어 있음.
+
+            print(f"\n{'='*80}")
+            print(f"{split_name} Set:")
+            print(f"  Edema Negative={edema_0}, Edema Positive={edema_1}, Unlabeled+Uncertain={edema_unlabeled}")
+            print(f"  Subtype (P(subtype|edema=1)): Non-cardio={subtype_1}, Cardio={subtype_2}")
+            print(f"{'='*80}")
+
     return train_df, val_df, test_df
+
+
+# dataset split with stratification
+# def split_dataset(merged_df, train_ratio, val_ratio, random_seed=0):
+#     """
+#     환자 레벨에서 층화추출을 수행하여 train/val/test split
+#     각 환자의 라벨을 고려하여 분할하여 각 split의 라벨 비율을 균등하게 유지
+#     """
+#     stay_ids = merged_df['stay_id'].unique()
+
+#     # 각 환자의 대표 라벨 결정 (우선순위: cardio > noncardio > negative > unlabeled)
+#     stay_labels = []
+#     for stay_id in stay_ids:
+#         stay_data = merged_df[merged_df['stay_id'] == stay_id]
+#         labels = stay_data['label'].to_numpy()
+
+#         if np.any(labels == 2):  # Cardio
+#             stay_labels.append(2)
+#         elif np.any(labels == 1):  # Non-cardio
+#             stay_labels.append(1)
+#         elif np.any(labels == 0):  # Negative
+#             stay_labels.append(0)
+#         else:  # Unlabeled (all NaN or -1)
+#             stay_labels.append(-1)
+
+#     # 층화추출로 train/temp split
+#     train_stay_ids, temp_stay_ids = train_test_split(
+#         stay_ids,
+#         test_size = (1 - train_ratio),
+#         random_state=random_seed,
+#         stratify=stay_labels
+#     )
+
+#     # temp의 라벨 추출
+#     temp_stay_labels = []
+#     for stay_id in temp_stay_ids:
+#         stay_data = merged_df[merged_df['stay_id'] == stay_id]
+#         labels = stay_data['label'].to_numpy()
+
+#         if np.any(labels == 2):
+#             temp_stay_labels.append(2)
+#         elif np.any(labels == 1):
+#             temp_stay_labels.append(1)
+#         elif np.any(labels == 0):
+#             temp_stay_labels.append(0)
+#         else:
+#             temp_stay_labels.append(-1)
+
+#     val_size = val_ratio / (1 - train_ratio)
+
+#     # 층화추출로 val/test split
+#     val_stay_ids, test_stay_ids = train_test_split(
+#         temp_stay_ids,
+#         test_size = (1 - val_size),
+#         random_state=random_seed,
+#         stratify=temp_stay_labels
+#     )
+
+#     train_df = merged_df[merged_df['stay_id'].isin(train_stay_ids)]
+#     val_df = merged_df[merged_df['stay_id'].isin(val_stay_ids)]
+#     test_df = merged_df[merged_df['stay_id'].isin(test_stay_ids)]
+
+#     print("\n[Dataset Split] Stratified patient-level distribution:")
+#     print(f"Train patients: {len(train_stay_ids)}")
+#     print(f"Val patients:   {len(val_stay_ids)}")
+#     print(f"Test patients:  {len(test_stay_ids)}")
+
+#     return train_df, val_df, test_df
 
 
 class StratifiedPatientSampler(Sampler):
@@ -896,47 +1106,84 @@ class StratifiedPatientSampler(Sampler):
         """
         - 실제 배치 구성에서의 윈도우 레벨 클래스 분포 반환
         - 오버샘플링이 없으므로 데이터셋 원본 분포와 동일
-        - Unlabeled 윈도우(label=-1)는 CE Loss에서 ignore되므로 제외하고 계산
+        - Unlabeled 윈도우(label=-1)는 Loss에서 ignore되므로 제외하고 계산
         """
-        cardio_windows = 0
-        noncardio_windows = 0
-        negative_windows = 0
-        unlabeled_windows = 0
+        # Check if multi-task
+        is_multitask = len(self.dataset.label_metadata) > 0 and 'edema_label_series' in self.dataset.label_metadata[0]
 
-        # 배치는 이제 [patient_idx, patient_idx, ...] 형태
-        for batch in self.batches:
-            for patient_idx in batch:
-                meta = self.dataset.label_metadata[patient_idx]
-                for label in meta['label_series']:
-                    if label == 2:
-                        cardio_windows += 1
-                    elif label == 1:
-                        noncardio_windows += 1
-                    elif label == 0:
-                        negative_windows += 1
-                    else:  # label == -1 (unlabeled)
-                        unlabeled_windows += 1
+        if is_multitask:
+            # Multi-task: count edema distribution
+            edema_0_windows = 0
+            edema_1_windows = 0
+            unlabeled_windows = 0
 
-        # CE Loss에서 ignore_index=-1이므로 유효한 라벨만 사용
-        valid_total = cardio_windows + noncardio_windows + negative_windows
+            for batch in self.batches:
+                for patient_idx in batch:
+                    meta = self.dataset.label_metadata[patient_idx]
+                    for label in meta['edema_label_series']:
+                        if label == 0:
+                            edema_0_windows += 1
+                        elif label == 1:
+                            edema_1_windows += 1
+                        else:
+                            unlabeled_windows += 1
 
-        if valid_total == 0:
-            return {'cardio': 0.33, 'noncardio': 0.33, 'negative': 0.34, 'cardio_count': 0, 'noncardio_count': 0, 'negative_count': 0}
+            valid_total = edema_0_windows + edema_1_windows
 
-        distribution = {
-            'cardio': cardio_windows / valid_total,
-            'noncardio': noncardio_windows / valid_total,
-            'negative': negative_windows / valid_total,
-            'negative_count': negative_windows,
-            'noncardio_count': noncardio_windows,
-            'cardio_count': cardio_windows
-        }
+            if valid_total == 0:
+                return {'edema_0': 0.5, 'edema_1': 0.5, 'edema_0_count': 0, 'edema_1_count': 0}
 
-        if self.accelerator is None or self.accelerator.is_main_process:
-            print(f"\n[StratifiedPatientSampler] Window-level class distribution (유효 라벨만):")
-            print(f"  Cardio: {cardio_windows:,} windows ({distribution['cardio']:.2%})")
-            print(f"  Non-cardio: {noncardio_windows:,} windows ({distribution['noncardio']:.2%})")
-            print(f"  Negative: {negative_windows:,} windows ({distribution['negative']:.2%})")
+            distribution = {
+                'edema_0': edema_0_windows / valid_total,
+                'edema_1': edema_1_windows / valid_total,
+                'edema_0_count': edema_0_windows,
+                'edema_1_count': edema_1_windows,
+            }
+
+            if self.accelerator is None or self.accelerator.is_main_process:
+                print(f"\n[StratifiedPatientSampler] Window-level edema distribution (유효 라벨만):")
+                print(f"  No edema (0): {edema_0_windows:,} windows ({distribution['edema_0']:.2%})")
+                print(f"  Has edema (1): {edema_1_windows:,} windows ({distribution['edema_1']:.2%})")
+
+        else:
+            # Legacy: count 3-class distribution
+            cardio_windows = 0
+            noncardio_windows = 0
+            negative_windows = 0
+            unlabeled_windows = 0
+
+            for batch in self.batches:
+                for patient_idx in batch:
+                    meta = self.dataset.label_metadata[patient_idx]
+                    for label in meta['label_series']:
+                        if label == 2:
+                            cardio_windows += 1
+                        elif label == 1:
+                            noncardio_windows += 1
+                        elif label == 0:
+                            negative_windows += 1
+                        else:
+                            unlabeled_windows += 1
+
+            valid_total = cardio_windows + noncardio_windows + negative_windows
+
+            if valid_total == 0:
+                return {'cardio': 0.33, 'noncardio': 0.33, 'negative': 0.34, 'cardio_count': 0, 'noncardio_count': 0, 'negative_count': 0}
+
+            distribution = {
+                'cardio': cardio_windows / valid_total,
+                'noncardio': noncardio_windows / valid_total,
+                'negative': negative_windows / valid_total,
+                'negative_count': negative_windows,
+                'noncardio_count': noncardio_windows,
+                'cardio_count': cardio_windows
+            }
+
+            if self.accelerator is None or self.accelerator.is_main_process:
+                print(f"\n[StratifiedPatientSampler] Window-level class distribution (유효 라벨만):")
+                print(f"  Cardio: {cardio_windows:,} windows ({distribution['cardio']:.2%})")
+                print(f"  Non-cardio: {noncardio_windows:,} windows ({distribution['noncardio']:.2%})")
+                print(f"  Negative: {negative_windows:,} windows ({distribution['negative']:.2%})")
             print(f"  Unlabeled (CE에서 제외됨): {unlabeled_windows:,} windows")
             print(f"  Total valid: {valid_total:,} windows")
 

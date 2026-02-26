@@ -5,8 +5,8 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
 
     # wandb
-    parser.add_argument('--project_name', type=str, default="TSC_analysis", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="6", help="Experiment ID")
+    parser.add_argument('--project_name', type=str, default="Multi_task", help="Wandb project name")
+    parser.add_argument('--experiment_id', type=str, default="1", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
 
     # Modality Selection
@@ -16,9 +16,9 @@ def parse_arguments():
     parser.add_argument('--img_to_3ch', type=bool, default=False, help='Convert grayscale to 3-channel (for ResNet)')
 
     # dataset & sampler
-    parser.add_argument('--train_batch_size', type=int, default=64)
-    parser.add_argument('--val_batch_size', type=int, default=64)
-    parser.add_argument('--test_batch_size', type=int, default=64)
+    parser.add_argument('--train_batch_size', type=int, default=128)
+    parser.add_argument('--val_batch_size', type=int, default=128)
+    parser.add_argument('--test_batch_size', type=int, default=128)
 
     parser.add_argument('--train_ratio', type=float, default=0.75, help='Train dataset ratio')
     parser.add_argument('--val_ratio', type=float, default=0.15, help='Validation dataset ratio')
@@ -31,40 +31,49 @@ def parse_arguments():
     parser.add_argument('--stride', type=int, default=1, help='Sliding window moving stride')
 
     # Augmentation (Gaussian noise on fused window embeddings)
-    parser.add_argument('--aug_noise_type', type=str, default='gaussian', help='Noise type for augmentation: gaussian | uniform | laplace')
-    parser.add_argument('--aug_epsilon', type=float, default=0.2, help='Noise scale for augmentation (controls cosine similarity between views)')
+    # parser.add_argument('--aug_noise_type', type=str, default='gaussian', help='Noise type for augmentation: gaussian | uniform | laplace')
+    # parser.add_argument('--aug_epsilon', type=float, default=0.2, help='Noise scale for augmentation (controls cosine similarity between views)')
 
-    # Supervised Contrastive Loss (Basic SupCon) - 현재 미사용
-    parser.add_argument('--use_supcon', type=bool, default=False, help='Enable supervised contrastive loss')
-    parser.add_argument('--scl_weight', type=float, default=0.3, help='Supervised contrastive loss weight') # Lambda
-    parser.add_argument('--scl_temperature', type=float, default=0.4, help='Temperature for supervised contrastive loss')
+    # # Supervised Contrastive Loss (Basic SupCon)
+    # parser.add_argument('--use_supcon', type=bool, default=True, help='Enable supervised contrastive loss')
+    # parser.add_argument('--scl_weight', type=float, default=0.3, help='Supervised contrastive loss weight') # Lambda
+    # parser.add_argument('--scl_temperature', type=float, default=0.1, help='Temperature for supervised contrastive loss')
 
     # Target-based Supervised Contrastive Loss
-    parser.add_argument('--use_target_supcon', type=bool, default=True, help='Enable Target_SupCon loss (KCL + TSC)')
-    parser.add_argument('--target_supcon_weight', type=float, default=1.0, help='Target_SupCon loss weight')
-    parser.add_argument('--target_supcon_temperature', type=float, default=0.2, help='Temperature for Target_SupCon KCL')
-    parser.add_argument('--target_supcon_queue_size', type=int, default=2048, help='Queue size for Target_SupCon')
-    parser.add_argument('--target_supcon_K', type=int, default=6, help='Max number of positives per anchor in Target_SupCon')       # 0으로 설정 시 지도대조학습과 동일함.
-    parser.add_argument('--target_supcon_tw', type=float, default=0.5, help='Weight for TSC loss in Target_SupCon')
-    parser.add_argument('--target_supcon_momentum', type=float, default=0.9, help='Momentum for centroid EMA in Target_SupCon')
-    parser.add_argument('--target_path', type=str, default=None, help='Path to optimal target .npy file for Target_SupCon')
-    parser.add_argument('--target_supcon_tr', type=int, default=9, help="Target vector")
+    # parser.add_argument('--use_target_supcon', type=bool, default=False, help='Enable Target_SupCon loss (KCL + TSC)')
+    # parser.add_argument('--target_supcon_weight', type=float, default=1.0, help='Target_SupCon loss weight')
+    # parser.add_argument('--target_supcon_temperature', type=float, default=0.2, help='Temperature for Target_SupCon KCL')
+    # parser.add_argument('--target_supcon_queue_size', type=int, default=2048, help='Queue size for Target_SupCon')
+    # parser.add_argument('--target_supcon_K', type=int, default=6, help='Max number of positives per anchor in Target_SupCon')       # 0으로 설정 시 지도대조학습과 동일함.
+    # parser.add_argument('--target_supcon_tw', type=float, default=0.5, help='Weight for TSC loss in Target_SupCon')
+    # parser.add_argument('--target_supcon_momentum', type=float, default=0.9, help='Momentum for centroid EMA in Target_SupCon')
+    # parser.add_argument('--target_path', type=str, default=None, help='Path to optimal target .npy file for Target_SupCon')
+    # parser.add_argument('--target_supcon_tr', type=int, default=9, help="Target vector")
 
-    # Cross-Entropy Loss (Stage 2)
-    parser.add_argument('--use_ce', type=bool, default=False, help='Enable cross-entropy loss for classification')
+    # Binary Cross-Entropy Loss (Edema Detection - Multi-task Learning)
+    parser.add_argument('--use_bce', type=bool, default=True, help='Enable BCE loss for edema detection')
+    parser.add_argument('--bce_weight', type=float, default=1.0, help='Binary cross-entropy loss weight')
+
+    # Cross-Entropy Loss
+    parser.add_argument('--use_ce', type=bool, default=True, help='Enable cross-entropy loss for classification')
     parser.add_argument('--ce_weight', type=float, default=1.0, help='Cross-entropy loss weight')
 
+    parser.add_argument('--use_ucl', type=bool, default=True)
+    parser.add_argument('--ucl_weight', type=float, default=0.1, help='Unsupervised contrastive loss weight')
+    parser.add_argument('--ucl_beta', type=float, default=1.0, help='Beta for unsupervised contrastive loss')
+    parser.add_argument('--ucl_temperature', type=float, default=0.1, help='Temperature for unsupervised contrastive loss')
+
     # Single-Stage Training
-    # parser.add_argument('--single_stage_epochs', type=int, default=50, help='Number of epochs for single-stage training')
-    # parser.add_argument('--single_learning_rate', type=float, default=1e-4, help='Learning rate at single training stage')
-    # parser.add_argument('--single_patience', type=int, default=5, help='Early stopping patience') # Stage 1 early stopping patience
+    parser.add_argument('--single_stage_epochs', type=int, default=100, help='Number of epochs for single-stage training')
+    parser.add_argument('--single_learning_rate', type=float, default=5e-5, help='Learning rate at single training stage')
+    parser.add_argument('--single_patience', type=int, default=5, help='Early stopping patience') # Stage 1 early stopping patience
     
     # Gradient Accumulation for Multi-GPU
     # parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help='Gradient accumulation steps - 멀티 GPU 안정성 향상')
 
     # model
     ## time-series modal
-    parser.add_argument('--ts_encoder_input_size', type=int, default=56, help="Input size for TF") # default=Variable 28 + observed_mask 28
+    parser.add_argument('--ts_encoder_input_size', type=int, default=29, help="Input size for TF") # default=Variable 28 + observed_mask 28
     parser.add_argument('--ts_encoder_hidden_size', type=int, default=512, help="Hidden size for TF")
     parser.add_argument('--ts_encoder_num_layers', type=int, default=2, help="The number of layers in TF")
 
@@ -79,10 +88,10 @@ def parse_arguments():
     parser.add_argument('--num_iterations', type=int, default=2, help='cross attention iteration number')
 
     ## Projection_head
-    parser.add_argument('--use_projection', type=bool, default=True, help='Use projection head for contrastive learning in Stage 1. If False, use encoder output (z) directly.')
-    parser.add_argument('--head_input_dim', type=int, default=256, help='projection head input dim')  # Updated for Perceiver-TS (512-dim output)
-    parser.add_argument('--head_hidden_dim1', type=int, default=128, help='projection head first hidden dim')
-    parser.add_argument('--head_hidden_dim2', type=int, default=128, help='projection head second hidden dim - Keep 512 for better contrastive clustering')
+    # parser.add_argument('--use_projection', type=bool, default=True, help='Use projection head for contrastive learning in Stage 1. If False, use encoder output (z) directly.')
+    # parser.add_argument('--head_input_dim', type=int, default=256, help='projection head input dim')  # Updated for Perceiver-TS (512-dim output)
+    # parser.add_argument('--head_hidden_dim1', type=int, default=128, help='projection head first hidden dim')
+    # parser.add_argument('--head_hidden_dim2', type=int, default=128, help='projection head second hidden dim - Keep 512 for better contrastive clustering')
 
     # Visualization
     ## UMAP
@@ -102,7 +111,7 @@ def parse_arguments():
     ##################################################################################################################################
     # Two-Stage Training
     parser.add_argument('--use_two_stage', type=bool, default=False, help='Use two-stage training: contrastive pretraining + classification')
-    parser.add_argument('--stage1_only', type=bool, default=True, help='Run only stage 1 (contrastive pretraining)')
+    parser.add_argument('--stage1_only', type=bool, default=False, help='Run only stage 1 (contrastive pretraining)')
     parser.add_argument('--stage2_only', type=bool, default=False, help='Run only stage 2 (classification from pretrained)')
     parser.add_argument('--stage1_epochs', type=int, default=40, help='Number of epochs for stage 1 (contrastive pretraining)')
     parser.add_argument('--stage2_epochs', type=int, default=30, help='Number of epochs for stage 2 (classification)')
@@ -124,8 +133,9 @@ def parse_arguments():
 
     if args.use_two_stage:
         args.wandb_run_name = f"{args.experiment_id}: [GPU 0] temp=0.7/Optimal_hyperparam_search/Img_Text_Tuning/Fine-tuning"
+    # single stage
     else:
-        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] TSC_analysis_1/Improve_stage1_representation"
+        args.wandb_run_name = f"{args.experiment_id}: [GPU 1] Multi-task First Training"
 
     # ===================================================================================================
 
@@ -151,7 +161,7 @@ def parse_arguments():
             print(f"⚠️  [Stage 2 Only] Stage 1 model not found at: {actual_stage1_path}")
             print(f"    Will try default path: {args.stage1_model_path}")
 
-    if args.target_path is None and args.use_target_supcon:
-        args.target_path = f'./output/targets/optimal_target_{args.num_classes}_{args.head_hidden_dim2}.npy'
+    # if args.target_path is None and args.use_target_supcon:
+    #     args.target_path = f'./output/targets/optimal_target_{args.num_classes}_{args.head_hidden_dim2}.npy'
 
     return args

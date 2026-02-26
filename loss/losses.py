@@ -7,7 +7,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from training.run import parse_arguments
+# from training.run import parse_arguments
 from utils import timer
 
 
@@ -40,7 +40,7 @@ class MultiModalLoss(nn.Module):
                 self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights.float(), ignore_index=-1)
                 print(f"[Loss] Standard CE Loss with class weights")
         
-        # CE loss without class weights (현재는 사용하고 있지 않음.)
+        # CE loss without class weights
         else:
             print("[Loss] CE Loss without class weights")
             if self.use_label_smooth:
@@ -50,133 +50,271 @@ class MultiModalLoss(nn.Module):
                 self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
                 print(f"[Loss] Standard CE Loss")
 
+        # ==================== Binary Cross-Entropy Loss (Edema Detection) ====================
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')  # reduction='none' for manual filtering
+        print(f"[Loss] BCE Loss initialized for edema detection")
+        
+
+        # ==================== Temporal Neighbor based Contrastive Learning (For Generalization) ====================
+        self.use_ucl = args.use_ucl
+        if self.use_ucl:
+            self.ucl_loss_fn = ConstrainttimeLoss(ucl_beta=args.ucl_beta)
+            self.ucl_temperature = args.ucl_temperature
+            print(f"[Loss] Temporal UCL enabled (temperature={self.ucl_temperature})")
+        else: 
+            self.ucl_loss_fn = None
+            print(f"[Loss] Temporal UCL disabled")
+
         # ==================== Supervised Contrastive Loss ====================
-        self.use_supcon = args.use_supcon
-        if self.use_supcon:
-            self.supcon_loss_fn = SupConLoss()
-            self.scl_temperature = args.scl_temperature
-            print(f"[Loss] Supervised Contrastive Loss enabled (temperature={self.scl_temperature})")
-        else:
-            self.supcon_loss_fn = None
-            print(f"[Loss] Supervised Contrastive Loss disabled")
+        # self.use_supcon = args.use_supcon
+        # if self.use_supcon:
+        #     self.supcon_loss_fn = SupConLoss()
+        #     self.scl_temperature = args.scl_temperature
+        #     print(f"[Loss] Supervised Contrastive Loss enabled (temperature={self.scl_temperature})")
+        # else:
+        #     self.supcon_loss_fn = None
+        #     print(f"[Loss] Supervised Contrastive Loss disabled")
 
-        # ==================== Target_SupCon Loss (TSC + KCL) ====================
-        self.use_target_supcon = args.use_target_supcon
-        if self.use_target_supcon:
-            self.target_supcon_loss_fn = TSCwithQueue(
-                args=args,
-                embedding_dim=args.head_hidden_dim2,
-                queue_size=args.target_supcon_queue_size,
-                n_cls=args.num_classes,
-                T=args.target_supcon_temperature,
-                num_positive=args.target_supcon_K,
-                targeted=True,
-                tr=args.target_supcon_tr,
-                sep_t=True,
-                tw=args.target_supcon_tw
-            )
-            print(f"[Loss] TSCwithQueue Loss enabled")
-            print(f"       - Queue Size: {args.target_supcon_queue_size}")
-            print(f"       - Temperature: {args.target_supcon_temperature}")
-            print(f"       - K (max positives): {args.target_supcon_K}")
-            print(f"       - TSC Weight (tw): {args.target_supcon_tw}")
-            print(f"       - Embedding Dim: {args.head_hidden_dim2}")
-        else:
-            self.target_supcon_loss_fn = None
-            print(f"[Loss] TSCwithQueue Loss disabled")
+        # # ==================== Target_SupCon Loss (TSC + KCL) ====================
+        # self.use_target_supcon = args.use_target_supcon
+        # if self.use_target_supcon:
+        #     self.target_supcon_loss_fn = TSCwithQueue(
+        #         args=args,
+        #         embedding_dim=args.head_hidden_dim2,
+        #         queue_size=args.target_supcon_queue_size,
+        #         n_cls=args.num_classes,
+        #         T=args.target_supcon_temperature,
+        #         num_positive=args.target_supcon_K,
+        #         targeted=True,
+        #         tr=args.target_supcon_tr,
+        #         sep_t=True,
+        #         tw=args.target_supcon_tw
+        #     )
+        #     print(f"[Loss] TSCwithQueue Loss enabled")
+        #     print(f"       - Queue Size: {args.target_supcon_queue_size}")
+        #     print(f"       - Temperature: {args.target_supcon_temperature}")
+        #     print(f"       - K (max positives): {args.target_supcon_K}")
+        #     print(f"       - TSC Weight (tw): {args.target_supcon_tw}")
+        #     print(f"       - Embedding Dim: {args.head_hidden_dim2}")
+        # else:
+        #     self.target_supcon_loss_fn = None
+        #     print(f"[Loss] TSCwithQueue Loss disabled")
 
-    def cross_entropy(self, logits, labels):
-        # logits: [B, W, num_classes]
-        # labels: [B, W]
-        logits_flat = logits.view(-1, logits.size(-1)).float()
-        labels_flat = labels.view(-1).long()                    
-        ce_loss = self.ce_loss(logits_flat, labels_flat)
+    ###########################################################################
+    def cross_entropy(self, subtype_logits, subtype_labels, edema_labels, window_mask):
+        """
+        Subtype classification loss (Cross-Entropy)
+        Only applies to windows where:
+        - window_mask == 1 (valid, non-padded)
+        - edema_labels == 1 (edema-positive)
+        - subtype_labels in {0, 1} (valid subtype labels)
+
+        Args:
+            subtype_logits: [B, W, 2] - subtype classifier output
+            subtype_labels: [B, W] - subtype labels {0: non-cardiogenic, 1: cardiogenic, -1: unlabeled}
+            edema_labels: [B, W] - edema labels {0, 1}
+            window_mask: [B, W] - valid window mask
+        """
+        # Flatten tensors
+        logits_flat = subtype_logits.view(-1, 2).float()      # [B*W, C=2]
+        subtype_labels_flat = subtype_labels.view(-1).long()  # [B*W]
+        edema_labels_flat = edema_labels.view(-1).long()      # [B*W]
+        window_mask_flat = window_mask.view(-1).bool()        # [B*W]
+
+        # Filter (Valid window + Edema-positive + Valid subtype label)
+        valid_mask = (window_mask_flat &                                            # Valid windows
+                    (edema_labels_flat == 1) &                                      # Edema-positive samples only
+                    ((subtype_labels_flat == 0) | (subtype_labels_flat == 1)))      # For subtype classification
+
+        # 보호장치
+        if valid_mask.sum() == 0:
+            return torch.tensor(0.0, device=subtype_logits.device, requires_grad=False)
+
+        # Extract valid samples
+        logits_valid = logits_flat[valid_mask]           # [N_valid, 2]
+        labels_valid = subtype_labels_flat[valid_mask]   # [N_valid] in {0, 1}
+
+        ce_loss = self.ce_loss(logits_valid, labels_valid)
         return ce_loss
 
-    def forward(self, classification_input, seq_valid_mask, logits, labels, window_mask, stay_ids, device,
-                ce_weight=0.0, scl_weight=0.0,
-                target_supcon_weight=0.0, 
-                # window_time_indices=None, 
-                accelerator=None,
-                projected_embeddings_multiview=None, current_epoch=None, total_epochs=None):
+    def binary_cross_entropy(self, edema_logits, edema_labels, window_mask):
+        edema_logits_flat = edema_logits.view(-1).float()   # [B*W]
+        edema_labels_flat = edema_labels.view(-1).float()     # [B*W]
+        window_mask_flat = window_mask.view(-1).bool()        # [B*W]
 
-        # -------------------- (1) CE Loss --------------------
+        valid_mask = window_mask_flat & (edema_labels_flat != -1)
+
+        if valid_mask.sum() == 0:
+            return torch.tensor(0.0, device=edema_logits.device, requires_grad=False)
+
+        logits_valid = edema_logits_flat[valid_mask]
+        labels_valid = edema_labels_flat[valid_mask]
+
+        loss_per_sample = self.bce_loss(logits_valid, labels_valid)
+        bce_loss = loss_per_sample.mean()
+
+        return bce_loss
+
+    def forward(self,
+                # Model outputs
+                edema_logits, subtype_logits, valid_embeddings,
+                window_time_indices, batch_indices,
+                # Labels
+                edema_labels, subtype_labels, window_mask,
+                # Loss weights
+                bce_weight=0.0, ce_weight=0.0, ucl_weight=0.0,
+                # Misc
+                device=None, accelerator=None
+        ):
+        if device is None:
+            device = edema_logits.device
+
+        # -------------------- (0) Binary CE Loss (Edema Detection) --------------------
+        if bce_weight > 0.0 and edema_logits is not None and edema_labels is not None:
+            with timer("BCE Loss", accelerator):
+                bce_loss = self.binary_cross_entropy(edema_logits, edema_labels, window_mask)
+        else:
+            bce_loss = torch.tensor(0.0, device=device, requires_grad=False)
+
+        # -------------------- (1) CE Loss (Subtype Classification) --------------------
         if ce_weight > 0.0:
             with timer("CE Loss", accelerator):
-                ce_loss = self.cross_entropy(logits, labels)
+                ce_loss = self.cross_entropy(subtype_logits, subtype_labels, edema_labels, window_mask)
         else:
             ce_loss = torch.tensor(0.0, device=device, requires_grad=False)
 
-        # -------------------- (2) Supervised Contrastive Loss --------------------
-        if self.use_supcon and scl_weight > 0.0:
-            with timer("Supervised Contrastive Loss", accelerator):
-                supcon_input = projected_embeddings_multiview if projected_embeddings_multiview is not None else classification_input
-                scl_loss = self.supcon_loss_fn(
-                    embeddings=supcon_input,
-                    labels=labels,
-                    window_mask=window_mask,
-                    temperature=self.scl_temperature
+        # -------------------- (2) Temporal UCL Loss --------------------
+        if self.use_ucl and ucl_weight > 0.0:
+            with timer("Temporal UCL Loss", accelerator):
+                ucl_loss = self.ucl_loss_fn(
+                    embeddings=valid_embeddings,
+                    time_indices=window_time_indices,
+                    batch_indices=batch_indices,
+                    temperature=self.ucl_temperature,
+                    accelerator=accelerator
                 )
         else:
-            scl_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            ucl_loss = torch.tensor(0.0, device=device, requires_grad=False)
 
-        # -------------------- (2-1) Target_SupCon Loss (KCL + TSC) --------------------
-        if self.use_target_supcon and target_supcon_weight > 0.0 and projected_embeddings_multiview is not None:
-            with timer("Target_SupCon Loss", accelerator):
-                # Multi-view projections: [Nwin, 2, D]
-                z_view0 = projected_embeddings_multiview[:, 0, :]  # [Nwin, D]
-                z_view1 = projected_embeddings_multiview[:, 1, :]  # [Nwin, D]
+        # unused code
+        #####################################################################################################################################
+        # # -------------------- (2) Supervised Contrastive Loss (Subtype Classification) --------------------
+        # # NOTE: For multi-task learning, only apply contrastive loss to edema=1 samples with labeled subtypes
+        # if self.use_supcon and scl_weight > 0.0:
+        #     with timer("Supervised Contrastive Loss", accelerator):
+        #         supcon_input = projected_embeddings_multiview if projected_embeddings_multiview is not None else classification_input
 
-                B, W = labels.shape
-                labels_flat = labels.reshape(B * W)
-                mask_flat = window_mask.reshape(B * W).bool()
-                labels_valid = labels_flat[mask_flat]  # [Nwin]
+        #         # Multi-task filtering: only use edema=1 AND subtype IN {1,2} samples
+        #         if edema_labels is not None:
+        #             # Create filtered inputs for SupCon
+        #             B, W = subtype_labels.shape
+        #             subtype_labels_flat = subtype_labels.reshape(B * W)
+        #             edema_labels_flat = edema_labels.reshape(B * W)
+        #             mask_flat = window_mask.reshape(B * W).bool()
 
-                # Filter out -1 labels (unlabeled samples)
-                labeled_mask = (labels_valid != -1)                 # [Nwin]
-                z_view0_labeled = z_view0[labeled_mask]             # [N_labeled, D]
-                z_view1_labeled = z_view1[labeled_mask]             # [N_labeled, D]
-                labels_labeled = labels_valid[labeled_mask]         # [N_labeled] - no -1
+        #             # Get valid windows
+        #             subtype_valid = subtype_labels_flat[mask_flat]  # [Nwin]
+        #             edema_valid = edema_labels_flat[mask_flat]      # [Nwin]
 
-                # TSCwithQueue forward: (v, v_tilde, y, update_queue)
-                loss_dict = self.target_supcon_loss_fn(
-                    v=z_view0_labeled,
-                    v_tilde=z_view1_labeled,
-                    y=labels_labeled,
-                    update_queue=True,
-                    current_epoch=current_epoch,
-                    total_epochs=total_epochs,
-                )
+        #             # Filter: edema==1 AND subtype IN {1, 2} (exclude NaN, -1, 0)
+        #             # Subtype labels: 1 (non-cardiogenic), 2 (cardiogenic)
+        #             has_edema = (edema_valid == 1)
+        #             has_subtype_label = (subtype_valid == 1) | (subtype_valid == 2)
+        #             contrastive_mask = has_edema & has_subtype_label
 
-                target_supcon_loss = loss_dict["loss"]  # KCL + TSC combined
-                loss_kcl = loss_dict["loss_kcl"]        # KCL only (for logging)
-                loss_tsc = loss_dict["loss_tsc"]        # TSC only (for logging)
-                softmax_self_prob = loss_dict["softmax_self_prob"]  # self-positive 포화도
+        #             if contrastive_mask.sum() > 0:
+        #                 # Filter embeddings and labels (single-view, no augmentation)
+        #                 # supcon_input: [Nwin, D] → filter → [N_contrastive, D]
+        #                 supcon_input_filtered = supcon_input[contrastive_mask]
+        #                 labels_filtered = subtype_valid[contrastive_mask]
 
-        else:
-            target_supcon_loss = torch.tensor(0.0, device=device, requires_grad=False)
-            loss_kcl = torch.tensor(0.0, device=device, requires_grad=False)
-            loss_tsc = torch.tensor(0.0, device=device, requires_grad=False)
-            softmax_self_prob = 0.0
+        #                 # Create a temporary window mask (all 1s since we already filtered)
+        #                 temp_window_mask = torch.ones(labels_filtered.shape[0], device=device, dtype=torch.bool)
+
+        #                 # Reshape for SupConLoss: expects [B, W, D] format
+        #                 # We treat filtered samples as a single "batch" with W windows
+        #                 scl_loss = self.supcon_loss_fn(
+        #                     embeddings=supcon_input_filtered.unsqueeze(0),  # [1, N_contrastive, D]
+        #                     labels=labels_filtered.unsqueeze(0),  # [1, N_contrastive]
+        #                     window_mask=temp_window_mask.unsqueeze(0),  # [1, N_contrastive]
+        #                     temperature=self.scl_temperature
+        #                 )
+        #             else:
+        #                 # No samples for contrastive learning
+        #                 scl_loss = torch.tensor(0.0, device=device, requires_grad=False)
+        #         else:
+        #             # Legacy behavior: use all labeled samples
+        #             scl_loss = self.supcon_loss_fn(
+        #                 embeddings=supcon_input,
+        #                 labels=labels,
+        #                 window_mask=window_mask,
+        #                 temperature=self.scl_temperature
+        #             )
+        # else:
+        #     scl_loss = torch.tensor(0.0, device=device, requires_grad=False)
+
+        # # -------------------- (2-1) Target_SupCon Loss (KCL + TSC) --------------------
+        # if self.use_target_supcon and target_supcon_weight > 0.0 and projected_embeddings_multiview is not None:
+        #     with timer("Target_SupCon Loss", accelerator):
+        #         # Multi-view projections: [Nwin, 2, D]
+        #         z_view0 = projected_embeddings_multiview[:, 0, :]  # [Nwin, D]
+        #         z_view1 = projected_embeddings_multiview[:, 1, :]  # [Nwin, D]
+
+        #         B, W = labels.shape
+        #         labels_flat = labels.reshape(B * W)
+        #         mask_flat = window_mask.reshape(B * W).bool()
+        #         labels_valid = labels_flat[mask_flat]  # [Nwin]
+
+        #         # Filter out -1 labels (unlabeled samples)
+        #         labeled_mask = (labels_valid != -1)                 # [Nwin]
+        #         z_view0_labeled = z_view0[labeled_mask]             # [N_labeled, D]
+        #         z_view1_labeled = z_view1[labeled_mask]             # [N_labeled, D]
+        #         labels_labeled = labels_valid[labeled_mask]         # [N_labeled] - no -1
+
+        #         # TSCwithQueue forward: (v, v_tilde, y, update_queue)
+        #         loss_dict = self.target_supcon_loss_fn(
+        #             v=z_view0_labeled,
+        #             v_tilde=z_view1_labeled,
+        #             y=labels_labeled,
+        #             update_queue=True,
+        #             current_epoch=current_epoch,
+        #             total_epochs=total_epochs,
+        #         )
+
+        #         target_supcon_loss = loss_dict["loss"]  # KCL + TSC combined
+        #         loss_kcl = loss_dict["loss_kcl"]        # KCL only (for logging)
+        #         loss_tsc = loss_dict["loss_tsc"]        # TSC only (for logging)
+
+        # else:
+        #     target_supcon_loss = torch.tensor(0.0, device=device, requires_grad=False)
+        #     loss_kcl = torch.tensor(0.0, device=device, requires_grad=False)
+        #     loss_tsc = torch.tensor(0.0, device=device, requires_grad=False)
+        #####################################################################################################################################
 
         # -------------------- NaN Detection --------------------
+        if torch.isnan(bce_loss) or torch.isinf(bce_loss):
+            print(f"[WARNING] BCE Loss is NaN/Inf: {bce_loss.item()}")
+
         if torch.isnan(ce_loss) or torch.isinf(ce_loss):
             print(f"[WARNING] CE Loss is NaN/Inf: {ce_loss.item()}")
 
-        if torch.isnan(scl_loss) or torch.isinf(scl_loss):
-            print(f"[WARNING] SCL Loss is NaN/Inf: {scl_loss.item()}")
+        if torch.isnan(ucl_loss) or torch.isinf(ucl_loss):
+            print(f"[WARNING] Temporal UCL Loss is NaN/Inf: {ucl_loss.item()}")
 
-        if torch.isnan(target_supcon_loss) or torch.isinf(target_supcon_loss):
-            print(f"[WARNING] Target_SupCon Loss is NaN/Inf: {target_supcon_loss.item()}")
+        # if torch.isnan(scl_loss) or torch.isinf(scl_loss):
+        #     print(f"[WARNING] SCL Loss is NaN/Inf: {scl_loss.item()}")
+
+        # if torch.isnan(target_supcon_loss) or torch.isinf(target_supcon_loss):
+        #     print(f"[WARNING] Target_SupCon Loss is NaN/Inf: {target_supcon_loss.item()}")
 
         # -------------------- Total Loss --------------------
         total_loss = (
+            bce_weight * bce_loss +
             ce_weight * ce_loss +
-            scl_weight * scl_loss +
-            target_supcon_weight * target_supcon_loss  # KCL + TSC combined
+            ucl_weight * ucl_loss
         )
 
-        return total_loss, ce_loss, scl_loss, target_supcon_loss, loss_kcl, loss_tsc, softmax_self_prob
+        return total_loss, bce_loss, ce_loss, ucl_loss
     
     # validation & test
     def inference(self, classification_input, logits, labels, window_mask):
@@ -188,495 +326,563 @@ class MultiModalLoss(nn.Module):
         }
 
 
-class TSCwithQueue(nn.Module):
+class ConstrainttimeLoss(nn.Module):
     """
-    - Loss와 Queue를 관리하는 최상위 모듈
+    Temporal Neighbor Contrastive Loss (Single-View, No Augmentation)
+
+    - 같은 환자의 시간적으로 가까운 window끼리 embedding을 가까이 당김 (pull)
+    - 시간 거리에 반비례하는 가중치: w(i,j) = 1 / (beta + |t_i - t_j|)
+    - Weighted InfoNCE loss 사용
+
+    Args:
+        beta: Time distance weight decay factor (default: 1.0)
     """
-    def __init__(self, args, embedding_dim=128, queue_size=8192, n_cls=3, T=0.07, num_positive=6, targeted=True, tr=1, sep_t=True, tw=1.0):
+    def __init__(self, ucl_beta=None):
         super().__init__()
+        self.beta = ucl_beta
+        self.very_neg = -1e9
+
+    def forward(self, embeddings, time_indices, batch_indices, temperature, accelerator=None):
+        """
+        Args:
+            embeddings: [N_valid, D] - valid window embeddings (already filtered by model)
+            time_indices: [N_valid] - temporal indices for each window
+            batch_indices: [N_valid] - batch (patient) indices for each window
+            window_mask: [B, W] - not used (already filtered in model)
+            temperature: temperature for InfoNCE
+            accelerator: accelerator object for logging
+        """
+        device = embeddings.device
+        N = embeddings.size(0)
+
+        # Early exit if not enough samples
+        if N < 2:
+            return torch.tensor(0.0, device=device, requires_grad=False)
+
+        # Normalize embeddings (if not already normalized)
+        z = F.normalize(embeddings, p=2, dim=-1)  # [N, D]
+
+        # ------------------------------------------------------------------
+        # Time-aware Pull Loss (Weighted InfoNCE)
+        # ------------------------------------------------------------------
+        # Compute similarity matrix: [N, N]
+        sim = torch.matmul(z, z.T) / temperature
+
+        # Mask diagonal (self-contrast)
+        mask_self = torch.eye(N, dtype=torch.bool, device=device)
+        sim = sim.masked_fill(mask_self, self.very_neg)
+
+        # Compute time-aware positive mask and weights
+        same_patient = batch_indices.unsqueeze(1) == batch_indices.unsqueeze(0)  # [N, N]
+        time_dist = (time_indices.unsqueeze(1) - time_indices.unsqueeze(0)).abs()  # [N, N]
+        mask_pos = same_patient & (time_dist > 0)  # Exclude self, same patient only
+
+        # Time-aware weights: closer in time = higher weight
+        w = torch.zeros_like(sim)
+        w[mask_pos] = (1.0 / (self.beta + time_dist[mask_pos].float())).to(w.dtype)
+        w = w / (w.sum(dim=1, keepdim=True) + 1e-8)  # Normalize weights
+
+        # Weighted InfoNCE loss
+        pull_loss = -(w * F.log_softmax(sim, dim=1)).sum(dim=1).mean()
+
+        if accelerator is not None and accelerator.is_main_process:
+            num_pos_pairs = mask_pos.sum().item()
+            total_pairs = N * (N - 1)
+            pos_ratio = 100.0 * num_pos_pairs / total_pairs if total_pairs > 0 else 0.0
+
+            # print(f"[Temporal UCL] Loss={pull_loss.item():.4f} | "
+            #     f"Positive pairs: {num_pos_pairs}/{total_pairs} ({pos_ratio:.1f}%) | "
+            #     f"Samples: {N}")
+
+        return pull_loss
+
+
+
+# class TSCwithQueue(nn.Module):
+#     """
+#     - Loss와 Queue를 관리하는 최상위 모듈
+#     """
+#     def __init__(self, args, embedding_dim=128, queue_size=8192, n_cls=3, T=0.07, num_positive=6, targeted=True, tr=1, sep_t=True, tw=1.0):
+#         super().__init__()
         
-        self.queue = TSCQueue(
-            embedding_dim=embedding_dim,
-            queue_size=queue_size,
-        )
+#         self.queue = TSCQueue(
+#             embedding_dim=embedding_dim,
+#             queue_size=queue_size,
+#         )
 
-        self.kcl = KCL(
-            dim=embedding_dim,
-            K=queue_size,
-            T=T,
-            num_positive=num_positive,
-            targeted=targeted,
-            tr=tr,
-            sep_t=sep_t,
-            tw=tw,
-        )
+#         self.kcl = KCL(
+#             dim=embedding_dim,
+#             K=queue_size,
+#             T=T,
+#             num_positive=num_positive,
+#             targeted=targeted,
+#             tr=tr,
+#             sep_t=sep_t,
+#             tw=tw,
+#         )
 
-    def forward(self, v, v_tilde, y, update_queue=True, current_epoch=None, total_epochs=None):
-        queue_v, queue_labels = self.queue.get()
+#     def forward(self, v, v_tilde, y, update_queue=True, current_epoch=None, total_epochs=None):
+#         queue_v, queue_labels = self.queue.get()
 
-        logits, _, q, loss, loss_class, loss_target, softmax_self_prob = self.kcl(
-            v=v,
-            v_tilde=v_tilde,
-            y=y,
-            queue_v=queue_v,
-            queue_labels=queue_labels,
-            current_epoch=current_epoch,
-            total_epochs=total_epochs,
-        )
+#         logits, _, q, loss, loss_class, loss_target, softmax_self_prob = self.kcl(
+#             v=v,
+#             v_tilde=v_tilde,
+#             y=y,
+#             queue_v=queue_v,
+#             queue_labels=queue_labels,
+#             current_epoch=current_epoch,
+#             total_epochs=total_epochs,
+#         )
 
-        if update_queue:
-            with torch.no_grad():
-                self.queue.enqueue(v, y)
+#         if update_queue:
+#             with torch.no_grad():
+#                 self.queue.enqueue(v, y)
 
-        return {
-            "loss": loss,
-            "loss_kcl": loss_class,
-            "loss_tsc": loss_target,
-            "logits": logits,
-            "embeddings": q,
-            "softmax_self_prob": softmax_self_prob,
-        }
-
-
-class TSCQueue(nn.Module):
-    """
-    TSC를 위한 FIFO Queue
-    - Momentum update 방식은 아님...
-    - 과거 배치의 임베딩과 라벨을 저장하여 대조학습의 negative samples 확보
-    """
-    def __init__(self, embedding_dim, queue_size, device=None):
-        super().__init__()
-        self.queue_size = queue_size
-        self.embedding_dim = embedding_dim
-
-        # [queue_size, Dim=128]
-        self.register_buffer("queue_embeds", F.normalize(torch.randn(queue_size, embedding_dim), dim=1))
-        self.register_buffer("queue_labels", torch.full((queue_size,), -100, dtype=torch.long)) # 결측 라벨도 아닌 -100을 사용함.
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-
-    @torch.no_grad()
-    def enqueue(self, embeddings, labels):
-        """
-        embeddings: [B, D]
-        labels: [B]
-        - 과거 샘플들의 feature와 label을 저장해서 TSC Loss의 분모 V_i를 구성함.
-        1. 새 임베딩을 normalize하여 unit sphere에 위치시킴.
-        2. queue_ptr 위치부터 순서대로 덮어씀.
-        3. Queue 끝을 넘으면 앞으로 돌아옴 (circular buffer)
-        4. Pointer를 다음 위치로 업데이트함.
-        """
-        z = F.normalize(embeddings.detach(), dim=1) # no-grad
-        labels = labels.detach().long()
-
-        B = z.size(0)                     # 모델에 들어온 배치 크기
-        ptr = int(self.queue_ptr.item())  # 현재 queue에 쓰기 시작할 위치
-        Q = self.queue_size               # 전체 queue 크기
-
-        # B >= Q인 경우: 배치가 queue 전체보다 크므로 최신 Q개만 사용 (FIFO)
-        if B >= Q:
-            z = z[-Q:]
-            labels = labels[-Q:]
-            B = Q
-
-        # circular enqueue
-        if ptr + B <= Q:
-            # 한 번에 다 들어가는 경우
-            self.queue_embeds[ptr:ptr + B] = z
-            self.queue_labels[ptr:ptr + B] = labels
-
-        else:
-            # queue size를 초과하는 경우 (첫 번째 빼고는 전부 else구문을 통해 업데이트될 것임.)
-            first = Q - ptr
-            # 일단 잔여 queue 끝까지 채우기
-            self.queue_embeds[ptr:] = z[:first]
-            self.queue_labels[ptr:] = labels[:first]
-            # 남은 것은 앞부터 채우기
-            self.queue_embeds[:B - first] = z[first:]
-            self.queue_labels[:B - first] = labels[first:]
-
-        self.queue_ptr[0] = (ptr + B) % Q # FIFO / 포인터도 업데이트함.
-
-    def get(self):
-        return self.queue_embeds, self.queue_labels
+#         return {
+#             "loss": loss,
+#             "loss_kcl": loss_class,
+#             "loss_tsc": loss_target,
+#             "logits": logits,
+#             "embeddings": q,
+#             "softmax_self_prob": softmax_self_prob,
+#         }
 
 
-class KCL(nn.Module):
-    """
-    1. KCL: Queue와 K를 사용해서 샘플링했을 뿐 supervised contrastive learning과 같은 개념
-    - Anchor와 같은 클래스 샘플 = positive
-    - Anchor와 다른 클래스 샘플 = negative
-    - Queue에서 K개의 positive만 샘플링하며, 이를 통해 클래스별 imbalance를 해소함.
-    - 그런데 이미지와 다르게 클래스별 임베딩 간 차이가 크지 않은 우리 연구에는 보완이 필요해보임.
+# class TSCQueue(nn.Module):
+#     """
+#     TSC를 위한 FIFO Queue
+#     - Momentum update 방식은 아님...
+#     - 과거 배치의 임베딩과 라벨을 저장하여 대조학습의 negative samples 확보
+#     """
+#     def __init__(self, embedding_dim, queue_size, device=None):
+#         super().__init__()
+#         self.queue_size = queue_size
+#         self.embedding_dim = embedding_dim
+
+#         # [queue_size, Dim=128]
+#         self.register_buffer("queue_embeds", F.normalize(torch.randn(queue_size, embedding_dim), dim=1))
+#         self.register_buffer("queue_labels", torch.full((queue_size,), -100, dtype=torch.long)) # 결측 라벨도 아닌 -100을 사용함.
+#         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+#     @torch.no_grad()
+#     def enqueue(self, embeddings, labels):
+#         """
+#         embeddings: [B, D]
+#         labels: [B]
+#         - 과거 샘플들의 feature와 label을 저장해서 TSC Loss의 분모 V_i를 구성함.
+#         1. 새 임베딩을 normalize하여 unit sphere에 위치시킴.
+#         2. queue_ptr 위치부터 순서대로 덮어씀.
+#         3. Queue 끝을 넘으면 앞으로 돌아옴 (circular buffer)
+#         4. Pointer를 다음 위치로 업데이트함.
+#         """
+#         z = F.normalize(embeddings.detach(), dim=1) # no-grad
+#         labels = labels.detach().long()
+
+#         B = z.size(0)                     # 모델에 들어온 배치 크기
+#         ptr = int(self.queue_ptr.item())  # 현재 queue에 쓰기 시작할 위치
+#         Q = self.queue_size               # 전체 queue 크기
+
+#         # B >= Q인 경우: 배치가 queue 전체보다 크므로 최신 Q개만 사용 (FIFO)
+#         if B >= Q:
+#             z = z[-Q:]
+#             labels = labels[-Q:]
+#             B = Q
+
+#         # circular enqueue
+#         if ptr + B <= Q:
+#             # 한 번에 다 들어가는 경우
+#             self.queue_embeds[ptr:ptr + B] = z
+#             self.queue_labels[ptr:ptr + B] = labels
+
+#         else:
+#             # queue size를 초과하는 경우 (첫 번째 빼고는 전부 else구문을 통해 업데이트될 것임.)
+#             first = Q - ptr
+#             # 일단 잔여 queue 끝까지 채우기
+#             self.queue_embeds[ptr:] = z[:first]
+#             self.queue_labels[ptr:] = labels[:first]
+#             # 남은 것은 앞부터 채우기
+#             self.queue_embeds[:B - first] = z[first:]
+#             self.queue_labels[:B - first] = labels[first:]
+
+#         self.queue_ptr[0] = (ptr + B) % Q # FIFO / 포인터도 업데이트함.
+
+#     def get(self):
+#         return self.queue_embeds, self.queue_labels
+
+
+# class KCL(nn.Module):
+#     """
+#     1. KCL: Queue와 K를 사용해서 샘플링했을 뿐 supervised contrastive learning과 같은 개념
+#     - Anchor와 같은 클래스 샘플 = positive
+#     - Anchor와 다른 클래스 샘플 = negative
+#     - Queue에서 K개의 positive만 샘플링하며, 이를 통해 클래스별 imbalance를 해소함.
+#     - 그런데 이미지와 다르게 클래스별 임베딩 간 차이가 크지 않은 우리 연구에는 보완이 필요해보임.
         
-    2. TSC: Target embedding을 사용하여 할당된 Target으로 클래스별 임베딩을 끌어당김.
-    - 각 클래스마다 optimal target embedding 사전 정의
-    - Class centroid ↔ Target embedding Hungarian algorithm based matching
-    - Target을 추가 positive로 사용하여 centroid로 수렴 유도 (전역적으로 밀어내는 효과도 있음.)
-    """
-    def __init__(self,
-        dim=128,            # projection head 후 임베딩 차원
-        K=8192,             # queue size
-        m=0.999,            # momentum encoder update ratio
-        T=0.07,             # temperature
-        num_positive=0,     # anchor 당 positive sampling 개수 (K)
-        targeted=False,     # target-based contrastive loss 사용 여부
-        tr=20, 
-        sep_t=True, 
-        tw=1                # target loss 가중치 (lambda)
-    ):
-        super(KCL, self).__init__()
+#     2. TSC: Target embedding을 사용하여 할당된 Target으로 클래스별 임베딩을 끌어당김.
+#     - 각 클래스마다 optimal target embedding 사전 정의
+#     - Class centroid ↔ Target embedding Hungarian algorithm based matching
+#     - Target을 추가 positive로 사용하여 centroid로 수렴 유도 (전역적으로 밀어내는 효과도 있음.)
+#     """
+#     def __init__(self,
+#         dim=128,            # projection head 후 임베딩 차원
+#         K=8192,             # queue size
+#         m=0.999,            # momentum encoder update ratio
+#         T=0.07,             # temperature
+#         num_positive=0,     # anchor 당 positive sampling 개수 (K)
+#         targeted=False,     # target-based contrastive loss 사용 여부
+#         tr=20, 
+#         sep_t=True, 
+#         tw=1                # target loss 가중치 (lambda)
+#     ):
+#         super(KCL, self).__init__()
 
-        self.K = K                          # queue size
-        self.m = m                          
-        self.T = T                          # temperature
-        self.num_positive = num_positive    # anchor 당 positive sampling 개수 (K)
-        self.n_cls = 3                      # The number of classes
-        self.targeted = targeted            # TSC 사용 여부
-        self.tr = tr                        # Target repeat 횟수
-        self.sep_t = sep_t
-        self.tw = tw                        # target-loss weight
+#         self.K = K                          # queue size
+#         self.m = m                          
+#         self.T = T                          # temperature
+#         self.num_positive = num_positive    # anchor 당 positive sampling 개수 (K)
+#         self.n_cls = 3                      # The number of classes
+#         self.targeted = targeted            # TSC 사용 여부
+#         self.tr = tr                        # Target repeat 횟수
+#         self.sep_t = sep_t
+#         self.tw = tw                        # target-loss weight
 
-        # ========================== optimal target embedding ==========================
-        optimal_target = np.load(OUTPUT_DIR + 'targets/optimal_target_{}_{}.npy'.format(self.n_cls, dim)) # [n_cls, dim]
-        optimal_target_order = np.arange(self.n_cls)
-        target_repeat = tr * np.ones(self.n_cls)
-        """
-        분모가 이미 aug pos 1개, K (queue), T_n (targets)로 구성되어 있는데, 이때 queue 8192개에 target이 3개라면 target은 거의 무시될 수 밖에 없는 구조임.
-        - 따라서 target을 tr배하여 분모 내에서 target의 영향력을 높임.
-        - 즉, target이 softmax 분모에서 사라지지 않도록 분모 weight를 맞추는 역할.
-        - 코드에 문제가 없다면, tr에 따른 실험이 필요함 [10, 100, 1000]
-        - (추가) tr을 과하게 설정하지 않는 것이 중요할 것을 보임.
-        """
-        optimal_target = torch.Tensor(optimal_target).float()
-        target_repeat = torch.Tensor(target_repeat).long()
-        optimal_target = torch.cat([optimal_target[i:i + 1, :].repeat(target_repeat[i], 1) for i in range(len(target_repeat))], dim=0)
-        target_labels = torch.cat([torch.Tensor([optimal_target_order[i]]).repeat(target_repeat[i]) for i in range(len(target_repeat))], dim=0).long().unsqueeze(-1)
+#         # ========================== optimal target embedding ==========================
+#         optimal_target = np.load(OUTPUT_DIR + 'targets/optimal_target_{}_{}.npy'.format(self.n_cls, dim)) # [n_cls, dim]
+#         optimal_target_order = np.arange(self.n_cls)
+#         target_repeat = tr * np.ones(self.n_cls)
+#         """
+#         분모가 이미 aug pos 1개, K (queue), T_n (targets)로 구성되어 있는데, 이때 queue 8192개에 target이 3개라면 target은 거의 무시될 수 밖에 없는 구조임.
+#         - 따라서 target을 tr배하여 분모 내에서 target의 영향력을 높임.
+#         - 즉, target이 softmax 분모에서 사라지지 않도록 분모 weight를 맞추는 역할.
+#         - 코드에 문제가 없다면, tr에 따른 실험이 필요함 [10, 100, 1000]
+#         - (추가) tr을 과하게 설정하지 않는 것이 중요할 것을 보임.
+#         """
+#         optimal_target = torch.Tensor(optimal_target).float()
+#         target_repeat = torch.Tensor(target_repeat).long()
+#         optimal_target = torch.cat([optimal_target[i:i + 1, :].repeat(target_repeat[i], 1) for i in range(len(target_repeat))], dim=0)
+#         target_labels = torch.cat([torch.Tensor([optimal_target_order[i]]).repeat(target_repeat[i]) for i in range(len(target_repeat))], dim=0).long().unsqueeze(-1)
 
-        self.register_buffer("optimal_target", optimal_target)
-        self.register_buffer("optimal_target_unique", optimal_target[::self.tr, :].contiguous().transpose(0, 1))
-        self.register_buffer("target_labels", target_labels)
+#         self.register_buffer("optimal_target", optimal_target)
+#         self.register_buffer("optimal_target_unique", optimal_target[::self.tr, :].contiguous().transpose(0, 1))
+#         self.register_buffer("target_labels", target_labels)
 
-        # Initialize class centroids (for EMA update during training)
-        self.register_buffer("class_centroid", torch.randn(self.n_cls, dim))
+#         # Initialize class centroids (for EMA update during training)
+#         self.register_buffer("class_centroid", torch.randn(self.n_cls, dim))
 
-        # Target Diagnosis
-        print(f"\n{'='*80}")
-        print(f"🎯 TSC Target Embeddings Loaded")
-        print(f"   File: optimal_target_{self.n_cls}_{dim}.npy")
-        print(f"   Shape after repeat (tr={tr}): {self.optimal_target.shape}")
-        print(f"   Expected: [{self.n_cls * tr}, {dim}] = [{self.n_cls}*{tr}, {dim}]")
-        print(f"   Target labels shape: {self.target_labels.shape}")
-        print(f"   Unique targets shape: {self.optimal_target_unique.shape}")
-        print(f"   Target embedding norms (first 3): {F.normalize(self.optimal_target[:3], dim=1).norm(dim=1).cpu().numpy()}")
-        print(f"   First target sample (class 0): {self.optimal_target[0, :5].cpu().numpy()}")
-        print(f"{'='*80}\n")
+#         # Target Diagnosis
+#         print(f"\n{'='*80}")
+#         print(f"🎯 TSC Target Embeddings Loaded")
+#         print(f"   File: optimal_target_{self.n_cls}_{dim}.npy")
+#         print(f"   Shape after repeat (tr={tr}): {self.optimal_target.shape}")
+#         print(f"   Expected: [{self.n_cls * tr}, {dim}] = [{self.n_cls}*{tr}, {dim}]")
+#         print(f"   Target labels shape: {self.target_labels.shape}")
+#         print(f"   Unique targets shape: {self.optimal_target_unique.shape}")
+#         print(f"   Target embedding norms (first 3): {F.normalize(self.optimal_target[:3], dim=1).norm(dim=1).cpu().numpy()}")
+#         print(f"   First target sample (class 0): {self.optimal_target[0, :5].cpu().numpy()}")
+#         print(f"{'='*80}\n")
 
-    def forward(
-        self,
-        v,                      # projection head output
-        v_tilde,                # augmentation(positive pair)
-        y,                      # labels
-        queue_v,
-        queue_labels,
-        current_epoch=None,     # Current epoch (for staged activation)
-        total_epochs=None,      # Total epochs (for staged activation)
-    ):
+#     def forward(
+#         self,
+#         v,                      # projection head output
+#         v_tilde,                # augmentation(positive pair)
+#         y,                      # labels
+#         queue_v,
+#         queue_labels,
+#         current_epoch=None,     # Current epoch (for staged activation)
+#         total_epochs=None,      # Total epochs (for staged activation)
+#     ):
 
-        device = v.device
-        B, D = v.shape
-        q = F.normalize(v, dim=1)         # [B, D] - 현재 배치의 anchor (query view)
-        k = F.normalize(v_tilde, dim=1)   # [B, D] - positive view (key view)
+#         device = v.device
+#         B, D = v.shape
+#         q = F.normalize(v, dim=1)         # [B, D] - 현재 배치의 anchor (query view)
+#         k = F.normalize(v_tilde, dim=1)   # [B, D] - positive view (key view)
 
-        qneg = F.normalize(queue_v.detach(), dim=1)  # [Q, D] - queue는 학습 대상이 아니므로 loss가 queue를 통해 과거 임베딩으로 역전파되는 것을 차단함.
-        qlab = queue_labels.detach().long()          # [Q]    - queue에 저장된 임베딩의 클래스 라벨
+#         qneg = F.normalize(queue_v.detach(), dim=1)  # [Q, D] - queue는 학습 대상이 아니므로 loss가 queue를 통해 과거 임베딩으로 역전파되는 것을 차단함.
+#         qlab = queue_labels.detach().long()          # [Q]    - queue에 저장된 임베딩의 클래스 라벨
 
-        # 사전에 계산해둔 128차원의 target load함.
-        use_target = self.targeted
-        if current_epoch is not None and total_epochs is not None:
-            prev_use_target = hasattr(self, '_prev_use_target') and self._prev_use_target
-            use_target = use_target and (current_epoch >= total_epochs // 2)
+#         # 사전에 계산해둔 128차원의 target load함.
+#         use_target = self.targeted
+#         if current_epoch is not None and total_epochs is not None:
+#             prev_use_target = hasattr(self, '_prev_use_target') and self._prev_use_target
+#             use_target = use_target and (current_epoch >= total_epochs // 2)
 
-            if use_target and not prev_use_target:
-                valid_queue_labels = (queue_labels != -100).sum().item()
-                queue_fill_ratio = valid_queue_labels / self.K * 100
+#             if use_target and not prev_use_target:
+#                 valid_queue_labels = (queue_labels != -100).sum().item()
+#                 queue_fill_ratio = valid_queue_labels / self.K * 100
 
-                print(f"\n{'='*80}")
-                print(f"🎯 TSC (Targeted Supervised Contrastive) ACTIVATED!")
-                print(f"   Epoch: {current_epoch + 1}/{total_epochs}")
-                print(f"   Queue size: {self.K}")
-                print(f"   Queue filled: {valid_queue_labels}/{self.K} ({queue_fill_ratio:.1f}%)")
-                print(f"   Temperature: {self.T}")
-                print(f"   Target weight (tw): {self.tw}")
+#                 print(f"\n{'='*80}")
+#                 print(f"🎯 TSC (Targeted Supervised Contrastive) ACTIVATED!")
+#                 print(f"   Epoch: {current_epoch + 1}/{total_epochs}")
+#                 print(f"   Queue size: {self.K}")
+#                 print(f"   Queue filled: {valid_queue_labels}/{self.K} ({queue_fill_ratio:.1f}%)")
+#                 print(f"   Temperature: {self.T}")
+#                 print(f"   Target weight (tw): {self.tw}")
 
-                # Centroids가 Assigned target에 얼만큼 잘 따라가는지 측정함.
-                print(f"\n   📊 Centroid-Target Status:")
-                tgt_unique = F.normalize(self.optimal_target_unique.t(), dim=1).cpu()  # [n_cls, D]
-                cent = F.normalize(self.class_centroid, dim=1).cpu()  # [n_cls, D]
-                for c in range(self.n_cls):
-                    dist = (cent[c] - tgt_unique[c]).norm().item()
-                    print(f"      Class {c}: centroid-target distance = {dist:.4f}")
+#                 # Centroids가 Assigned target에 얼만큼 잘 따라가는지 측정함.
+#                 print(f"\n   📊 Centroid-Target Status:")
+#                 tgt_unique = F.normalize(self.optimal_target_unique.t(), dim=1).cpu()  # [n_cls, D]
+#                 cent = F.normalize(self.class_centroid, dim=1).cpu()  # [n_cls, D]
+#                 for c in range(self.n_cls):
+#                     dist = (cent[c] - tgt_unique[c]).norm().item()
+#                     print(f"      Class {c}: centroid-target distance = {dist:.4f}")
 
-                print(f"{'='*80}\n")
+#                 print(f"{'='*80}\n")
 
-            self._prev_use_target = use_target
+#             self._prev_use_target = use_target
 
-        # compute logits
-        l_pos = torch.einsum("bd,bd->b", q, k).unsqueeze(1) # [B, 1] - anchor와 self positive 간의 유사도 (logit 0번으로 고정함)
-        l_neg_queue = torch.matmul(q, qneg.t())             # [B, K] - anchor q_i와 queue에 저장된 모든 과거 임베딩과의 유사도
+#         # compute logits
+#         l_pos = torch.einsum("bd,bd->b", q, k).unsqueeze(1) # [B, 1] - anchor와 self positive 간의 유사도 (logit 0번으로 고정함)
+#         l_neg_queue = torch.matmul(q, qneg.t())             # [B, K] - anchor q_i와 queue에 저장된 모든 과거 임베딩과의 유사도
 
-        # ==================== KCL 진단 로그 (매 forward) ====================
-        if not hasattr(self, '_kcl_log_step'):
-            self._kcl_log_step = 0
-        self._kcl_log_step += 1
+#         # ==================== KCL 진단 로그 (매 forward) ====================
+#         if not hasattr(self, '_kcl_log_step'):
+#             self._kcl_log_step = 0
+#         self._kcl_log_step += 1
 
-        log_interval = 50  # 50 step마다 출력
-        if self._kcl_log_step % log_interval == 1:
-            with torch.no_grad():
-                # (1) Augmentation 품질: self-positive similarity
-                pos_sim = l_pos.squeeze(1)  # [B]
+#         log_interval = 50  # 50 step마다 출력
+#         if self._kcl_log_step % log_interval == 1:
+#             with torch.no_grad():
+#                 # (1) Augmentation 품질: self-positive similarity
+#                 pos_sim = l_pos.squeeze(1)  # [B]
 
-                # (2) Queue 내 같은/다른 클래스 similarity
-                y_flat = y.view(-1)  # [B]
-                qlab_flat = qlab     # [Q]
-                valid_queue = (qlab_flat != -100)  # -100은 미초기화 슬롯
-                queue_fill = valid_queue.sum().item()
-                queue_total = qlab_flat.numel()
+#                 # (2) Queue 내 같은/다른 클래스 similarity
+#                 y_flat = y.view(-1)  # [B]
+#                 qlab_flat = qlab     # [Q]
+#                 valid_queue = (qlab_flat != -100)  # -100은 미초기화 슬롯
+#                 queue_fill = valid_queue.sum().item()
+#                 queue_total = qlab_flat.numel()
 
-                # # 🔍 Queue embedding norm 체크 (normalize 제대로 되었는지)
-                # if valid_queue.any():
-                #     queue_norms = qneg[valid_queue].norm(dim=1)
-                # else:
-                #     queue_norms = None
-                # anchor_norms = q.norm(dim=1)
+#                 # # 🔍 Queue embedding norm 체크 (normalize 제대로 되었는지)
+#                 # if valid_queue.any():
+#                 #     queue_norms = qneg[valid_queue].norm(dim=1)
+#                 # else:
+#                 #     queue_norms = None
+#                 # anchor_norms = q.norm(dim=1)
 
-                # 클래스별 positive 개수 (queue 기준)
-                pos_counts = []
-                neg_sims_list = []
-                pos_sims_list = []
-                for cls in torch.unique(y_flat):
-                    cls_int = int(cls.item())
-                    if cls_int < 0:
-                        continue
-                    anchor_sel = (y_flat == cls_int)
-                    queue_pos_sel = (qlab_flat == cls_int) & valid_queue
-                    queue_neg_sel = (qlab_flat != cls_int) & valid_queue
+#                 # 클래스별 positive 개수 (queue 기준)
+#                 pos_counts = []
+#                 neg_sims_list = []
+#                 pos_sims_list = []
+#                 for cls in torch.unique(y_flat):
+#                     cls_int = int(cls.item())
+#                     if cls_int < 0:
+#                         continue
+#                     anchor_sel = (y_flat == cls_int)
+#                     queue_pos_sel = (qlab_flat == cls_int) & valid_queue
+#                     queue_neg_sel = (qlab_flat != cls_int) & valid_queue
 
-                    n_pos = queue_pos_sel.sum().item()
-                    pos_counts.append((cls_int, anchor_sel.sum().item(), n_pos))
+#                     n_pos = queue_pos_sel.sum().item()
+#                     pos_counts.append((cls_int, anchor_sel.sum().item(), n_pos))
 
-                    if anchor_sel.any() and queue_pos_sel.any():
-                        sim_pos = l_neg_queue[anchor_sel][:, queue_pos_sel]
-                        pos_sims_list.append(sim_pos.mean().item())
-                    if anchor_sel.any() and queue_neg_sel.any():
-                        sim_neg = l_neg_queue[anchor_sel][:, queue_neg_sel]
-                        neg_sims_list.append(sim_neg.mean().item())
+#                     if anchor_sel.any() and queue_pos_sel.any():
+#                         sim_pos = l_neg_queue[anchor_sel][:, queue_pos_sel]
+#                         pos_sims_list.append(sim_pos.mean().item())
+#                     if anchor_sel.any() and queue_neg_sel.any():
+#                         sim_neg = l_neg_queue[anchor_sel][:, queue_neg_sel]
+#                         neg_sims_list.append(sim_neg.mean().item())
 
-                pos_neg_gap = (
-                    (sum(pos_sims_list) / len(pos_sims_list)) -
-                    (sum(neg_sims_list) / len(neg_sims_list))
-                ) if pos_sims_list and neg_sims_list else float('nan')
+#                 pos_neg_gap = (
+#                     (sum(pos_sims_list) / len(pos_sims_list)) -
+#                     (sum(neg_sims_list) / len(neg_sims_list))
+#                 ) if pos_sims_list and neg_sims_list else float('nan')
 
-                print(f"\n{'='*70}")
-                print(f"[KCL LOG | step {self._kcl_log_step}] use_target={use_target}")
-                print(f"  Queue: {queue_fill}/{queue_total} filled ({100*queue_fill/queue_total:.1f}%)")
-                # print(f"  🔍 Normalization Check:")
-                # print(f"     Anchor norms:  mean={anchor_norms.mean():.4f}  min={anchor_norms.min():.4f}  max={anchor_norms.max():.4f}")
-                # if queue_norms is not None:
-                #     print(f"     Queue norms:   mean={queue_norms.mean():.4f}  min={queue_norms.min():.4f}  max={queue_norms.max():.4f}")
-                # else:
-                #     print(f"     Queue norms:   N/A (queue empty)")
-                print(f"  Self-positive sim (aug quality):  mean={pos_sim.mean():.4f}  min={pos_sim.min():.4f}  max={pos_sim.max():.4f}")
-                if pos_sims_list:
-                    print(f"  Queue same-class sim (pos):       mean={sum(pos_sims_list)/len(pos_sims_list):.4f}")
-                if neg_sims_list:
-                    print(f"  Queue diff-class sim (neg):       mean={sum(neg_sims_list)/len(neg_sims_list):.4f}")
-                print(f"  Pos-Neg gap:                       {pos_neg_gap:.4f}  (클수록 좋음)")
-                print(f"  Class-wise positive count in queue:")
-                for cls_int, n_anchor, n_pos in pos_counts:
-                    print(f"    Class {cls_int}: anchors={n_anchor}, queue_positives={n_pos}")
-                print(f"{'='*70}\n")
+#                 print(f"\n{'='*70}")
+#                 print(f"[KCL LOG | step {self._kcl_log_step}] use_target={use_target}")
+#                 print(f"  Queue: {queue_fill}/{queue_total} filled ({100*queue_fill/queue_total:.1f}%)")
+#                 # print(f"  🔍 Normalization Check:")
+#                 # print(f"     Anchor norms:  mean={anchor_norms.mean():.4f}  min={anchor_norms.min():.4f}  max={anchor_norms.max():.4f}")
+#                 # if queue_norms is not None:
+#                 #     print(f"     Queue norms:   mean={queue_norms.mean():.4f}  min={queue_norms.min():.4f}  max={queue_norms.max():.4f}")
+#                 # else:
+#                 #     print(f"     Queue norms:   N/A (queue empty)")
+#                 print(f"  Self-positive sim (aug quality):  mean={pos_sim.mean():.4f}  min={pos_sim.min():.4f}  max={pos_sim.max():.4f}")
+#                 if pos_sims_list:
+#                     print(f"  Queue same-class sim (pos):       mean={sum(pos_sims_list)/len(pos_sims_list):.4f}")
+#                 if neg_sims_list:
+#                     print(f"  Queue diff-class sim (neg):       mean={sum(neg_sims_list)/len(neg_sims_list):.4f}")
+#                 print(f"  Pos-Neg gap:                       {pos_neg_gap:.4f}  (클수록 좋음)")
+#                 print(f"  Class-wise positive count in queue:")
+#                 for cls_int, n_anchor, n_pos in pos_counts:
+#                     print(f"    Class {cls_int}: anchors={n_anchor}, queue_positives={n_pos}")
+#                 print(f"{'='*70}\n")
 
-        if use_target:
-            tgt = F.normalize(self.optimal_target.to(device), dim=1)  # [Tn, D]    - [n_cls, D]짜리 원형 target을 각 클래스마다 tr번 repeat해서 만듦.
-            l_neg_tgt = torch.matmul(q, tgt.t())                      # [B, Tn]
-            l_neg = torch.cat([l_neg_queue, l_neg_tgt], dim=1)        # [B, K+Tn]
-        else:
-            l_neg = l_neg_queue                             # [B, K]
+#         if use_target:
+#             tgt = F.normalize(self.optimal_target.to(device), dim=1)  # [Tn, D]    - [n_cls, D]짜리 원형 target을 각 클래스마다 tr번 repeat해서 만듦.
+#             l_neg_tgt = torch.matmul(q, tgt.t())                      # [B, Tn]
+#             l_neg = torch.cat([l_neg_queue, l_neg_tgt], dim=1)        # [B, K+Tn]
+#         else:
+#             l_neg = l_neg_queue                             # [B, K]
 
-        logits = torch.cat([l_pos, l_neg], dim=1) # [B, 1+K(+Tn)]
-        logits = logits / self.T
-        labels_ce = torch.zeros(B, dtype=torch.long, device=device)
+#         logits = torch.cat([l_pos, l_neg], dim=1) # [B, 1+K(+Tn)]
+#         logits = logits / self.T
+#         labels_ce = torch.zeros(B, dtype=torch.long, device=device)
 
-        # same-class positive mask 만들기
-        y = y.view(-1, 1).long()
-        qlab_row = qlab.view(1, -1)
+#         # same-class positive mask 만들기
+#         y = y.view(-1, 1).long()
+#         qlab_row = qlab.view(1, -1)
 
-        if use_target:
-            target_labels = self.target_labels.to(device).t().contiguous()  # [1,Tn]
+#         if use_target:
+#             target_labels = self.target_labels.to(device).t().contiguous()  # [1,Tn]
 
-            # queue 내부 같은 클래스 샘플을 1차 mask로 정의함
-            # - target은 아직 전부 0으로 봄.
-            mask_queue = (y == qlab_row).float()                                    # [B,K]
-            mask_target = torch.zeros((B, target_labels.size(1)), device=device)    # [B,Tn]
-            mask = torch.cat([mask_queue, mask_target], dim=1)                      # [B,K+Tn]
+#             # queue 내부 같은 클래스 샘플을 1차 mask로 정의함
+#             # - target은 아직 전부 0으로 봄.
+#             mask_queue = (y == qlab_row).float()                                    # [B,K]
+#             mask_target = torch.zeros((B, target_labels.size(1)), device=device)    # [B,Tn]
+#             mask = torch.cat([mask_queue, mask_target], dim=1)                      # [B,K+Tn]
 
-            #  class centroid ↔ target assignment
-            """
-            - Class centroid가 어떤 target으로 수렴해야 하는지 결정함.
-            - Class centroid와 target 간의 similarity를 최대화하도록 매칭함.
+#             #  class centroid ↔ target assignment
+#             """
+#             - Class centroid가 어떤 target으로 수렴해야 하는지 결정함.
+#             - Class centroid와 target 간의 similarity를 최대화하도록 매칭함.
 
-            Flow:
-                1. Class centroid를 EMA 방식으로 업데이트함.
-                2. Centroid-Target Similarity matrix 계산함 [n_cls, n_cls]
-                3. 헝가리안 알고리즘으로 최적 매칭 찾기
-                4. 매칭된 target을 해당 class의 positive로 추가함.
-            """
-            with torch.no_grad():
-                feat_all = q.detach()
+#             Flow:
+#                 1. Class centroid를 EMA 방식으로 업데이트함.
+#                 2. Centroid-Target Similarity matrix 계산함 [n_cls, n_cls]
+#                 3. 헝가리안 알고리즘으로 최적 매칭 찾기
+#                 4. 매칭된 target을 해당 class의 positive로 추가함.
+#             """
+#             with torch.no_grad():
+#                 feat_all = q.detach()
 
-                # ==================== Centroid Update (EMA) ====================
-                centroid_updates = {}
-                for one_label in torch.unique(y):
-                    one_label_int = int(one_label.item())
+#                 # ==================== Centroid Update (EMA) ====================
+#                 centroid_updates = {}
+#                 for one_label in torch.unique(y):
+#                     one_label_int = int(one_label.item())
                     
-                    if one_label_int < 0 or one_label_int >= self.n_cls: # Skip invalid labels (-1 or out of range)
-                        continue
+#                     if one_label_int < 0 or one_label_int >= self.n_cls: # Skip invalid labels (-1 or out of range)
+#                         continue
 
-                    sel = (y[:, 0] == one_label_int)
-                    if sel.any():
-                        centroid_old = self.class_centroid[one_label_int].clone()
-                        centroid_batch = F.normalize(feat_all[sel].mean(dim=0), dim=0)  # [D]
-                        self.class_centroid[one_label_int] = F.normalize(0.9 * self.class_centroid[one_label_int].to(device) + 0.1 * centroid_batch, dim=0)
+#                     sel = (y[:, 0] == one_label_int)
+#                     if sel.any():
+#                         centroid_old = self.class_centroid[one_label_int].clone()
+#                         centroid_batch = F.normalize(feat_all[sel].mean(dim=0), dim=0)  # [D]
+#                         self.class_centroid[one_label_int] = F.normalize(0.9 * self.class_centroid[one_label_int].to(device) + 0.1 * centroid_batch, dim=0)
 
-                        # Track centroid movement
-                        centroid_new = self.class_centroid[one_label_int]
-                        movement = (centroid_new - centroid_old.to(device)).norm().item()
-                        centroid_updates[one_label_int] = (sel.sum().item(), movement)
+#                         # Track centroid movement
+#                         centroid_new = self.class_centroid[one_label_int]
+#                         movement = (centroid_new - centroid_old.to(device)).norm().item()
+#                         centroid_updates[one_label_int] = (sel.sum().item(), movement)
 
-                # DEBUG: Print centroid updates (first time TSC activates)
-                if not hasattr(self, '_centroid_logged') and centroid_updates:
-                    print(f"\n📊 Centroid Update (first TSC batch):")
-                    for cls, (count, movement) in centroid_updates.items():
-                        print(f"   Class {cls}: {count} samples, centroid moved {movement:.6f}")
-                    self._centroid_logged = True
+#                 # DEBUG: Print centroid updates (first time TSC activates)
+#                 if not hasattr(self, '_centroid_logged') and centroid_updates:
+#                     print(f"\n📊 Centroid Update (first TSC batch):")
+#                     for cls, (count, movement) in centroid_updates.items():
+#                         print(f"   Class {cls}: {count} samples, centroid moved {movement:.6f}")
+#                     self._centroid_logged = True
 
-                # ==================== Hungarian Matching ====================
-                cent = F.normalize(self.class_centroid.to(device), dim=1)      # [n_cls, D]
-                otu = self.optimal_target_unique.to(device)                    # [D, n_cls]
-                dist = torch.matmul(cent, otu).detach().float().cpu().numpy()  # [n_cls, n_cls] (similarity) - cast to float32 before numpy
-                row_ind, col_ind = linear_sum_assignment(-dist)                # maximize similarity
+#                 # ==================== Hungarian Matching ====================
+#                 cent = F.normalize(self.class_centroid.to(device), dim=1)      # [n_cls, D]
+#                 otu = self.optimal_target_unique.to(device)                    # [D, n_cls]
+#                 dist = torch.matmul(cent, otu).detach().float().cpu().numpy()  # [n_cls, n_cls] (similarity) - cast to float32 before numpy
+#                 row_ind, col_ind = linear_sum_assignment(-dist)                # maximize similarity
 
-                # 🔍 ALWAYS PRINT Hungarian Matching (디버깅용)
-                print(f"\n{'='*80}")
-                print(f"🔍 Hungarian Matching Result (Step {self._kcl_log_step}):")
-                print(f"   Centroid-Target Similarity Matrix (값이 높을수록 유사):")
-                for i in range(self.n_cls):
-                    print(f"   Centroid {i}: {dist[i]}")
-                print(f"   Assignment: {list(zip(row_ind, col_ind))}")
-                for cls, tgt_idx in zip(row_ind, col_ind):
-                    print(f"   Class {cls} → Target {tgt_idx} (similarity: {dist[cls, tgt_idx]:.4f})")
-                print(f"   Centroid norms: {cent.norm(dim=1).cpu().numpy()}")
+#                 # 🔍 ALWAYS PRINT Hungarian Matching (디버깅용)
+#                 print(f"\n{'='*80}")
+#                 print(f"🔍 Hungarian Matching Result (Step {self._kcl_log_step}):")
+#                 print(f"   Centroid-Target Similarity Matrix (값이 높을수록 유사):")
+#                 for i in range(self.n_cls):
+#                     print(f"   Centroid {i}: {dist[i]}")
+#                 print(f"   Assignment: {list(zip(row_ind, col_ind))}")
+#                 for cls, tgt_idx in zip(row_ind, col_ind):
+#                     print(f"   Class {cls} → Target {tgt_idx} (similarity: {dist[cls, tgt_idx]:.4f})")
+#                 print(f"   Centroid norms: {cent.norm(dim=1).cpu().numpy()}")
 
-                # Target 벡터 자체 확인
-                tgt_unique_cpu = otu.t().cpu()  # [n_cls, D]
-                print(f"\n   Target vector preview (first 5 dims):")
-                for i in range(self.n_cls):
-                    print(f"   Target {i}: {tgt_unique_cpu[i, :5].numpy()}")
-                print(f"{'='*80}\n")
+#                 # Target 벡터 자체 확인
+#                 tgt_unique_cpu = otu.t().cpu()  # [n_cls, D]
+#                 print(f"\n   Target vector preview (first 5 dims):")
+#                 for i in range(self.n_cls):
+#                     print(f"   Target {i}: {tgt_unique_cpu[i, :5].numpy()}")
+#                 print(f"{'='*80}\n")
 
-                # ==================== Matched Target을 Positive로 추가 ====================
-                for cls, tgt_idx in zip(row_ind, col_ind):
-                    cls = int(cls)
-                    sel = (y[:, 0] == cls)
+#                 # ==================== Matched Target을 Positive로 추가 ====================
+#                 for cls, tgt_idx in zip(row_ind, col_ind):
+#                     cls = int(cls)
+#                     sel = (y[:, 0] == cls)
 
-                    if not sel.any():
-                        continue
+#                     if not sel.any():
+#                         continue
 
-                    t_indices = torch.arange(tgt_idx * self.tr, tgt_idx * self.tr + self.tr, device=device)
+#                     t_indices = torch.arange(tgt_idx * self.tr, tgt_idx * self.tr + self.tr, device=device)
 
-                    # target이 matching positivie로 이 시점부터 지정됨
-                    sel_indices = torch.where(sel)[0]  # [N_sel]
-                    mask[sel_indices[:, None], qlab.numel() + t_indices[None, :]] = 1.0
+#                     # target이 matching positivie로 이 시점부터 지정됨
+#                     sel_indices = torch.where(sel)[0]  # [N_sel]
+#                     mask[sel_indices[:, None], qlab.numel() + t_indices[None, :]] = 1.0
 
-            if self.sep_t:
-                mask_target_only = mask.clone()
-                mask_target_only[:, :qlab.numel()] = 0.0
-                mask_class_only = mask.clone()
-                mask_class_only[:, qlab.numel():] = 0.0
-            else:
-                mask_class_only = mask
-                mask_target_only = mask
-        else:
-            mask = (y == qlab_row).float()
-            mask_class_only = mask
-            mask_target_only = mask
+#             if self.sep_t:
+#                 mask_target_only = mask.clone()
+#                 mask_target_only[:, :qlab.numel()] = 0.0
+#                 mask_class_only = mask.clone()
+#                 mask_class_only[:, qlab.numel():] = 0.0
+#             else:
+#                 mask_class_only = mask
+#                 mask_target_only = mask
+#         else:
+#             mask = (y == qlab_row).float()
+#             mask_class_only = mask
+#             mask_target_only = mask
 
-        mask_pos_view = torch.zeros_like(mask)          # [B,K(+Tn)]
+#         mask_pos_view = torch.zeros_like(mask)          # [B,K(+Tn)]
 
-        # ==================== KCL의 K-positive 샘플링 ====================
-        """
-        - 일종의 hard negative mining 강화 방식임.
-        - 랜덤샘플링과 다르게 가장 효과적인 K 샘플링 방법은 없을까?
-        """
-        if self.num_positive > 0:
-            work_mask = mask.clone()
-            for iteration in range(self.num_positive):
-                all_pos = work_mask.view(-1).nonzero().view(-1)
+#         # ==================== KCL의 K-positive 샘플링 ====================
+#         """
+#         - 일종의 hard negative mining 강화 방식임.
+#         - 랜덤샘플링과 다르게 가장 효과적인 K 샘플링 방법은 없을까?
+#         """
+#         if self.num_positive > 0:
+#             work_mask = mask.clone()
+#             for iteration in range(self.num_positive):
+#                 all_pos = work_mask.view(-1).nonzero().view(-1)
 
-                # Early exit: positive가 하나도 없으면 종료 (보호장치인데 사실상 작동 안함.)
-                if all_pos.numel() == 0:          
-                    break
+#                 # Early exit: positive가 하나도 없으면 종료 (보호장치인데 사실상 작동 안함.)
+#                 if all_pos.numel() == 0:          
+#                     break
 
-                num_pos = work_mask.sum(1)                                   # 각 anchor의 positive 개수                   
-                num_pos_cum = num_pos.cumsum(0).roll(1)
-                num_pos_cum[0] = 0
+#                 num_pos = work_mask.sum(1)                                   # 각 anchor의 positive 개수                   
+#                 num_pos_cum = num_pos.cumsum(0).roll(1)
+#                 num_pos_cum[0] = 0
 
-                rand = torch.rand(B, device=device)                          # 각 anchor에서 랜덤하게 하나씩 샘플링
-                idxs = ((rand * num_pos).floor() + num_pos_cum).long()
-                valid = (num_pos > 0)                                        # Positive가 있는 anchor만 처리
-                idxs = idxs[valid]
+#                 rand = torch.rand(B, device=device)                          # 각 anchor에서 랜덤하게 하나씩 샘플링
+#                 idxs = ((rand * num_pos).floor() + num_pos_cum).long()
+#                 valid = (num_pos > 0)                                        # Positive가 있는 anchor만 처리
+#                 idxs = idxs[valid]
 
-                if idxs.numel() > 0:
-                    idxs = idxs.clamp(0, all_pos.numel() - 1)
-                    sampled = all_pos[idxs]
-                    mask_pos_view.view(-1)[sampled] = 1.0
-                    work_mask.view(-1)[sampled] = 0.0
-        else:
-            # K-sampling 비활성화 - 모든 positive 사용
-            mask_pos_view = mask.clone()
+#                 if idxs.numel() > 0:
+#                     idxs = idxs.clamp(0, all_pos.numel() - 1)
+#                     sampled = all_pos[idxs]
+#                     mask_pos_view.view(-1)[sampled] = 1.0
+#                     work_mask.view(-1)[sampled] = 0.0
+#         else:
+#             # K-sampling 비활성화 - 모든 positive 사용
+#             mask_pos_view = mask.clone()
 
-        # 최종 mask 구성 과정
-        if use_target and self.sep_t:
-            mask_pos_view_class = (mask_pos_view * (mask_class_only > 0).float())
-            mask_pos_view_target = (mask_target_only > 0).float()
-            denom_mask = mask_pos_view + (mask_target_only > 0).float()
-        else:
-            mask_pos_view_class = mask_pos_view.clone()
-            mask_pos_view_target = torch.zeros_like(mask_pos_view)
-            denom_mask = mask_pos_view
+#         # 최종 mask 구성 과정
+#         if use_target and self.sep_t:
+#             mask_pos_view_class = (mask_pos_view * (mask_class_only > 0).float())
+#             mask_pos_view_target = (mask_target_only > 0).float()
+#             denom_mask = mask_pos_view + (mask_target_only > 0).float()
+#         else:
+#             mask_pos_view_class = mask_pos_view.clone()
+#             mask_pos_view_target = torch.zeros_like(mask_pos_view)
+#             denom_mask = mask_pos_view
 
-        ones_pos = torch.ones((B, 1), device=device)
-        zeros_pos = torch.zeros((B, 1), device=device)
+#         ones_pos = torch.ones((B, 1), device=device)
+#         zeros_pos = torch.zeros((B, 1), device=device)
 
-        mask_all = torch.cat([ones_pos, denom_mask], dim=1)  # [B, 1+K(+Tn)]
-        mask_class = torch.cat([ones_pos, mask_pos_view_class], dim=1)
-        mask_target = torch.cat([zeros_pos, mask_pos_view_target], dim=1)
+#         mask_all = torch.cat([ones_pos, denom_mask], dim=1)  # [B, 1+K(+Tn)]
+#         mask_class = torch.cat([ones_pos, mask_pos_view_class], dim=1)
+#         mask_target = torch.cat([zeros_pos, mask_pos_view_target], dim=1)
 
-        # ==================== Loss 계산 ====================
-        log_prob = F.log_softmax(logits, dim=1)
-        denom = mask_all.sum(1).clamp_min(1.0)
+#         # ==================== Loss 계산 ====================
+#         log_prob = F.log_softmax(logits, dim=1)
+#         denom = mask_all.sum(1).clamp_min(1.0)
 
-        loss_class = -((mask_class * log_prob).sum(1) / denom).mean()
-        loss_target = -((mask_target * log_prob).sum(1) / denom).mean()
+#         loss_class = -((mask_class * log_prob).sum(1) / denom).mean()
+#         loss_target = -((mask_target * log_prob).sum(1) / denom).mean()
 
-        loss_target = loss_target * self.tw
-        loss = loss_class + loss_target
+#         loss_target = loss_target * self.tw
+#         loss = loss_class + loss_target
 
-        # softmax 포화도 모니터링: self-positive(pos 0)가 softmax 확률 중 차지하는 비율
-        with torch.no_grad():
-            softmax_self_prob = F.softmax(logits, dim=1)[:, 0].mean().item()
-
-        return logits, labels_ce, q, loss, loss_class, loss_target, softmax_self_prob
+#         return logits, labels_ce, q, loss, loss_class, loss_target
 
 ################################################################################################################################
 ################################################################################################################################
@@ -705,7 +911,7 @@ class SupConLoss(nn.Module):
         features = feat_flat[valid]     # [N, D]
         labels_valid = lab_flat[valid]  # [N]
 
-        # 3) L2 normalize (Necessary in Contrastive Learning)
+        # 3) L2 normalize
         features = F.normalize(features, p=2, dim=-1)
 
         N = features.shape[0]

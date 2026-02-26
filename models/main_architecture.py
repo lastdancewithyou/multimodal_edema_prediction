@@ -267,70 +267,59 @@ class MultiModalEncoder(nn.Module):
 # Stage 1: Representation Learning Model
 ##################################################################################################
 class MultiModalContrastiveModel(nn.Module):
-    def __init__(self, encoder, args):
+    def __init__(self, encoder):
         super().__init__()
 
         self.encoder = encoder
-        self.pooled_augmenter = AugmentationModule(
-            noise_type=args.aug_noise_type,
-            epsilon=args.aug_epsilon,
-            num_views=2,
-        )
+    
+        # Binary classifier head for edema detection
+        self.edema_classifier = nn.Linear(256, 1)  # [B, W, 256] → [B, W, 1]
 
-        # 일단 단일 projection head를 사용함.
-        self.projection_head = ProjectionHead(args)
-
-        print(f"[MultiModalContrastiveModel] ✅ Stage 1 model initialized")
-        print(f"   - Augmentation: {args.aug_noise_type}, epsilon={args.aug_epsilon}")
+        # Hierarchical classifier for subtype classification
+        self.subtype_classifier = nn.Linear(256, 2)  # [B, W, 256] → [B, W, num_subtypes]
 
     def forward(self, args, ts_series, cxr_data, text_data, has_cxr, has_text,
-                window_mask, seq_valid_mask, demo_features=None, time_steps=None):
-        """
-        Forward pass for Stage 1 contrastive(Representation) learning.
+            window_mask, seq_valid_mask, demo_features=None, time_steps=None,
+        ):
 
-        Flow:
-            1. Encoder returns [B, W, 256] embeddings.
-            2. Augment pooled embeddings → [Nwin, 2, 256] # temporary position
-            3. Project each view to different projection head → [Nwin, 2, proj_dim]
-
-        Returns:
-            projected_embeddings_multiview: [Nwin, 2, proj_dim=128] - For Contrastive Loss
-        """
         B, W = window_mask.shape
 
-        # ================ Extracting embeddings using a pre-made encoder ================
+        # Encoder
         window_embeddings, _ = self.encoder(
             args, ts_series, cxr_data, text_data, has_cxr, has_text,
             window_mask, seq_valid_mask, demo_features, time_steps
         )
 
-        # ================ Extract valid windows ================
+        # Binary logits for edema detection
+        edema_logits = self.edema_classifier(window_embeddings)
+
+        # Subtype logits for valid windows
+        subtype_logits = self.subtype_classifier(window_embeddings)
+
+        # Extract valid windows
         """
         - 환자마다 ICU stay가 다르고, padding 된 window가 존재함.
-        - padding된 window에 augmentation과 projection을 적용해서 낭비를 막기 위함임.
+        - padding된 window에 projection을 적용해서 낭비를 막기 위함임.
         """
+        # Temporal indices
         BW = B * W
         window_embeddings_flat = window_embeddings.reshape(BW, 256)
         window_valid_mask = window_mask.reshape(BW).bool()
-        pooled_base = window_embeddings_flat[window_valid_mask]  # [Nwin, 256]
+        valid_windows = window_embeddings_flat[window_valid_mask]  # [Nwin, 256]
 
-        # ================ Augment pooled embeddings (2 views) ================
-        """
-        - 적절한 증강 위치를 찾다가 일시적으로 이 곳에 증강을 하였는데, 일단 modality-specific embedding에 적용하는 것을 최우선으로 고려함.
-        """
-        augmented_pooled = self.pooled_augmenter(pooled_base) # [Nwin, 256] → [Nwin, 2, 256]
+        window_time_indices = torch.arange(W, device=window_embeddings.device).unsqueeze(0).expand(B, W)
+        batch_indices = torch.arange(B, device=window_embeddings.device).unsqueeze(1).expand(B, W)
+        window_time_indices_flat = window_time_indices.reshape(BW)[window_valid_mask]
+        batch_indices_flat = batch_indices.reshape(BW)[window_valid_mask]
 
-        # ================ Project each view ================
-        # Use separate projection heads for each view
-        view_0 = augmented_pooled[:, 0, :]  # [Nwin, 256]
-        view_1 = augmented_pooled[:, 1, :]  # [Nwin, 256]
-
-        proj_0 = self.projection_head(view_0)  # [Nwin, proj_dim]
-        proj_1 = self.projection_head(view_1)  # [Nwin, proj_dim]
-
-        projected_embeddings_multiview = torch.stack([proj_0, proj_1], dim=1)
-
-        return projected_embeddings_multiview
+        return {
+            'edema_logits': edema_logits,                     # [B, W, 1]
+            'subtype_logits': subtype_logits,                   # [B, W, 2]
+            'window_embeddings': window_embeddings,             # [B, W, 256]
+            'valid_embeddings': valid_windows,                  # for contrastive
+            'window_time_indices': window_time_indices_flat,    # [Nwin]
+            'batch_indices': batch_indices_flat,                # [Nwin]
+        }
 
 
 ##################################################################################################
