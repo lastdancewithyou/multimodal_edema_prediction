@@ -156,29 +156,31 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
     edema_classifier_params = list(model.edema_classifier.parameters())
     subtype_classifier_params = list(model.subtype_classifier.parameters())
 
+    # Differential learning rates: encoder > edema_classifier > subtype_classifier
     param_groups = [
         {
             'params': encoder_params,
-            'lr': args.single_learning_rate,
+            'lr': args.single_learning_rate,  # Full LR
             'weight_decay': 5e-5
         },
         {
             'params': edema_classifier_params,
-            'lr': args.single_learning_rate,
+            'lr': args.single_learning_rate * 0.5,  # 50% of full LR 
             'weight_decay': 5e-5
         },
         {
             'params': subtype_classifier_params,
-            'lr': args.single_learning_rate,
+            'lr': args.single_learning_rate * 0.1,  # 10% of full LR
             'weight_decay': 5e-5
         }
     ]
 
     optimizer = torch.optim.AdamW(param_groups)
 
-    print(f"\n🎯 [Optimizer Configuration]")
-    print(f"   Encoder LR: {args.single_learning_rate:.2e} (weight_decay: 1e-4)")
-    print(f"   Classifier LR: {args.single_learning_rate:.2e} (weight_decay: 5e-5)")
+    print(f"\n🎯 [Optimizer Configuration - Differential Learning Rates]")
+    print(f"   Encoder LR: {args.single_learning_rate:.2e} (weight_decay: 5e-5)")
+    print(f"   Edema Classifier LR: {args.single_learning_rate * 0.5:.2e} (weight_decay: 5e-5)")
+    print(f"   Subtype Classifier LR: {args.single_learning_rate * 0.1:.2e} (weight_decay: 5e-5)")
 
     model, optimizer, loss_module = accelerator.prepare(model, optimizer, loss_module)
 
@@ -249,7 +251,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                                                 desc=f"[Rank {local_rank}] Epoch {epoch+1}/{args.single_stage_epochs}",
                                                 position=local_rank, leave=True, dynamic_ncols=True)):
             with accelerator.accumulate(model):
-                total_batch_loss, batch_bce, batch_ce, batch_ucl, batch_outputs, batch_counts = train_batch(
+                total_batch_loss, batch_bce, batch_ce, batch_ucl, batch_scl, batch_info_ucl, batch_outputs, batch_counts = train_batch(
                     args=args,
                     model=model,
                     batch=batch,
@@ -270,16 +272,25 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            window_ct_local = torch.as_tensor(batch_counts['window_count'], device=device, dtype=torch.float32)
+            # Get loss-specific sample counts
+            bce_ct_local = torch.as_tensor(batch_counts['bce_count'], device=device, dtype=torch.float32)
+            ce_ct_local = torch.as_tensor(batch_counts['ce_count'], device=device, dtype=torch.float32)
+            ucl_ct_local = torch.as_tensor(batch_counts['ucl_count'], device=device, dtype=torch.float32)
+            scl_ct_local = torch.as_tensor(batch_counts['scl_count'], device=device, dtype=torch.float32)
+            infonce_ct_local = torch.as_tensor(batch_counts['infonce_count'], device=device, dtype=torch.float32)
 
-            bce_sum += torch.as_tensor(batch_bce, device=device, dtype=torch.float32) * window_ct_local
-            bce_count += window_ct_local
-            ce_sum += torch.as_tensor(batch_ce, device=device, dtype=torch.float32) * window_ct_local
-            ce_count += window_ct_local
-            ucl_sum += torch.as_tensor(batch_ucl, device=device, dtype=torch.float32) * window_ct_local
-            ucl_count += window_ct_local
+            # Accumulate losses weighted by their actual sample counts
+            bce_sum += torch.as_tensor(batch_bce, device=device, dtype=torch.float32) * bce_ct_local
+            bce_count += bce_ct_local
+            ce_sum += torch.as_tensor(batch_ce, device=device, dtype=torch.float32) * ce_ct_local
+            ce_count += ce_ct_local
+            ucl_sum += torch.as_tensor(batch_ucl, device=device, dtype=torch.float32) * ucl_ct_local
+            ucl_count += ucl_ct_local
+            scl_sum += torch.as_tensor(batch_scl, device=device, dtype=torch.float32) * scl_ct_local
+            scl_count += scl_ct_local
+            info_ucl_sum += torch.as_tensor(batch_info_ucl, device=device, dtype=torch.float32) * infonce_ct_local
+            info_ucl_count += infonce_ct_local
 
-            # Collect predictions for multi-task metrics (hierarchical probability combination)
             with torch.no_grad():
                 edema_logits = batch_outputs['edema_logits'].squeeze(-1)  # [B, W]
                 subtype_logits = batch_outputs['subtype_logits']           # [B, W, 2]
@@ -313,17 +324,25 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
             dist.all_reduce(ce_count, op=dist.ReduceOp.SUM)
             dist.all_reduce(ucl_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(ucl_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(scl_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(scl_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(info_ucl_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(info_ucl_count, op=dist.ReduceOp.SUM)
 
         # Calculate average losses
         bce_avg = (bce_sum / (bce_count + 1e-8)).item()
         ce_avg = (ce_sum / (ce_count + 1e-8)).item()
         ucl_avg = (ucl_sum / (ucl_count + 1e-8)).item()
+        scl_avg = (scl_sum / (scl_count + 1e-8)).item()
+        info_ucl_avg = (info_ucl_sum / (info_ucl_count + 1e-8)).item()
 
         # Weighted contributions
         bce_contrib = args.bce_weight * bce_avg
         ce_contrib = args.ce_weight * ce_avg
         ucl_contrib = args.ucl_weight * ucl_avg
-        avg_total_loss = bce_contrib + ce_contrib + ucl_contrib
+        scl_contrib = args.scl_weight * scl_avg
+        info_ucl_contrib = args.infonce_weight * info_ucl_avg
+        avg_total_loss = bce_contrib + ce_contrib + ucl_contrib + scl_contrib + info_ucl_contrib
 
         # Scheduler step
         scheduler.step()
@@ -424,7 +443,10 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
             print(f"   [Loss Components]")
             print(f"      BCE (Edema): {bce_avg:.4f} → Weighted: {bce_contrib:.4f} (λ={args.bce_weight})")
             print(f"      CE (Subtype): {ce_avg:.4f} → Weighted: {ce_contrib:.4f} (λ={args.ce_weight})")
-            print(f"      UCL (Temporal): {ucl_avg:.4f} → Weighted: {ucl_contrib:.4f} (λ={args.ucl_weight})")
+            print(f"      Temporal UCL: {ucl_avg:.4f} → Weighted: {ucl_contrib:.4f} (λ={args.ucl_weight})")
+            print(f"      SCL (Edema): {scl_avg:.4f} → Weighted: {scl_contrib:.4f} (λ={args.scl_weight})")
+            print(f"      InfoNCE: {info_ucl_avg:.4f} → Weighted: {info_ucl_contrib:.4f} (λ={args.info_ucl_weight})")
+
 
             print(f"\n   [Hierarchical Performance Metrics]")
             print(f"[Edema Detection]   AUROC={train_metrics['level1_auroc']:.4f}  "
@@ -441,7 +463,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
         torch.cuda.empty_cache()
 
         # ==================== Validation ====================
-        val_loss, val_bce_avg, val_ce_avg, val_ucl_avg, val_metrics = validate_multitask(
+        val_loss, val_bce_avg, val_ce_avg, val_ucl_avg, val_scl_avg, val_info_ucl_avg, val_metrics = validate_multitask(
             args=args,
             model=model,
             dataloader=val_loader,
@@ -477,7 +499,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 max_samples=40000,
                 umap_reducers=None
             )
-            print("✅ Training UMAP completed")
+            print("✅ Training UMAP completed!")
 
             # Validation UMAP (transform using train PCA + UMAP coordinate system)
             print("🖼️ Generating Validation UMAP...")
@@ -494,7 +516,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 max_samples=None,
                 umap_reducers=train_reducers  # Val mode: use train PCA + UMAP
             )
-            print("✅ Validation UMAP completed")
+            print("✅ Validation UMAP completed!")
 
         if accelerator.is_main_process:
             log_dict = {
@@ -504,10 +526,16 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 "train/bce_loss": bce_avg,
                 "train/ce_loss": ce_avg,
                 "train/ucl_loss": ucl_avg,
+                "train/scl_loss": scl_avg,
+                "train/info_ucl_loss": info_ucl_avg,
+    
                 "val/total_loss": val_loss,
                 "val/bce_loss": val_bce_avg,
                 "val/ce_loss": val_ce_avg,
                 "val/ucl_loss": val_ucl_avg,
+                "val/scl_loss": val_scl_avg,
+                "val/info_ucl_loss": val_info_ucl_avg,
+
                 #################### Hierarchical Metrics ####################
                 "val/level1_auroc": val_metrics['level1_auroc'],
                 "val/level1_auprc": val_metrics['level1_auprc'],
@@ -516,6 +544,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 "val/level2_auprc": val_metrics['level2_auprc'],
                 "val/level3_auroc": val_metrics['level3_auroc'],
                 "val/level3_auprc": val_metrics['level3_auprc'],
+                
                 "train/level1_auroc": train_metrics['level1_auroc'],
                 "train/level1_auprc": train_metrics['level1_auprc'],
                 "train/level1_brier": train_metrics['level1_brier'],
@@ -552,7 +581,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
         accelerator.print(f"⚠️ Best model not found, using current model state")
 
     # ==================== Test ====================
-    test_loss, _, _, _, _, wandb_test_metrics = test(
+    test_loss, _, _, _, _, _, _, wandb_test_metrics = test(
         args=args,
         model=model,
         dataloader=test_loader,
@@ -576,25 +605,21 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
     # ==================== UMAP Visualization ====================
     if accelerator.is_main_process:
         print("\n" + "="*80)
-        print("📊 Generating UMAP visualization for test set")
-        print("="*80)
-
-        try:
-            plot_umap_2d(
-                args=args,
-                model=model,
-                dataloader=test_loader,
-                device=accelerator.device,
-                accelerator=accelerator,
-                dataset=test_loader.dataset,
-                epoch="test",
-                stage="single_stage",
-                disable_cxr=args.disable_cxr,
-                disable_txt=args.disable_txt
-            )
-            print("✅ UMAP visualization saved successfully!")
-        except Exception as e:
-            print(f"⚠️  UMAP visualization failed: {e}")
+        print("🖼️ Generating Test UMAP...")
+        test_umap_dir = os.path.join(args.umap_save_dir, 'test')
+        plot_multitask_umap(
+            args=args,
+            model=model,
+            dataloader=test_loader,
+            device=accelerator.device,
+            accelerator=accelerator,
+            dataset=test_loader.dataset,
+            epoch=epoch+1,
+            save_dir=test_umap_dir,
+            max_samples=None,
+            umap_reducers=train_reducers  # Test mode: use train PCA + UMAP
+        )
+        print("✅ Test UMAP completed!")
 
     print("\n" + "="*80)
     print("✅ MULTI-TASK TRAINING COMPLETED!")

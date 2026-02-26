@@ -382,7 +382,7 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
 
     with torch.no_grad():
         for batch in tqdm(dataloader, total=len(dataloader), desc="🤖 <Multi-Task Validation>"):
-            _, batch_bce, batch_ce, batch_ucl, batch_outputs, batch_counts = train_batch(
+            _, batch_bce, batch_ce, batch_ucl, batch_scl, batch_info_ucl, batch_outputs, batch_counts = train_batch(
                 args=args,
                 model=model,
                 batch=batch,
@@ -396,21 +396,33 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
                 bce_weight=args.bce_weight,
                 ce_weight=args.ce_weight,
                 ucl_weight=args.ucl_weight,
+                scl_weight=args.scl_weight,
+                infonce_weight=args.infonce_weight,
                 # # No gradient, just compute loss
                 # bce_weight=0.0,
                 # ce_weight=0.0,
                 # ucl_weight=0.0,
             )
 
-            window_ct_local = torch.as_tensor(batch_counts['window_count'], device=device, dtype=torch.float32)
-            bce_sum += torch.as_tensor(batch_bce, device=device, dtype=torch.float32) * window_ct_local
-            bce_count += window_ct_local
-            ce_sum += torch.as_tensor(batch_ce, device=device, dtype=torch.float32) * window_ct_local
-            ce_count += window_ct_local
-            ucl_sum += torch.as_tensor(batch_ucl, device=device, dtype=torch.float32) * window_ct_local
-            ucl_count += window_ct_local
+            # Get loss-specific sample counts
+            bce_ct_local = torch.as_tensor(batch_counts['bce_count'], device=device, dtype=torch.float32)
+            ce_ct_local = torch.as_tensor(batch_counts['ce_count'], device=device, dtype=torch.float32)
+            ucl_ct_local = torch.as_tensor(batch_counts['ucl_count'], device=device, dtype=torch.float32)
+            scl_ct_local = torch.as_tensor(batch_counts['scl_count'], device=device, dtype=torch.float32)
+            infonce_ct_local = torch.as_tensor(batch_counts['infonce_count'], device=device, dtype=torch.float32)
 
-            # Collect predictions for hierarchical metrics (same as training)
+            # Accumulate losses weighted by their actual sample counts
+            bce_sum += torch.as_tensor(batch_bce, device=device, dtype=torch.float32) * bce_ct_local
+            bce_count += bce_ct_local
+            ce_sum += torch.as_tensor(batch_ce, device=device, dtype=torch.float32) * ce_ct_local
+            ce_count += ce_ct_local
+            ucl_sum += torch.as_tensor(batch_ucl, device=device, dtype=torch.float32) * ucl_ct_local
+            ucl_count += ucl_ct_local
+            scl_sum += torch.as_tensor(batch_scl, device=device, dtype=torch.float32) * scl_ct_local
+            scl_count += scl_ct_local
+            info_ucl_sum += torch.as_tensor(batch_info_ucl, device=device, dtype=torch.float32) * infonce_ct_local
+            info_ucl_count += infonce_ct_local
+            
             edema_logits = batch_outputs['edema_logits'].squeeze(-1)  # [B, W]
             subtype_logits = batch_outputs['subtype_logits']           # [B, W, 2]
             edema_labels = batch_outputs['edema_labels']               # [B, W]
@@ -441,6 +453,10 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
         total_ce_count = accelerator.gather_for_metrics(ce_count).sum()
         total_ucl_sum = accelerator.gather_for_metrics(ucl_sum).sum()
         total_ucl_count = accelerator.gather_for_metrics(ucl_count).sum()
+        total_scl_sum = accelerator.gather_for_metrics(scl_sum).sum()
+        total_scl_count = accelerator.gather_for_metrics(scl_count).sum()
+        total_info_ucl_sum = accelerator.gather_for_metrics(info_ucl_sum).sum()
+        total_info_ucl_count = accelerator.gather_for_metrics(info_ucl_count).sum()
     else:
         total_bce_sum = bce_sum
         total_bce_count = bce_count
@@ -448,15 +464,23 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
         total_ce_count = ce_count
         total_ucl_sum = ucl_sum
         total_ucl_count = ucl_count
+        total_scl_sum = scl_sum
+        total_scl_count = scl_count
+        total_info_ucl_sum = info_ucl_sum
+        total_info_ucl_count = info_ucl_count
 
     bce_avg = (total_bce_sum / (total_bce_count + 1e-8)).item()
     ce_avg = (total_ce_sum / (total_ce_count + 1e-8)).item()
     ucl_avg = (total_ucl_sum / (total_ucl_count + 1e-8)).item()
+    scl_avg = (total_scl_sum / (total_scl_count + 1e-8)).item()
+    info_ucl_avg = (total_info_ucl_sum / (total_info_ucl_count + 1e-8)).item()
 
-    bce_contrib = args.bce_weight * bce_avg if args.use_bce else 0.0
-    ce_contrib = args.ce_weight * ce_avg if args.use_ce else 0.0
-    ucl_contrib = args.ucl_weight * ucl_avg if args.use_ucl else 0.0
-    total_loss = bce_contrib + ce_contrib + ucl_contrib
+    bce_contrib = args.bce_weight * bce_avg 
+    ce_contrib = args.ce_weight * ce_avg
+    ucl_contrib = args.ucl_weight * ucl_avg
+    scl_contrib = args.scl_weight * scl_avg
+    info_ucl_contrib = args.infonce_weight * info_ucl_avg
+    total_loss = bce_contrib + ce_contrib + ucl_contrib + scl_contrib + info_ucl_contrib
 
     # Validation metrics - Multi-task learning (same structure as training)
     val_metrics = {}
@@ -549,12 +573,12 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
             print(f"[3-class Classification] AUROC={val_metrics['level3_auroc']:.4f}  "
                 f"AUPRC={val_metrics['level3_auprc']:.4f}\n")
 
-    return total_loss, bce_avg, ce_avg, ucl_avg, val_metrics
+    return total_loss, bce_avg, ce_avg, ucl_avg, scl_avg, info_ucl_avg, val_metrics
 
 
 # Test 함수
 def test(args, model, dataloader, loss_module, device, accelerator, dataset):
-    test_loss, test_bce_avg, test_ce_avg, test_ucl_avg, test_metrics = validate_multitask(
+    test_loss, test_bce_avg, test_ce_avg, test_ucl_avg, test_scl, test_info_ucl, test_metrics = validate_multitask(
         args, model, dataloader, loss_module, device, accelerator, dataset, epoch="final"
     )
 
@@ -578,11 +602,6 @@ def test(args, model, dataloader, loss_module, device, accelerator, dataset):
     print("\n" + "="*80)
     print("📊 [Final Test Results]")
     print("="*80)
-    print(f"Total Test Loss: {test_loss:.4f}")
-    print(f"   [Loss Components]")
-    print(f"      BCE (Edema): {test_bce_avg:.4f}")
-    print(f"      CE (Subtype): {test_ce_avg:.4f}")
-    print(f"      UCL (Temporal): {test_ucl_avg:.4f}")
 
     print(f"\n   [Hierarchical Performance Metrics]")
     print(f"[Edema Detection]   AUROC={test_metrics['level1_auroc']:.4f}  "
@@ -596,105 +615,107 @@ def test(args, model, dataloader, loss_module, device, accelerator, dataset):
         f"AUPRC={test_metrics['level3_auprc']:.4f}")
     print("="*80 + "\n")
 
-    return test_loss, test_bce_avg, test_ce_avg, test_ucl_avg, test_metrics, wandb_test_metrics
+    return test_loss, test_bce_avg, test_ce_avg, test_ucl_avg, test_scl, test_info_ucl, test_metrics, wandb_test_metrics
 
 
+
+####################################################################################
 # UMAP 생성 함수
-def plot_umap_2d(args, window_embeddings_list, window_labels_list, window_pred_list=None, epoch=None, prefix=None, pca_model=None):
-    window_embeddings = torch.cat(window_embeddings_list, dim=0)
-    window_labels = torch.cat(window_labels_list, dim=0)
+# def plot_umap_2d(args, window_embeddings_list, window_labels_list, window_pred_list=None, epoch=None, prefix=None, pca_model=None):
+#     window_embeddings = torch.cat(window_embeddings_list, dim=0)
+#     window_labels = torch.cat(window_labels_list, dim=0)
     
-    window_pred = None
-    if window_pred_list is not None:
-        window_pred = torch.cat(window_pred_list, dim=0)
-        window_pred = window_pred.cpu().numpy()
+#     window_pred = None
+#     if window_pred_list is not None:
+#         window_pred = torch.cat(window_pred_list, dim=0)
+#         window_pred = window_pred.cpu().numpy()
 
-    window_embeddings = window_embeddings.cpu().numpy()
-    window_labels = window_labels.cpu().numpy()
+#     window_embeddings = window_embeddings.cpu().numpy()
+#     window_labels = window_labels.cpu().numpy()
 
-    # 첫 번째 에포크에서는 PCA 모델 학습
-    if pca_model is None:
-        pca_model = PCA(n_components=args.pca_components, random_state=args.random_seed)
-        pca_model.fit(window_embeddings)
+#     # 첫 번째 에포크에서는 PCA 모델 학습
+#     if pca_model is None:
+#         pca_model = PCA(n_components=args.pca_components, random_state=args.random_seed)
+#         pca_model.fit(window_embeddings)
 
-    # 이후 에포크에서는 좌표계 고정함.
-    window_embeddings = pca_model.transform(window_embeddings)
+#     # 이후 에포크에서는 좌표계 고정함.
+#     window_embeddings = pca_model.transform(window_embeddings)
 
-    umap_model = UMAP(
-        n_components=2,
-        n_neighbors=args.umap_n_neighbors,
-        min_dist=args.umap_min_dist,
-        metric=args.umap_metric
-    )
+#     umap_model = UMAP(
+#         n_components=2,
+#         n_neighbors=args.umap_n_neighbors,
+#         min_dist=args.umap_min_dist,
+#         metric=args.umap_metric
+#     )
 
-    embeddings_2d = umap_model.fit_transform(window_embeddings)
+#     embeddings_2d = umap_model.fit_transform(window_embeddings)
 
-    umap_df = pd.DataFrame(embeddings_2d, columns=['component 0', 'component 1'])
-    umap_df['label'] = window_labels
-    if window_pred is not None:
-        umap_df['pred'] = window_pred
+#     umap_df = pd.DataFrame(embeddings_2d, columns=['component 0', 'component 1'])
+#     umap_df['label'] = window_labels
+#     if window_pred is not None:
+#         umap_df['pred'] = window_pred
 
-    label_colors = {
-        0: 'lightcoral',
-        1: 'turquoise', 
-        2: 'blueviolet',
-        -1: 'black'  # Unlabeled
-    }
+#     label_colors = {
+#         0: 'lightcoral',
+#         1: 'turquoise', 
+#         2: 'blueviolet',
+#         -1: 'black'  # Unlabeled
+#     }
 
-    label_mapping = {
-        0: 'Negative',
-        1: 'Noncardiogenic Edema',
-        2: 'Cardiogenic Edema',
-        -1: 'Unlabeled'
-    }
+#     label_mapping = {
+#         0: 'Negative',
+#         1: 'Noncardiogenic Edema',
+#         2: 'Cardiogenic Edema',
+#         -1: 'Unlabeled'
+#     }
 
-    # visualization
-    fig = plt.figure(figsize=(12,12))
+#     # visualization
+#     fig = plt.figure(figsize=(12,12))
 
-    for label, color in label_colors.items():
-        # label이 -1인 경우는 별도로 처리
-        if label == -1:
-            continue
-        subset = umap_df[umap_df['label'] == label]
-        plt.scatter(
-            subset['component 0'],
-            subset['component 1'],
-            color=color,
-            label=label_mapping[label],
-            s=8,
-            alpha=0.4
-        )
+#     for label, color in label_colors.items():
+#         # label이 -1인 경우는 별도로 처리
+#         if label == -1:
+#             continue
+#         subset = umap_df[umap_df['label'] == label]
+#         plt.scatter(
+#             subset['component 0'],
+#             subset['component 1'],
+#             color=color,
+#             label=label_mapping[label],
+#             s=8,
+#             alpha=0.4
+#         )
 
-    unlabeled_subset = umap_df[umap_df['label'] == -1]
-    if len(unlabeled_subset) > 0 and window_pred is not None:
-        for pred_label, color in label_colors.items():
-            if pred_label == -1:  # Skip unlabeled predictions
-                continue
-            pred_subset = unlabeled_subset[unlabeled_subset['pred'] == pred_label]
-            if len(pred_subset) > 0:  # Only plot if there are samples
-                plt.scatter(
-                    pred_subset['component 0'],
-                    pred_subset['component 1'],
-                    facecolors='black',
-                    edgecolors=color,
-                    linewidths=0.5,
-                    s=8,
-                    alpha=0.4,
-                    label=f"Unlabeled (pred: {label_mapping[pred_label]})"
-                )
+#     unlabeled_subset = umap_df[umap_df['label'] == -1]
+#     if len(unlabeled_subset) > 0 and window_pred is not None:
+#         for pred_label, color in label_colors.items():
+#             if pred_label == -1:  # Skip unlabeled predictions
+#                 continue
+#             pred_subset = unlabeled_subset[unlabeled_subset['pred'] == pred_label]
+#             if len(pred_subset) > 0:  # Only plot if there are samples
+#                 plt.scatter(
+#                     pred_subset['component 0'],
+#                     pred_subset['component 1'],
+#                     facecolors='black',
+#                     edgecolors=color,
+#                     linewidths=0.5,
+#                     s=8,
+#                     alpha=0.4,
+#                     label=f"Unlabeled (pred: {label_mapping[pred_label]})"
+#                 )
 
-    plt.legend(title="Classes", fontsize=12, handlelength=3, loc='upper left')
-    plt.title(f"{prefix.title()} Window-level Label distribution@ Epoch {epoch}" if epoch is not None else f"{prefix.title()} Window-level Label distribution")
-    plt.xticks([])
-    plt.yticks([])
+#     plt.legend(title="Classes", fontsize=12, handlelength=3, loc='upper left')
+#     plt.title(f"{prefix.title()} Window-level Label distribution@ Epoch {epoch}" if epoch is not None else f"{prefix.title()} Window-level Label distribution")
+#     plt.xticks([])
+#     plt.yticks([])
 
-    # ===== Save Locally =====
-    save_dir = args.umap_save_dir
-    os.makedirs(save_dir, exist_ok=True)
+#     # ===== Save Locally =====
+#     save_dir = args.umap_save_dir
+#     os.makedirs(save_dir, exist_ok=True)
 
-    file_name = f"{prefix}_umap_epoch{epoch}.png" if epoch is not None else f"{prefix}_umap.png"
-    save_path = os.path.join(save_dir, file_name)
+#     file_name = f"{prefix}_umap_epoch{epoch}.png" if epoch is not None else f"{prefix}_umap.png"
+#     save_path = os.path.join(save_dir, file_name)
 
-    plt.savefig(save_path)
-    plt.close(fig)
-    return pca_model
+#     plt.savefig(save_path)
+#     plt.close(fig)
+#     return pca_model

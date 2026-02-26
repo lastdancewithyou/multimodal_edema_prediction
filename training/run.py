@@ -50,7 +50,7 @@ def parse_arguments():
     # parser.add_argument('--target_path', type=str, default=None, help='Path to optimal target .npy file for Target_SupCon')
     # parser.add_argument('--target_supcon_tr', type=int, default=9, help="Target vector")
 
-    # Binary Cross-Entropy Loss (Edema Detection - Multi-task Learning)
+    #################################### Multi-task Learning ####################################
     parser.add_argument('--use_bce', type=bool, default=True, help='Enable BCE loss for edema detection')
     parser.add_argument('--bce_weight', type=float, default=1.0, help='Binary cross-entropy loss weight')
 
@@ -58,10 +58,19 @@ def parse_arguments():
     parser.add_argument('--use_ce', type=bool, default=True, help='Enable cross-entropy loss for classification')
     parser.add_argument('--ce_weight', type=float, default=1.0, help='Cross-entropy loss weight')
 
-    parser.add_argument('--use_ucl', type=bool, default=False)
+    parser.add_argument('--use_ucl', type=bool, default=True)
     parser.add_argument('--ucl_weight', type=float, default=0.1, help='Unsupervised contrastive loss weight')
     parser.add_argument('--ucl_beta', type=float, default=1.0, help='Beta for unsupervised contrastive loss')
     parser.add_argument('--ucl_temperature', type=float, default=0.1, help='Temperature for unsupervised contrastive loss')
+
+    parser.add_argument('--use_scl', type=bool, default=False)
+    parser.add_argument('--scl_weight', type=float, default=0.1, help='Supervised contrastive loss weight')
+    parser.add_argument('--scl_temperature', type=float, default=0.1, help='Temperature for supervised contrastive loss')
+
+    parser.add_argument('--use_infonce', type=bool, default=False)
+    parser.add_argument('--infonce_weight', type=float, default=0.1, help='InfoNCE loss weight')
+    parser.add_argument('--infonce_temperature', type=float, default=0.1, help='Temperature for InfoNCE loss')
+    ###############################################################################################
 
     # Single-Stage Training
     parser.add_argument('--single_stage_epochs', type=int, default=100, help='Number of epochs for single-stage training')
@@ -135,7 +144,7 @@ def parse_arguments():
         args.wandb_run_name = f"{args.experiment_id}: [GPU 0] temp=0.7/Optimal_hyperparam_search/Img_Text_Tuning/Fine-tuning"
     # single stage
     else:
-        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] No_Temporal_UCL+InfoNCE|SupCon"
+        args.wandb_run_name = f"{args.experiment_id}: [GPU 1] Baseline/classifierLR_changed"
 
     # ===================================================================================================
 

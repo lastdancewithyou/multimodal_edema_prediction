@@ -11,9 +11,9 @@ from utils import timer
 
 # 단일 배치 학습 함수
 def train_batch(args, model, batch, loss_module, device, accelerator, dataset, disable_cxr=False, disable_txt=False, max_length=256,
-                bce_weight=None, ce_weight=None, ucl_weight=None
+                bce_weight=None, ce_weight=None, ucl_weight=None, scl_weight=None, infonce_weight=None
     ):
-    
+
     model.train()
 
     # ==================== 1. 배치 데이터 GPU 전송 ====================
@@ -70,7 +70,7 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
                 batch_indices = model_outputs['batch_indices']         # [Nwin]
 
             with timer("Main loss 연산", accelerator):
-                total_batch_loss, bce_loss_t, ce_loss_t, ucl_loss_t = loss_module(
+                total_batch_loss, bce_loss_t, ce_loss_t, ucl_loss_t, scl_loss_t, infonce_loss_t, loss_counts = loss_module(
                     edema_logits = edema_logits,
                     subtype_logits = subtype_logits,
                     valid_embeddings = valid_embeddings,
@@ -82,6 +82,8 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
                     bce_weight=bce_weight,
                     ce_weight=ce_weight,
                     ucl_weight=ucl_weight,
+                    scl_weight=scl_weight,
+                    infonce_weight=infonce_weight,
                     device=device,
                     accelerator=accelerator
                 )
@@ -91,6 +93,8 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
     batch_bce = float(bce_loss_t.detach().item())
     batch_ce = float(ce_loss_t.detach().item())
     batch_ucl = float(ucl_loss_t.detach().item())
+    batch_scl = float(scl_loss_t.detach().item())
+    batch_info_ucl = float(infonce_loss_t.detach().item())
 
     batch_outputs = {
         'edema_labels': edema_labels,
@@ -101,9 +105,14 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
 
     batch_counts = {
         'window_count': window_count,
+        'bce_count': loss_counts['bce_count'],
+        'ce_count': loss_counts['ce_count'],
+        'ucl_count': loss_counts['ucl_count'],
+        'scl_count': loss_counts['scl_count'],
+        'infonce_count': loss_counts['infonce_count']
     }
 
-    return total_batch_loss, batch_bce, batch_ce, batch_ucl, batch_outputs, batch_counts
+    return total_batch_loss, batch_bce, batch_ce, batch_ucl, batch_scl, batch_info_ucl, batch_outputs, batch_counts
 
 
 def prepare_multiview_inputs_v2(batch, device, has_cxr, has_text, dataset, disable_cxr=False, disable_txt=False, max_length=256):

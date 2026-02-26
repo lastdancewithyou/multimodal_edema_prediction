@@ -17,19 +17,6 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
     1. Binary Edema embedding space (0 vs 1) - using window embeddings
     2. Subtype embedding space (0 vs 1, edema=1 only) - using window embeddings
     3. Combined 3-class visualization (0, 1, 2) - using window embeddings
-
-    Args:
-        max_samples: Maximum number of samples to use for UMAP. If None, use all samples.
-        umap_reducers: Dict of pre-fitted reducers:
-                       {
-                           'edema': {'pca': pca_obj, 'umap': umap_obj},
-                           'subtype': {'pca': pca_obj, 'umap': umap_obj},
-                           'combined': {'pca': pca_obj, 'umap': umap_obj}
-                       }
-                       If None, fit new reducers (training mode). If provided, use transform only (validation mode).
-
-    Returns:
-        reducers: Dict of fitted PCA + UMAP reducers (only if umap_reducers is None, i.e., training mode)
     """
     is_train_mode = (umap_reducers is None)
     if is_train_mode:

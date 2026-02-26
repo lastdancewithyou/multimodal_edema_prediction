@@ -66,39 +66,24 @@ class MultiModalLoss(nn.Module):
             print(f"[Loss] Temporal UCL disabled")
 
         # ==================== Supervised Contrastive Loss ====================
-        # self.use_supcon = args.use_supcon
-        # if self.use_supcon:
-        #     self.supcon_loss_fn = SupConLoss()
-        #     self.scl_temperature = args.scl_temperature
-        #     print(f"[Loss] Supervised Contrastive Loss enabled (temperature={self.scl_temperature})")
-        # else:
-        #     self.supcon_loss_fn = None
-        #     print(f"[Loss] Supervised Contrastive Loss disabled")
+        self.use_supcon = args.use_supcon
+        if self.use_supcon:
+            self.supcon_loss_fn = SupConLoss()
+            self.scl_temperature = args.scl_temperature
+            print(f"[Loss] Supervised Contrastive Loss enabled (temperature={self.scl_temperature})")
+        else:
+            self.supcon_loss_fn = None
+            print(f"[Loss] Supervised Contrastive Loss disabled")
 
-        # # ==================== Target_SupCon Loss (TSC + KCL) ====================
-        # self.use_target_supcon = args.use_target_supcon
-        # if self.use_target_supcon:
-        #     self.target_supcon_loss_fn = TSCwithQueue(
-        #         args=args,
-        #         embedding_dim=args.head_hidden_dim2,
-        #         queue_size=args.target_supcon_queue_size,
-        #         n_cls=args.num_classes,
-        #         T=args.target_supcon_temperature,
-        #         num_positive=args.target_supcon_K,
-        #         targeted=True,
-        #         tr=args.target_supcon_tr,
-        #         sep_t=True,
-        #         tw=args.target_supcon_tw
-        #     )
-        #     print(f"[Loss] TSCwithQueue Loss enabled")
-        #     print(f"       - Queue Size: {args.target_supcon_queue_size}")
-        #     print(f"       - Temperature: {args.target_supcon_temperature}")
-        #     print(f"       - K (max positives): {args.target_supcon_K}")
-        #     print(f"       - TSC Weight (tw): {args.target_supcon_tw}")
-        #     print(f"       - Embedding Dim: {args.head_hidden_dim2}")
-        # else:
-        #     self.target_supcon_loss_fn = None
-        #     print(f"[Loss] TSCwithQueue Loss disabled")
+        # ==================== InfoNCE Contrastive Loss ====================
+        self.use_infonce = args.use_infonce
+        if self.use_infonce:
+            self.infonce_loss_fn = SupConLoss()
+            self.infonce_temperature = args.infonce_temperature
+            print(f"[Loss] InFoNCE Contrastive Loss enabled (temperature={self.infonce_temperature})")
+        else:
+            self.infonce_loss_fn = None
+            print(f"[Loss] InFoNCE Contrastive Loss disabled")
 
     ###########################################################################
     def cross_entropy(self, subtype_logits, subtype_labels, edema_labels, window_mask):
@@ -126,16 +111,18 @@ class MultiModalLoss(nn.Module):
                     (edema_labels_flat == 1) &                                      # Edema-positive samples only
                     ((subtype_labels_flat == 0) | (subtype_labels_flat == 1)))      # For subtype classification
 
+        num_samples = valid_mask.sum().item()
+
         # 보호장치
-        if valid_mask.sum() == 0:
-            return torch.tensor(0.0, device=subtype_logits.device, requires_grad=False)
+        if num_samples == 0:
+            return torch.tensor(0.0, device=subtype_logits.device, requires_grad=False), 0
 
         # Extract valid samples
         logits_valid = logits_flat[valid_mask]           # [N_valid, 2]
         labels_valid = subtype_labels_flat[valid_mask]   # [N_valid] in {0, 1}
 
         ce_loss = self.ce_loss(logits_valid, labels_valid)
-        return ce_loss
+        return ce_loss, num_samples
 
     def binary_cross_entropy(self, edema_logits, edema_labels, window_mask):
         edema_logits_flat = edema_logits.view(-1).float()   # [B*W]
@@ -143,9 +130,10 @@ class MultiModalLoss(nn.Module):
         window_mask_flat = window_mask.view(-1).bool()        # [B*W]
 
         valid_mask = window_mask_flat & (edema_labels_flat != -1)
+        num_samples = valid_mask.sum().item()
 
-        if valid_mask.sum() == 0:
-            return torch.tensor(0.0, device=edema_logits.device, requires_grad=False)
+        if num_samples == 0:
+            return torch.tensor(0.0, device=edema_logits.device, requires_grad=False), 0
 
         logits_valid = edema_logits_flat[valid_mask]
         labels_valid = edema_labels_flat[valid_mask]
@@ -153,7 +141,7 @@ class MultiModalLoss(nn.Module):
         loss_per_sample = self.bce_loss(logits_valid, labels_valid)
         bce_loss = loss_per_sample.mean()
 
-        return bce_loss
+        return bce_loss, num_samples
 
     def forward(self,
                 # Model outputs
@@ -162,7 +150,7 @@ class MultiModalLoss(nn.Module):
                 # Labels
                 edema_labels, subtype_labels, window_mask,
                 # Loss weights
-                bce_weight=0.0, ce_weight=0.0, ucl_weight=0.0,
+                bce_weight=0.0, ce_weight=0.0, ucl_weight=0.0, scl_weight=0.0, infonce_weight=0.0,
                 # Misc
                 device=None, accelerator=None
         ):
@@ -172,21 +160,23 @@ class MultiModalLoss(nn.Module):
         # -------------------- (0) Binary CE Loss (Edema Detection) --------------------
         if bce_weight > 0.0 and edema_logits is not None and edema_labels is not None:
             with timer("BCE Loss", accelerator):
-                bce_loss = self.binary_cross_entropy(edema_logits, edema_labels, window_mask)
+                bce_loss, bce_count = self.binary_cross_entropy(edema_logits, edema_labels, window_mask)
         else:
             bce_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            bce_count = 0
 
         # -------------------- (1) CE Loss (Subtype Classification) --------------------
         if ce_weight > 0.0:
             with timer("CE Loss", accelerator):
-                ce_loss = self.cross_entropy(subtype_logits, subtype_labels, edema_labels, window_mask)
+                ce_loss, ce_count = self.cross_entropy(subtype_logits, subtype_labels, edema_labels, window_mask)
         else:
             ce_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            ce_count = 0
 
         # -------------------- (2) Temporal UCL Loss --------------------
         if self.use_ucl and ucl_weight > 0.0:
             with timer("Temporal UCL Loss", accelerator):
-                ucl_loss = self.ucl_loss_fn(
+                ucl_loss, ucl_count = self.ucl_loss_fn(
                     embeddings=valid_embeddings,
                     time_indices=window_time_indices,
                     batch_indices=batch_indices,
@@ -195,101 +185,35 @@ class MultiModalLoss(nn.Module):
                 )
         else:
             ucl_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            ucl_count = 0
 
-        # unused code
-        #####################################################################################################################################
-        # # -------------------- (2) Supervised Contrastive Loss (Subtype Classification) --------------------
-        # # NOTE: For multi-task learning, only apply contrastive loss to edema=1 samples with labeled subtypes
-        # if self.use_supcon and scl_weight > 0.0:
-        #     with timer("Supervised Contrastive Loss", accelerator):
-        #         supcon_input = projected_embeddings_multiview if projected_embeddings_multiview is not None else classification_input
+        # -------------------- (3) Supervised Contrastive Loss (SupCon) --------------------
+        if self.use_supcon and scl_weight > 0.0:
+            with timer("Supervised Contrastive Loss", accelerator):
+                # SupCon uses edema labels for contrastive learning
+                scl_loss, scl_count = self.supcon_loss_fn(
+                    embeddings=valid_embeddings,
+                    labels=edema_labels,
+                    window_mask=window_mask,
+                    temperature=self.scl_temperature
+                )
+        else:
+            scl_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            scl_count = 0
 
-        #         # Multi-task filtering: only use edema=1 AND subtype IN {1,2} samples
-        #         if edema_labels is not None:
-        #             # Create filtered inputs for SupCon
-        #             B, W = subtype_labels.shape
-        #             subtype_labels_flat = subtype_labels.reshape(B * W)
-        #             edema_labels_flat = edema_labels.reshape(B * W)
-        #             mask_flat = window_mask.reshape(B * W).bool()
-
-        #             # Get valid windows
-        #             subtype_valid = subtype_labels_flat[mask_flat]  # [Nwin]
-        #             edema_valid = edema_labels_flat[mask_flat]      # [Nwin]
-
-        #             # Filter: edema==1 AND subtype IN {1, 2} (exclude NaN, -1, 0)
-        #             # Subtype labels: 1 (non-cardiogenic), 2 (cardiogenic)
-        #             has_edema = (edema_valid == 1)
-        #             has_subtype_label = (subtype_valid == 1) | (subtype_valid == 2)
-        #             contrastive_mask = has_edema & has_subtype_label
-
-        #             if contrastive_mask.sum() > 0:
-        #                 # Filter embeddings and labels (single-view, no augmentation)
-        #                 # supcon_input: [Nwin, D] → filter → [N_contrastive, D]
-        #                 supcon_input_filtered = supcon_input[contrastive_mask]
-        #                 labels_filtered = subtype_valid[contrastive_mask]
-
-        #                 # Create a temporary window mask (all 1s since we already filtered)
-        #                 temp_window_mask = torch.ones(labels_filtered.shape[0], device=device, dtype=torch.bool)
-
-        #                 # Reshape for SupConLoss: expects [B, W, D] format
-        #                 # We treat filtered samples as a single "batch" with W windows
-        #                 scl_loss = self.supcon_loss_fn(
-        #                     embeddings=supcon_input_filtered.unsqueeze(0),  # [1, N_contrastive, D]
-        #                     labels=labels_filtered.unsqueeze(0),  # [1, N_contrastive]
-        #                     window_mask=temp_window_mask.unsqueeze(0),  # [1, N_contrastive]
-        #                     temperature=self.scl_temperature
-        #                 )
-        #             else:
-        #                 # No samples for contrastive learning
-        #                 scl_loss = torch.tensor(0.0, device=device, requires_grad=False)
-        #         else:
-        #             # Legacy behavior: use all labeled samples
-        #             scl_loss = self.supcon_loss_fn(
-        #                 embeddings=supcon_input,
-        #                 labels=labels,
-        #                 window_mask=window_mask,
-        #                 temperature=self.scl_temperature
-        #             )
-        # else:
-        #     scl_loss = torch.tensor(0.0, device=device, requires_grad=False)
-
-        # # -------------------- (2-1) Target_SupCon Loss (KCL + TSC) --------------------
-        # if self.use_target_supcon and target_supcon_weight > 0.0 and projected_embeddings_multiview is not None:
-        #     with timer("Target_SupCon Loss", accelerator):
-        #         # Multi-view projections: [Nwin, 2, D]
-        #         z_view0 = projected_embeddings_multiview[:, 0, :]  # [Nwin, D]
-        #         z_view1 = projected_embeddings_multiview[:, 1, :]  # [Nwin, D]
-
-        #         B, W = labels.shape
-        #         labels_flat = labels.reshape(B * W)
-        #         mask_flat = window_mask.reshape(B * W).bool()
-        #         labels_valid = labels_flat[mask_flat]  # [Nwin]
-
-        #         # Filter out -1 labels (unlabeled samples)
-        #         labeled_mask = (labels_valid != -1)                 # [Nwin]
-        #         z_view0_labeled = z_view0[labeled_mask]             # [N_labeled, D]
-        #         z_view1_labeled = z_view1[labeled_mask]             # [N_labeled, D]
-        #         labels_labeled = labels_valid[labeled_mask]         # [N_labeled] - no -1
-
-        #         # TSCwithQueue forward: (v, v_tilde, y, update_queue)
-        #         loss_dict = self.target_supcon_loss_fn(
-        #             v=z_view0_labeled,
-        #             v_tilde=z_view1_labeled,
-        #             y=labels_labeled,
-        #             update_queue=True,
-        #             current_epoch=current_epoch,
-        #             total_epochs=total_epochs,
-        #         )
-
-        #         target_supcon_loss = loss_dict["loss"]  # KCL + TSC combined
-        #         loss_kcl = loss_dict["loss_kcl"]        # KCL only (for logging)
-        #         loss_tsc = loss_dict["loss_tsc"]        # TSC only (for logging)
-
-        # else:
-        #     target_supcon_loss = torch.tensor(0.0, device=device, requires_grad=False)
-        #     loss_kcl = torch.tensor(0.0, device=device, requires_grad=False)
-        #     loss_tsc = torch.tensor(0.0, device=device, requires_grad=False)
-        #####################################################################################################################################
+        # -------------------- (4) InfoNCE Contrastive Loss --------------------
+        if self.use_infonce and infonce_weight > 0.0:
+            with timer("InfoNCE Contrastive Loss", accelerator):
+                # InfoNCE uses subtype labels for contrastive learning (edema=1 only)
+                infonce_loss, infonce_count = self.infonce_loss_fn(
+                    embeddings=valid_embeddings,
+                    labels=subtype_labels,
+                    window_mask=window_mask,
+                    temperature=self.infonce_temperature
+                )
+        else:
+            infonce_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            infonce_count = 0
 
         # -------------------- NaN Detection --------------------
         if torch.isnan(bce_loss) or torch.isinf(bce_loss):
@@ -301,20 +225,32 @@ class MultiModalLoss(nn.Module):
         if torch.isnan(ucl_loss) or torch.isinf(ucl_loss):
             print(f"[WARNING] Temporal UCL Loss is NaN/Inf: {ucl_loss.item()}")
 
-        # if torch.isnan(scl_loss) or torch.isinf(scl_loss):
-        #     print(f"[WARNING] SCL Loss is NaN/Inf: {scl_loss.item()}")
+        if torch.isnan(scl_loss) or torch.isinf(scl_loss):
+            print(f"[WARNING] SCL Loss is NaN/Inf: {scl_loss.item()}")
 
-        # if torch.isnan(target_supcon_loss) or torch.isinf(target_supcon_loss):
-        #     print(f"[WARNING] Target_SupCon Loss is NaN/Inf: {target_supcon_loss.item()}")
+        if torch.isnan(infonce_loss) or torch.isinf(infonce_loss):
+            print(f"[WARNING] InfoNCE Loss is NaN/Inf: {infonce_loss.item()}")
+
 
         # -------------------- Total Loss --------------------
         total_loss = (
             bce_weight * bce_loss +
             ce_weight * ce_loss +
-            ucl_weight * ucl_loss
+            ucl_weight * ucl_loss +
+            scl_weight * scl_loss +
+            infonce_weight * infonce_loss
         )
 
-        return total_loss, bce_loss, ce_loss, ucl_loss
+        # -------------------- Sample Counts --------------------
+        loss_counts = {
+            'bce_count': bce_count,
+            'ce_count': ce_count,
+            'ucl_count': ucl_count,
+            'scl_count': scl_count,
+            'infonce_count': infonce_count
+        }
+
+        return total_loss, bce_loss, ce_loss, ucl_loss, scl_loss, infonce_loss, loss_counts
     
     # validation & test
     def inference(self, classification_input, logits, labels, window_mask):
@@ -357,7 +293,7 @@ class ConstrainttimeLoss(nn.Module):
 
         # Early exit if not enough samples
         if N < 2:
-            return torch.tensor(0.0, device=device, requires_grad=False)
+            return torch.tensor(0.0, device=device, requires_grad=False), 0
 
         # Normalize embeddings (if not already normalized)
         z = F.normalize(embeddings, p=2, dim=-1)  # [N, D]
@@ -394,7 +330,7 @@ class ConstrainttimeLoss(nn.Module):
             #     f"Positive pairs: {num_pos_pairs}/{total_pairs} ({pos_ratio:.1f}%) | "
             #     f"Samples: {N}")
 
-        return pull_loss
+        return pull_loss, N
 
 
 
@@ -904,9 +840,10 @@ class SupConLoss(nn.Module):
 
         # 2) Valid window filtering (exclude unlabeled and padded)
         valid = mask_flat & (lab_flat != -1)
+        num_samples = valid.sum().item()
 
-        if valid.sum() == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
+        if num_samples == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True), 0
 
         features = feat_flat[valid]     # [N, D]
         labels_valid = lab_flat[valid]  # [N]
@@ -916,7 +853,7 @@ class SupConLoss(nn.Module):
 
         N = features.shape[0]
         if N < 2:
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            return torch.tensor(0.0, device=device, requires_grad=True), N
 
         # 4) Compute similarity matrix
         logits = torch.div(features @ features.T, temperature)  # [N, N]
@@ -943,7 +880,7 @@ class SupConLoss(nn.Module):
         mean_log_prob_pos = (pos_mask * log_prob).sum(1) / pos_per_anchor
         loss = -mean_log_prob_pos.mean()
 
-        return loss
+        return loss, N
 
 #############################################################################################################
 #############################################################################################################
