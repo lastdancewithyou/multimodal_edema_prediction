@@ -9,15 +9,33 @@ import torch
 from training.engine import prepare_multiview_inputs_v2
 
 
-def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, epoch, save_dir, max_samples=None):
+def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, epoch, save_dir, max_samples=None,
+                        umap_reducers=None):
     """
     Multi-task Learning UMAP Visualization:
     Creates 3 plots:
     1. Binary Edema embedding space (0 vs 1) - using window embeddings
     2. Subtype embedding space (0 vs 1, edema=1 only) - using window embeddings
     3. Combined 3-class visualization (0, 1, 2) - using window embeddings
+
+    Args:
+        max_samples: Maximum number of samples to use for UMAP. If None, use all samples.
+        umap_reducers: Dict of pre-fitted reducers:
+                       {
+                           'edema': {'pca': pca_obj, 'umap': umap_obj},
+                           'subtype': {'pca': pca_obj, 'umap': umap_obj},
+                           'combined': {'pca': pca_obj, 'umap': umap_obj}
+                       }
+                       If None, fit new reducers (training mode). If provided, use transform only (validation mode).
+
+    Returns:
+        reducers: Dict of fitted PCA + UMAP reducers (only if umap_reducers is None, i.e., training mode)
     """
-    print("=====Generating Multi-Task UMAP Visualizations=====")
+    is_train_mode = (umap_reducers is None)
+    if is_train_mode:
+        print("=====Generating Multi-Task UMAP Visualizations =====")
+    else:
+        print("=====Generating Multi-Task UMAP Visualizations =====")
     model.eval()
 
     all_window_embeddings = []
@@ -73,15 +91,6 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
             labeled_mask = (edema_labels_flat != -1)  # Exclude unlabeled windows
             combined_mask = valid_mask & labeled_mask
 
-            ###############################################################
-            # valid_window_emb = window_embeddings_flat[combined_mask]
-            # valid_edema = edema_labels_flat[combined_mask]
-            # valid_subtype = subtype_labels_flat[combined_mask]
-            ###############################################################
-
-            labeled_mask = (edema_labels_flat != -1)  # Exclude unlabeled windows
-            combined_mask = valid_mask & labeled_mask
-
             valid_window_emb = window_embeddings_flat[combined_mask]
             valid_edema = edema_labels_flat[combined_mask]
             valid_subtype = subtype_labels_flat[combined_mask]
@@ -112,19 +121,35 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
 
     os.makedirs(save_dir, exist_ok=True)
 
+    # Initialize reducer storage for training mode
+    if is_train_mode:
+        fitted_reducers = {}
+
     # ============== Plot 1: Binary Edema (0 vs 1) - Window Embeddings ==============
     edema_valid_mask = (edema_labels != -1)
     if edema_valid_mask.sum() > 0:
         edema_emb = window_embeddings[edema_valid_mask]
         edema_lbl = edema_labels[edema_valid_mask]
 
-        # PCA then UMAP
-        pca_dim = min(50, edema_emb.shape[0], edema_emb.shape[1])
-        pca = PCA(n_components=pca_dim, random_state=args.random_seed)
-        edema_emb_pca = pca.fit_transform(edema_emb)
+        if is_train_mode:
+            # Training: fit new PCA + UMAP
+            pca_dim = min(50, edema_emb.shape[0], edema_emb.shape[1])
+            pca_edema = PCA(n_components=pca_dim, random_state=args.random_seed)
+            edema_emb_pca = pca_edema.fit_transform(edema_emb)
 
-        umap_edema = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=args.random_seed)
-        edema_2d = umap_edema.fit_transform(edema_emb_pca)
+            umap_edema = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=args.random_seed)
+            edema_2d = umap_edema.fit_transform(edema_emb_pca)
+
+            fitted_reducers['edema'] = {'pca': pca_edema, 'umap': umap_edema}
+            print(f"[Train] Fitted PCA + UMAP for Binary Edema")
+        else:
+            # Validation: transform only using pre-fitted PCA + UMAP
+            pca_edema = umap_reducers['edema']['pca']
+            umap_edema = umap_reducers['edema']['umap']
+
+            edema_emb_pca = pca_edema.transform(edema_emb)
+            edema_2d = umap_edema.transform(edema_emb_pca)
+            print(f"[Val] Transformed using Train PCA + UMAP for Binary Edema")
 
         fig, ax = plt.subplots(figsize=(10, 8))
         colors = {0: '#9E9E9E', 1: '#1565C0'}
@@ -152,13 +177,25 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
         subtype_emb = window_embeddings[subtype_mask]
         subtype_lbl = subtype_labels[subtype_mask]
 
-        # PCA then UMAP
-        pca_dim = min(50, subtype_emb.shape[0], subtype_emb.shape[1])
-        pca = PCA(n_components=pca_dim, random_state=args.random_seed)
-        subtype_emb_pca = pca.fit_transform(subtype_emb)
+        if is_train_mode:
+            # Training: fit new PCA + UMAP
+            pca_dim = min(50, subtype_emb.shape[0], subtype_emb.shape[1])
+            pca_subtype = PCA(n_components=pca_dim, random_state=args.random_seed)
+            subtype_emb_pca = pca_subtype.fit_transform(subtype_emb)
 
-        umap_subtype = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=args.random_seed)
-        subtype_2d = umap_subtype.fit_transform(subtype_emb_pca)
+            umap_subtype = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=args.random_seed)
+            subtype_2d = umap_subtype.fit_transform(subtype_emb_pca)
+
+            fitted_reducers['subtype'] = {'pca': pca_subtype, 'umap': umap_subtype}
+            print(f"[Train] Fitted PCA + UMAP for Subtype Classification")
+        else:
+            # Validation: transform only using pre-fitted PCA + UMAP
+            pca_subtype = umap_reducers['subtype']['pca']
+            umap_subtype = umap_reducers['subtype']['umap']
+
+            subtype_emb_pca = pca_subtype.transform(subtype_emb)
+            subtype_2d = umap_subtype.transform(subtype_emb_pca)
+            print(f"[Val] Transformed using Train PCA + UMAP for Subtype Classification")
 
         fig, ax = plt.subplots(figsize=(10, 8))
         colors = {0: '#42A5F5', 1: '#E53935'}
@@ -192,13 +229,25 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
         combined_emb = window_embeddings[combined_valid_mask]
         combined_lbl = combined_labels[combined_valid_mask]
 
-        # PCA then UMAP
-        pca_dim = min(50, combined_emb.shape[0], combined_emb.shape[1])
-        pca = PCA(n_components=pca_dim, random_state=args.random_seed)
-        combined_emb_pca = pca.fit_transform(combined_emb)
+        if is_train_mode:
+            # Training: fit new PCA + UMAP
+            pca_dim = min(50, combined_emb.shape[0], combined_emb.shape[1])
+            pca_combined = PCA(n_components=pca_dim, random_state=args.random_seed)
+            combined_emb_pca = pca_combined.fit_transform(combined_emb)
 
-        umap_combined = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=args.random_seed)
-        combined_2d = umap_combined.fit_transform(combined_emb_pca)
+            umap_combined = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=args.random_seed)
+            combined_2d = umap_combined.fit_transform(combined_emb_pca)
+
+            fitted_reducers['combined'] = {'pca': pca_combined, 'umap': umap_combined}
+            print(f"[Train] Fitted PCA + UMAP for Combined 3-Class")
+        else:
+            # Validation: transform only using pre-fitted PCA + UMAP
+            pca_combined = umap_reducers['combined']['pca']
+            umap_combined = umap_reducers['combined']['umap']
+
+            combined_emb_pca = pca_combined.transform(combined_emb)
+            combined_2d = umap_combined.transform(combined_emb_pca)
+            print(f"[Val] Transformed using Train PCA + UMAP for Combined 3-Class")
 
         fig, ax = plt.subplots(figsize=(10, 8))
         colors = {0: '#9E9E9E', 1: '#42A5F5', 2: '#E53935'}
@@ -220,4 +269,9 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
         plt.close(fig)
         print(f"Saved: {save_path}")
 
-    print("✅ Multi-Task UMAP Visualization Complete")
+    if is_train_mode:
+        print("✅ Multi-Task UMAP Visualization Complete")
+        return fitted_reducers
+    else:
+        print("✅ Multi-Task UMAP Visualization Complete")
+        return None

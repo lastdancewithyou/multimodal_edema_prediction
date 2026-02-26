@@ -463,10 +463,9 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
 
         # ==================== Multi-Task UMAP Visualization ====================
         if accelerator.is_main_process and ((epoch + 1) == 1 or (epoch + 1) % 5 == 0 or (epoch + 1) == args.single_stage_epochs):
-            # Training UMAP
             print("🖼️ Generating Training UMAP...")
             train_umap_dir = os.path.join(args.umap_save_dir, 'train')
-            plot_multitask_umap(
+            train_reducers = plot_multitask_umap(
                 args=args,
                 model=model,
                 dataloader=train_loader,
@@ -475,11 +474,12 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 dataset=train_loader.dataset,
                 epoch=epoch+1,
                 save_dir=train_umap_dir,
-                max_samples=20000
+                max_samples=40000,
+                umap_reducers=None
             )
             print("✅ Training UMAP completed")
 
-            # Validation UMAP
+            # Validation UMAP (transform using train PCA + UMAP coordinate system)
             print("🖼️ Generating Validation UMAP...")
             val_umap_dir = os.path.join(args.umap_save_dir, 'val')
             plot_multitask_umap(
@@ -491,7 +491,8 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 dataset=val_loader.dataset,
                 epoch=epoch+1,
                 save_dir=val_umap_dir,
-                max_samples=20000
+                max_samples=None,
+                umap_reducers=train_reducers  # Val mode: use train PCA + UMAP
             )
             print("✅ Validation UMAP completed")
 

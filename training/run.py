@@ -6,7 +6,7 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="Multi_task", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="1", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="3", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
 
     # Modality Selection
@@ -58,7 +58,7 @@ def parse_arguments():
     parser.add_argument('--use_ce', type=bool, default=True, help='Enable cross-entropy loss for classification')
     parser.add_argument('--ce_weight', type=float, default=1.0, help='Cross-entropy loss weight')
 
-    parser.add_argument('--use_ucl', type=bool, default=True)
+    parser.add_argument('--use_ucl', type=bool, default=False)
     parser.add_argument('--ucl_weight', type=float, default=0.1, help='Unsupervised contrastive loss weight')
     parser.add_argument('--ucl_beta', type=float, default=1.0, help='Beta for unsupervised contrastive loss')
     parser.add_argument('--ucl_temperature', type=float, default=0.1, help='Temperature for unsupervised contrastive loss')
@@ -135,7 +135,7 @@ def parse_arguments():
         args.wandb_run_name = f"{args.experiment_id}: [GPU 0] temp=0.7/Optimal_hyperparam_search/Img_Text_Tuning/Fine-tuning"
     # single stage
     else:
-        args.wandb_run_name = f"{args.experiment_id}: [GPU 1] Multi-task First Training"
+        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] No_Temporal_UCL+InfoNCE|SupCon"
 
     # ===================================================================================================
 

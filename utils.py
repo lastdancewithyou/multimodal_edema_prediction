@@ -14,7 +14,6 @@ from training.run import parse_arguments
 # TIMER 전역 제어
 TIME_ENABLED = False # True: 작동 / False: 미작동
 
-
 def plot_latent_time_attention(attn, save_path=None):
     B, L, T = attn.shape
 
