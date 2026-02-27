@@ -374,6 +374,10 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
     ce_count = torch.zeros(1, device=device, dtype=torch.float32)
     ucl_sum = torch.zeros(1, device=device, dtype=torch.float32)
     ucl_count = torch.zeros(1, device=device, dtype=torch.float32)
+    scl_sum = torch.zeros(1, device=device, dtype=torch.float32)
+    scl_count = torch.zeros(1, device=device, dtype=torch.float32)
+    info_ucl_sum = torch.zeros(1, device=device, dtype=torch.float32)
+    info_ucl_count = torch.zeros(1, device=device, dtype=torch.float32)
 
     val_edema_preds_list = []
     val_edema_labels_list = []
@@ -398,10 +402,6 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
                 ucl_weight=args.ucl_weight,
                 scl_weight=args.scl_weight,
                 infonce_weight=args.infonce_weight,
-                # # No gradient, just compute loss
-                # bce_weight=0.0,
-                # ce_weight=0.0,
-                # ucl_weight=0.0,
             )
 
             # Get loss-specific sample counts
@@ -583,10 +583,6 @@ def test(args, model, dataloader, loss_module, device, accelerator, dataset):
     )
 
     wandb_test_metrics = {
-        'test/total_loss': test_loss,
-        'test/bce_loss': test_bce_avg,
-        'test/ce_loss': test_ce_avg,
-        'test/ucl_loss': test_ucl_avg,
         # Level 1: Binary Edema Detection
         'test/level1_auroc': test_metrics['level1_auroc'],
         'test/level1_auprc': test_metrics['level1_auprc'],

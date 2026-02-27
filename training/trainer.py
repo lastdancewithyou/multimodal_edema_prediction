@@ -25,7 +25,7 @@ logging.getLogger("torch.distributed.distributed_c10d").setLevel(logging.ERROR)
 from training.run import parse_arguments
 from training.data_processing import get_dataloaders
 from training.engine import train_batch
-from training.evaluator import test, plot_umap_2d, validate_multitask
+from training.evaluator import test, validate_multitask
 from models.main_architecture import MultiModalEncoder, MultiModalContrastiveModel, MultiModalClassificationModel
 from loss.losses import MultiModalLoss
 from loss.target_metrics import visualize_target_supcon
@@ -98,7 +98,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
     print(f"      BCE Loss: {'Enabled' if args.use_bce else 'Disabled'} (λ={args.bce_weight})")
     print(f"   Sub Task (Subtype Classification & Representation Learning):")
     print(f"      CE Loss: {'Enabled' if args.use_ce else 'Disabled'} (λ={args.ce_weight})")
-    print(f"      UCL Loss: {'Enabled' if args.use_ucl else 'Disabled'} (λ={args.ucl_weight})")
+    print(f"      UCL Loss: {'Enabled' if args.use_temporal_ucl else 'Disabled'} (λ={args.ucl_weight})")
     print(f"   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     # if args.use_target_supcon:
     #     print(f"   Target_SupCon (Optional): Enabled (λ={args.target_supcon_weight})")
@@ -185,7 +185,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
     model, optimizer, loss_module = accelerator.prepare(model, optimizer, loss_module)
 
     # ==================== Scheduler Configuration ====================
-    warmup_epochs = 5
+    warmup_epochs = 3
     warmup_scheduler = lr_scheduler.LinearLR(
         optimizer,
         start_factor=0.1,
@@ -233,6 +233,10 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
         ce_count = torch.zeros(1, device=device, dtype=torch.float32)
         ucl_sum = torch.zeros(1, device=device, dtype=torch.float32)
         ucl_count = torch.zeros(1, device=device, dtype=torch.float32)
+        scl_sum = torch.zeros(1, device=device, dtype=torch.float32)
+        scl_count = torch.zeros(1, device=device, dtype=torch.float32)
+        info_ucl_sum = torch.zeros(1, device=device, dtype=torch.float32)
+        info_ucl_count = torch.zeros(1, device=device, dtype=torch.float32)
 
         train_edema_preds_list = []
         train_edema_labels_list = []
@@ -265,6 +269,8 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                     bce_weight=args.bce_weight,
                     ce_weight=args.ce_weight,
                     ucl_weight=args.ucl_weight,
+                    scl_weight=args.scl_weight,
+                    infonce_weight=args.infonce_weight,
                 )
 
                 accelerator.backward(total_batch_loss)
@@ -445,7 +451,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
             print(f"      CE (Subtype): {ce_avg:.4f} → Weighted: {ce_contrib:.4f} (λ={args.ce_weight})")
             print(f"      Temporal UCL: {ucl_avg:.4f} → Weighted: {ucl_contrib:.4f} (λ={args.ucl_weight})")
             print(f"      SCL (Edema): {scl_avg:.4f} → Weighted: {scl_contrib:.4f} (λ={args.scl_weight})")
-            print(f"      InfoNCE: {info_ucl_avg:.4f} → Weighted: {info_ucl_contrib:.4f} (λ={args.info_ucl_weight})")
+            print(f"      InfoNCE: {info_ucl_avg:.4f} → Weighted: {info_ucl_contrib:.4f} (λ={args.infonce_weight})")
 
 
             print(f"\n   [Hierarchical Performance Metrics]")
@@ -627,20 +633,20 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
     print(f"   Best Val Level 3 AUPRC: {best_val_auprc:.4f}\n")
 
     print("   [Test Results - Hierarchical Metrics]")
-    print(f"   Level 1 (Edema Detection):        AUROC={wandb_test_metrics['level1_auroc']:.4f}  AUPRC={wandb_test_metrics['level1_auprc']:.4f}")
-    print(f"   Level 2 (Subtype Classification): AUROC={wandb_test_metrics['level2_auroc']:.4f}  AUPRC={wandb_test_metrics['level2_auprc']:.4f}")
-    print(f"   Level 3 (3-class Combined):       AUROC={wandb_test_metrics['level3_auroc']:.4f}  AUPRC={wandb_test_metrics['level3_auprc']:.4f}")
+    print(f"   Level 1 (Edema Detection):        AUROC={wandb_test_metrics['test/level1_auroc']:.4f}  AUPRC={wandb_test_metrics['test/level1_auprc']:.4f}")
+    print(f"   Level 2 (Subtype Classification): AUROC={wandb_test_metrics['test/level2_auroc']:.4f}  AUPRC={wandb_test_metrics['test/level2_auprc']:.4f}")
+    print(f"   Level 3 (3-class Combined):       AUROC={wandb_test_metrics['test/level3_auroc']:.4f}  AUPRC={wandb_test_metrics['test/level3_auprc']:.4f}")
     print("="*80 + "\n")
 
     results = {
         'val_level3_auroc': best_val_auroc,
         'val_level3_auprc': best_val_auprc,
-        'test_level1_auroc': wandb_test_metrics['level1_auroc'],
-        'test_level1_auprc': wandb_test_metrics['level1_auprc'],
-        'test_level2_auroc': wandb_test_metrics['level2_auroc'],
-        'test_level2_auprc': wandb_test_metrics['level2_auprc'],
-        'test_level3_auroc': wandb_test_metrics['level3_auroc'],
-        'test_level3_auprc': wandb_test_metrics['level3_auprc']
+        'test_level1_auroc': wandb_test_metrics['test/level1_auroc'],
+        'test_level1_auprc': wandb_test_metrics['test/level1_auprc'],
+        'test_level2_auroc': wandb_test_metrics['test/level2_auroc'],
+        'test_level2_auprc': wandb_test_metrics['test/level2_auprc'],
+        'test_level3_auroc': wandb_test_metrics['test/level3_auroc'],
+        'test_level3_auprc': wandb_test_metrics['test/level3_auprc']
     }
 
     if accelerator.num_processes > 1:

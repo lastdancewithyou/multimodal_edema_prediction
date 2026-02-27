@@ -66,7 +66,6 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
             # Extract window embeddings
             window_embeddings_bw = outputs['window_embeddings']  # [B, W, 256]
 
-            # Flatten window embeddings: [B, W, 256] -> [B*W, 256]
             B, W = window_mask.shape
             window_embeddings_flat = window_embeddings_bw.reshape(B * W, -1)
             edema_labels_flat = edema_labels.reshape(-1)
@@ -86,7 +85,6 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
             all_edema_labels.append(valid_edema.cpu())
             all_subtype_labels.append(valid_subtype.cpu())
 
-    # Concatenate all
     window_embeddings = torch.cat(all_window_embeddings, dim=0).numpy()
     edema_labels = torch.cat(all_edema_labels, dim=0).numpy()
     subtype_labels = torch.cat(all_subtype_labels, dim=0).numpy()
@@ -94,7 +92,7 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
     total_samples = len(window_embeddings)
     print(f"Collected {total_samples} total samples")
 
-    # Random sampling if max_samples is specified and we have more samples than max_samples
+    # Random sampling if input more samples than max_samples
     if max_samples is not None and total_samples > max_samples:
         print(f"Randomly sampling {max_samples} samples from {total_samples} for UMAP visualization")
         np.random.seed(args.random_seed)
@@ -108,7 +106,6 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
 
     os.makedirs(save_dir, exist_ok=True)
 
-    # Initialize reducer storage for training mode
     if is_train_mode:
         fitted_reducers = {}
 
@@ -129,8 +126,9 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
 
             fitted_reducers['edema'] = {'pca': pca_edema, 'umap': umap_edema}
             print(f"[Train] Fitted PCA + UMAP for Binary Edema")
+
         else:
-            # Validation: transform only using pre-fitted PCA + UMAP
+            # ⭐ Validation: transform only using pre-fitted PCA + UMAP
             pca_edema = umap_reducers['edema']['pca']
             umap_edema = umap_reducers['edema']['umap']
 
@@ -176,7 +174,7 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
             fitted_reducers['subtype'] = {'pca': pca_subtype, 'umap': umap_subtype}
             print(f"[Train] Fitted PCA + UMAP for Subtype Classification")
         else:
-            # Validation: transform only using pre-fitted PCA + UMAP
+            # ⭐ Validation: transform only using pre-fitted PCA + UMAP
             pca_subtype = umap_reducers['subtype']['pca']
             umap_subtype = umap_reducers['subtype']['umap']
 
@@ -192,7 +190,7 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
             mask = (subtype_lbl == lbl)
             if mask.sum() > 0:
                 ax.scatter(subtype_2d[mask, 0], subtype_2d[mask, 1],
-                          c=colors[lbl], label=f'{labels_map[lbl]} (n={mask.sum()})', s=3, alpha=0.6, edgecolors='none')
+                        c=colors[lbl], label=f'{labels_map[lbl]} (n={mask.sum()})', s=3, alpha=0.6, edgecolors='none')
 
         ax.legend(fontsize=12)
         ax.set_title(f'Subtype Classification - Window Embeddings (Edema=1 only) - Epoch {epoch}', fontsize=14)
@@ -244,7 +242,7 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
             mask = (combined_lbl == lbl)
             if mask.sum() > 0:
                 ax.scatter(combined_2d[mask, 0], combined_2d[mask, 1],
-                          c=colors[lbl], label=f'{labels_map[lbl]} (n={mask.sum()})', s=3, alpha=0.6, edgecolors='none')
+                        c=colors[lbl], label=f'{labels_map[lbl]} (n={mask.sum()})', s=3, alpha=0.6, edgecolors='none')
 
         ax.legend(fontsize=12)
         ax.set_title(f'Combined 3-Class (Window Embeddings) - Epoch {epoch}', fontsize=14)

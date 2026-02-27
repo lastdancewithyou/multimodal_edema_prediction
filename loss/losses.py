@@ -56,8 +56,8 @@ class MultiModalLoss(nn.Module):
         
 
         # ==================== Temporal Neighbor based Contrastive Learning (For Generalization) ====================
-        self.use_ucl = args.use_ucl
-        if self.use_ucl:
+        self.use_temporal_ucl = args.use_temporal_ucl
+        if self.use_temporal_ucl:
             self.ucl_loss_fn = ConstrainttimeLoss(ucl_beta=args.ucl_beta)
             self.ucl_temperature = args.ucl_temperature
             print(f"[Loss] Temporal UCL enabled (temperature={self.ucl_temperature})")
@@ -78,12 +78,12 @@ class MultiModalLoss(nn.Module):
         # ==================== InfoNCE Contrastive Loss ====================
         self.use_infonce = args.use_infonce
         if self.use_infonce:
-            self.infonce_loss_fn = SupConLoss()
+            self.infonce_loss_fn = InfoNCELoss()
             self.infonce_temperature = args.infonce_temperature
-            print(f"[Loss] InFoNCE Contrastive Loss enabled (temperature={self.infonce_temperature})")
+            print(f"[Loss] InfoNCE Contrastive Loss enabled (temperature={self.infonce_temperature})")
         else:
             self.infonce_loss_fn = None
-            print(f"[Loss] InFoNCE Contrastive Loss disabled")
+            print(f"[Loss] InfoNCE Contrastive Loss disabled")
 
     ###########################################################################
     def cross_entropy(self, subtype_logits, subtype_labels, edema_labels, window_mask):
@@ -174,7 +174,7 @@ class MultiModalLoss(nn.Module):
             ce_count = 0
 
         # -------------------- (2) Temporal UCL Loss --------------------
-        if self.use_ucl and ucl_weight > 0.0:
+        if self.use_temporal_ucl and ucl_weight > 0.0:
             with timer("Temporal UCL Loss", accelerator):
                 ucl_loss, ucl_count = self.ucl_loss_fn(
                     embeddings=valid_embeddings,
@@ -204,10 +204,8 @@ class MultiModalLoss(nn.Module):
         # -------------------- (4) InfoNCE Contrastive Loss --------------------
         if self.use_infonce and infonce_weight > 0.0:
             with timer("InfoNCE Contrastive Loss", accelerator):
-                # InfoNCE uses subtype labels for contrastive learning (edema=1 only)
                 infonce_loss, infonce_count = self.infonce_loss_fn(
                     embeddings=valid_embeddings,
-                    labels=subtype_labels,
                     window_mask=window_mask,
                     temperature=self.infonce_temperature
                 )
@@ -333,6 +331,141 @@ class ConstrainttimeLoss(nn.Module):
         return pull_loss, N
 
 
+## Supervised Contrastive Loss (Single-View)
+class SupConLoss(nn.Module):
+    def __init__(self):
+        super(SupConLoss, self).__init__()
+
+    def forward(self, embeddings, labels, window_mask, temperature):
+        """
+        Supervised Contrastive Loss
+
+        Args:
+            embeddings: [N_valid, D] - already filtered valid embeddings from model
+            labels: [B, W] - edema labels
+            window_mask: [B, W] - window mask
+            temperature: temperature scaling
+        """
+        device = embeddings.device
+
+        # Flatten labels and mask to match embeddings
+        lab_flat = labels.view(-1)                      # [B*W]
+        mask_flat = window_mask.view(-1).bool()         # [B*W]
+
+        # Extract labels only for valid windows (matching embeddings order)
+        labels_valid = lab_flat[mask_flat]  # [N_valid]
+
+        # Filter out unlabeled samples (-1)
+        labeled_mask = (labels_valid != -1)
+        num_samples = labeled_mask.sum().item()
+
+        if num_samples == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+        features = embeddings[labeled_mask]     # [N_labeled, D]
+        labels_final = labels_valid[labeled_mask]  # [N_labeled]
+
+        # L2 normalize
+        features = F.normalize(features, p=2, dim=-1)
+
+        N = features.shape[0]
+        if N < 2:
+            return torch.tensor(0.0, device=device, requires_grad=True), N
+
+        # Compute similarity matrix
+        logits = torch.div(features @ features.T, temperature)  # [N, N]
+
+        # Create positive mask (same label)
+        labels_row = labels_final.view(-1, 1)
+        labels_col = labels_final.view(1, -1)
+        pos_mask = (labels_row == labels_col).float()  # [N, N]
+
+        # Remove self-contrast (diagonal)
+        logits_mask = torch.ones_like(pos_mask)
+        diag_idx = torch.arange(N, device=device)
+        logits_mask[diag_idx, diag_idx] = 0
+        pos_mask = pos_mask * logits_mask  # Remove diagonal from positive mask
+
+        # Mask out invalid positions in logits
+        logits_masked = logits + (1 - logits_mask) * -1e9
+
+        # Compute log probability
+        log_prob = logits - torch.logsumexp(logits_masked, dim=1, keepdim=True)
+
+        # Compute mean of log-likelihood over positive pairs
+        pos_per_anchor = pos_mask.sum(1).clamp(min=1e-6)
+        mean_log_prob_pos = (pos_mask * log_prob).sum(1) / pos_per_anchor
+        loss = -mean_log_prob_pos.mean()
+
+        return loss, N
+
+
+class InfoNCELoss(nn.Module):
+    """
+    Unsupervised InfoNCE Contrastive Loss
+    - 라벨 필요 없음 (unsupervised)
+    - 모든 유효한 임베딩에 적용 (window_mask==True인 모든 윈도우)
+    - Standard InfoNCE: maximize agreement between embeddings
+    """
+    def __init__(self):
+        super(InfoNCELoss, self).__init__()
+
+    def forward(self, embeddings, window_mask, temperature):
+        device = embeddings.device
+        D = embeddings.shape[-1]
+
+        # 1) Flatten windows
+        feat_flat = embeddings.reshape(-1, D)           # [B*W, D]
+        mask_flat = window_mask.view(-1).bool()         # [B*W]
+
+        # 2) Valid window filtering (only exclude padding, NOT unlabeled)
+        # InfoNCE는 라벨 필터링 없이 모든 유효한 윈도우 사용
+        valid = mask_flat
+        num_samples = valid.sum().item()
+
+        if num_samples == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True), 0
+
+        features = feat_flat[valid]     # [N, D]
+
+        # 3) L2 normalize
+        features = F.normalize(features, p=2, dim=-1)
+
+        N = features.shape[0]
+        if N < 2:
+            return torch.tensor(0.0, device=device, requires_grad=True), N
+
+        # 4) Compute similarity matrix
+        sim_matrix = torch.matmul(features, features.T) / temperature  # [N, N]
+
+        # 5) Standard InfoNCE: each sample contrasts with all others
+        # Diagonal = self-similarity (excluded from loss)
+        # Off-diagonal = other samples (all treated as negatives in unsupervised setting)
+
+        # Create mask to exclude diagonal
+        mask_self = torch.eye(N, dtype=torch.bool, device=device)
+
+        # 6) For each anchor, we use similarity-based weighting
+        # Closer embeddings (higher similarity) should be pulled together
+        # This encourages local structure preservation
+
+        # Mask out diagonal for denominator
+        sim_matrix_masked = sim_matrix.masked_fill(mask_self, -1e9)
+
+        # 7) InfoNCE loss (unsupervised version)
+        # Maximize average similarity while normalizing by all other samples
+        # This is equivalent to: -log(exp(sim_ii) / sum_j(exp(sim_ij)))
+        # But since we don't have explicit positives, we use a different formulation:
+        # Maximize uniformity of the embedding space
+
+        # Standard unsupervised InfoNCE: maximize entropy of similarity distribution
+        log_prob = F.log_softmax(sim_matrix_masked, dim=1)  # [N, N]
+
+        # Average log probability (excluding self)
+        # This encourages uniform distribution of similarities
+        loss = -log_prob.sum(dim=1).mean() / (N - 1)
+
+        return loss, N
 
 # class TSCwithQueue(nn.Module):
 #     """
@@ -824,63 +957,8 @@ class ConstrainttimeLoss(nn.Module):
 ################################################################################################################################
 
 # Global Loss
-## Supervised Contrastive Loss (Single-View)
-class SupConLoss(nn.Module):
-    def __init__(self):
-        super(SupConLoss, self).__init__()
 
-    def forward(self, embeddings, labels, window_mask, temperature):
-        device = embeddings.device
-        D = embeddings.shape[-1]
 
-        # 1) Flatten windows
-        feat_flat = embeddings.reshape(-1, D)           # [B*W, D]
-        lab_flat = labels.view(-1)                      # [B*W]
-        mask_flat = window_mask.view(-1).bool()         # [B*W]
-
-        # 2) Valid window filtering (exclude unlabeled and padded)
-        valid = mask_flat & (lab_flat != -1)
-        num_samples = valid.sum().item()
-
-        if num_samples == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True), 0
-
-        features = feat_flat[valid]     # [N, D]
-        labels_valid = lab_flat[valid]  # [N]
-
-        # 3) L2 normalize
-        features = F.normalize(features, p=2, dim=-1)
-
-        N = features.shape[0]
-        if N < 2:
-            return torch.tensor(0.0, device=device, requires_grad=True), N
-
-        # 4) Compute similarity matrix
-        logits = torch.div(features @ features.T, temperature)  # [N, N]
-
-        # 5) Create positive mask (same label)
-        labels_row = labels_valid.view(-1, 1)
-        labels_col = labels_valid.view(1, -1)
-        pos_mask = (labels_row == labels_col).float()  # [N, N]
-
-        # 6) Remove self-contrast (diagonal)
-        logits_mask = torch.ones_like(pos_mask)
-        diag_idx = torch.arange(N, device=device)
-        logits_mask[diag_idx, diag_idx] = 0
-        pos_mask = pos_mask * logits_mask  # Remove diagonal from positive mask
-
-        # 7) Mask out invalid positions in logits
-        logits_masked = logits + (1 - logits_mask) * -1e9
-
-        # 8) Compute log probability
-        log_prob = logits - torch.logsumexp(logits_masked, dim=1, keepdim=True)
-
-        # 9) Compute mean of log-likelihood over positive pairs
-        pos_per_anchor = pos_mask.sum(1).clamp(min=1e-6)
-        mean_log_prob_pos = (pos_mask * log_prob).sum(1) / pos_per_anchor
-        loss = -mean_log_prob_pos.mean()
-
-        return loss, N
 
 #############################################################################################################
 #############################################################################################################
