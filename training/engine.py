@@ -35,7 +35,6 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
 
         window_mask = batch['window_mask']
         seq_valid_mask = batch['valid_seq_mask']
-        stay_ids = torch.tensor(batch['stay_ids'], dtype=torch.long, device=device)  # [B]
 
     # ==================== 2. 모델 입력 데이터 전처리 ====================
     with timer("데이터 전처리 작업", accelerator):

@@ -531,14 +531,14 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 "train/total_loss": avg_total_loss,
                 "train/bce_loss": bce_avg,
                 "train/ce_loss": ce_avg,
-                "train/ucl_loss": ucl_avg,
+                "train/temporal_ucl_loss": ucl_avg,
                 "train/scl_loss": scl_avg,
                 "train/info_ucl_loss": info_ucl_avg,
     
                 "val/total_loss": val_loss,
                 "val/bce_loss": val_bce_avg,
                 "val/ce_loss": val_ce_avg,
-                "val/ucl_loss": val_ucl_avg,
+                "val/temporal_ucl_loss": val_ucl_avg,
                 "val/scl_loss": val_scl_avg,
                 "val/info_ucl_loss": val_info_ucl_avg,
 

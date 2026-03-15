@@ -206,7 +206,6 @@ class MultiModalLoss(nn.Module):
             with timer("InfoNCE Contrastive Loss", accelerator):
                 infonce_loss, infonce_count = self.infonce_loss_fn(
                     embeddings=valid_embeddings,
-                    window_mask=window_mask,
                     temperature=self.infonce_temperature
                 )
         else:
@@ -401,71 +400,33 @@ class SupConLoss(nn.Module):
 
 
 class InfoNCELoss(nn.Module):
-    """
-    Unsupervised InfoNCE Contrastive Loss
-    - 라벨 필요 없음 (unsupervised)
-    - 모든 유효한 임베딩에 적용 (window_mask==True인 모든 윈도우)
-    - Standard InfoNCE: maximize agreement between embeddings
-    """
     def __init__(self):
         super(InfoNCELoss, self).__init__()
 
-    def forward(self, embeddings, window_mask, temperature):
+    def forward(self, embeddings, temperature):
         device = embeddings.device
-        D = embeddings.shape[-1]
+        N = embeddings.shape[0]
 
-        # 1) Flatten windows
-        feat_flat = embeddings.reshape(-1, D)           # [B*W, D]
-        mask_flat = window_mask.view(-1).bool()         # [B*W]
-
-        # 2) Valid window filtering (only exclude padding, NOT unlabeled)
-        # InfoNCE는 라벨 필터링 없이 모든 유효한 윈도우 사용
-        valid = mask_flat
-        num_samples = valid.sum().item()
-
-        if num_samples == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True), 0
-
-        features = feat_flat[valid]     # [N, D]
-
-        # 3) L2 normalize
-        features = F.normalize(features, p=2, dim=-1)
-
-        N = features.shape[0]
         if N < 2:
             return torch.tensor(0.0, device=device, requires_grad=True), N
 
-        # 4) Compute similarity matrix
-        sim_matrix = torch.matmul(features, features.T) / temperature  # [N, N]
+        # L2 normalize
+        features = F.normalize(embeddings, p=2, dim=-1)
 
-        # 5) Standard InfoNCE: each sample contrasts with all others
-        # Diagonal = self-similarity (excluded from loss)
-        # Off-diagonal = other samples (all treated as negatives in unsupervised setting)
+        sim_matrix = torch.matmul(features, features.T) / temperature  # [N, N]
 
         # Create mask to exclude diagonal
         mask_self = torch.eye(N, dtype=torch.bool, device=device)
 
-        # 6) For each anchor, we use similarity-based weighting
-        # Closer embeddings (higher similarity) should be pulled together
-        # This encourages local structure preservation
+        # High similarity closer embeddings should be pulled together
+        sim_matrix_masked = sim_matrix.masked_fill(mask_self, -1e9) # Mask out diagonal for denominator
 
-        # Mask out diagonal for denominator
-        sim_matrix_masked = sim_matrix.masked_fill(mask_self, -1e9)
-
-        # 7) InfoNCE loss (unsupervised version)
-        # Maximize average similarity while normalizing by all other samples
-        # This is equivalent to: -log(exp(sim_ii) / sum_j(exp(sim_ij)))
-        # But since we don't have explicit positives, we use a different formulation:
-        # Maximize uniformity of the embedding space
-
-        # Standard unsupervised InfoNCE: maximize entropy of similarity distribution
         log_prob = F.log_softmax(sim_matrix_masked, dim=1)  # [N, N]
 
-        # Average log probability (excluding self)
-        # This encourages uniform distribution of similarities
         loss = -log_prob.sum(dim=1).mean() / (N - 1)
 
         return loss, N
+
 
 # class TSCwithQueue(nn.Module):
 #     """

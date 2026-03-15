@@ -414,7 +414,7 @@ class SCL_Multi_Dataset(Dataset):
 #######################################################################
 # 데이터셋 정의
 #######################################################################
-def get_dataloaders(ts_df, cxr_df, text_df, demo_df, args, accelerator=None):
+def get_dataloaders(ts_df, cxr_df, text_df, demo_df, args, accelerator=None, num_workers=8):
     if not args.use_demographic:
         demo_df = None
     
@@ -482,35 +482,37 @@ def get_dataloaders(ts_df, cxr_df, text_df, demo_df, args, accelerator=None):
     test_collate_fn = test_dataset.collate_fn
 
     with timer("데이터로더 정의"):
+        # Configure DataLoader settings based on num_workers
+        dataloader_kwargs = {
+            'pin_memory': True,
+            'num_workers': num_workers,
+        }
+
+        # Only use prefetch_factor and persistent_workers if num_workers > 0
+        if num_workers > 0:
+            dataloader_kwargs['prefetch_factor'] = 2
+            dataloader_kwargs['persistent_workers'] = True
+            dataloader_kwargs['worker_init_fn'] = seed_worker
+
         train_dataloader = DataLoader(
             dataset=train_dataset,
             batch_sampler=train_sampler,
             collate_fn=train_collate_fn,
-            pin_memory=True,
-            num_workers=8,
-            prefetch_factor=2,
-            persistent_workers=True,
-            worker_init_fn=seed_worker
+            **dataloader_kwargs
         )
 
         val_dataloader = DataLoader(
             dataset=val_dataset,
             batch_sampler=val_sampler,
             collate_fn=val_collate_fn,
-            pin_memory=True,
-            num_workers=8,
-            prefetch_factor=2,
-            persistent_workers=True,
-            worker_init_fn=seed_worker
+            **dataloader_kwargs
         )
 
         test_dataloader = DataLoader(
             dataset=test_dataset,
             batch_sampler=test_sampler,
             collate_fn=test_collate_fn,
-            pin_memory=True,
-            num_workers=8,
-            worker_init_fn=seed_worker
+            **dataloader_kwargs
         )
 
     # # 윈도우 레벨 라벨 비율 비교

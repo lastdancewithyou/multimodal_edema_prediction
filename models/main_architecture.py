@@ -42,7 +42,7 @@ class MultiModalEncoder(nn.Module):
         _img_total     = sum(p.numel() for p in self.img_encoder.parameters())
         print(f"[MultiModalEncoder] DenseNet121: {_img_trainable:,} / {_img_total:,} params trainable")
 
-        # Text Encoder: Bio_ClinicalBERT
+        # Text Encoder: BioClinicalBERT
         model_name = "emilyalsentzer/Bio_ClinicalBERT"
         self.language_model = AutoModel.from_pretrained(model_name)
         for param in self.language_model.parameters():
@@ -254,6 +254,28 @@ class MultiModalEncoder(nn.Module):
         valid_fused = fused_flat[window_valid_mask]             # [Nwin, L, 256]
         valid_seg_valid = seg_valid_flat[window_valid_mask]     # [Nwin, L]
         pooled_emb = self.attention_pooling(valid_fused, seg_valid_mask=valid_seg_valid) # 유효한 window만 attention pooling에 사용함.
+
+        # ================ Demographic Embedding Integration ================
+        # Add patient-level demographic information to window embeddings
+        if demo_features is not None:
+            demo_emb = self.demo_encoder(demo_features)  
+            demo_emb_expanded = demo_emb.unsqueeze(1).expand(-1, W, -1)
+            demo_emb_flat = demo_emb_expanded.reshape(BW, 256)
+            demo_emb_valid = demo_emb_flat[window_valid_mask]
+
+            # Residual addition
+            before_add = pooled_emb.clone()
+            pooled_emb = pooled_emb + demo_emb_valid
+
+            ######################################################################
+            # # Analyze demographic influence 
+            # if torch.rand(1).item() < 0.01:
+            #     demo_l2 = torch.norm(demo_emb_valid, p=2, dim=1).mean().item()
+            #     pooled_l2_before = torch.norm(before_add, p=2, dim=1).mean().item()
+            #     pooled_l2_after = torch.norm(pooled_emb, p=2, dim=1).mean().item()
+            #     relative_change = (pooled_l2_after - pooled_l2_before) / (pooled_l2_before + 1e-8) * 100
+            #     print(f"[Demo Influence] L2 norm - Demo: {demo_l2:.4f} | Pooled Before: {pooled_l2_before:.4f} | After: {pooled_l2_after:.4f} | Change: {relative_change:.2f}%")
+            ###################################################################### 
 
         # [B, W, 256]으로 복원함. (배치 간 Shape 맞춰주기)
         window_embeddings_flat = torch.zeros(BW, 256, device=device, dtype=pooled_emb.dtype)

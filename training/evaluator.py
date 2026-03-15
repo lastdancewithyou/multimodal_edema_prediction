@@ -557,6 +557,60 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
             val_metrics['level3_auroc'] = float('nan')
             val_metrics['level3_auprc'] = float('nan')
 
+    # ==================== Calibration Analysis ====================
+    if accelerator.is_main_process and val_metrics:
+        from training.calibration import ExpectedCalibrationError, analyze_calibration
+
+        # Prepare calibration data
+        y_true_dict = {}
+        y_prob_dict = {}
+
+        # Level 1: Binary Edema Detection
+        if mask_l1.sum() >= 2 and len(np.unique(y_l1)) >= 2:
+            y_true_dict['Edema Detection'] = y_l1
+            y_prob_dict['Edema Detection'] = p_l1
+
+        # Level 2: Subtype Classification
+        if mask_l2.sum() >= 2 and len(np.unique(y_l2)) >= 2:
+            y_true_dict['Subtype Classification'] = y_l2
+            y_prob_dict['Subtype Classification'] = p_l2
+
+        # Level 3: 3-class (per-class calibration)
+        if mask_l3.sum() >= 3 and len(valid_classes) >= 2:
+            # For each class, compute binary calibration (one-vs-rest)
+            for class_idx, class_name in enumerate(['Negative', 'NCPE', 'CPE']):
+                if class_idx in valid_classes:
+                    y_binary = (y3 == class_idx).astype(int)
+                    p_binary = probs_3[:, class_idx]
+                    y_true_dict[f'3-class: {class_name}'] = y_binary
+                    y_prob_dict[f'3-class: {class_name}'] = p_binary
+
+        # Compute calibration metrics
+        if len(y_true_dict) > 0:
+            # Quick ECE calculation (no plots during training)
+            ece_calc = ExpectedCalibrationError(n_bins=15)
+
+            for task_name in y_true_dict.keys():
+                ece, _ = ece_calc.compute(y_true_dict[task_name], y_prob_dict[task_name])
+                val_metrics[f'{task_name}_ece'] = ece
+
+            # For final epoch or specific epochs, generate plots
+            if epoch == "final" or (epoch is not None and epoch % 10 == 0):
+                save_dir = f'./output/calibration/{args.run_name}'
+                prefix = f'epoch_{epoch}' if epoch != "final" else 'final'
+
+                try:
+                    calibration_results = analyze_calibration(
+                        y_true_dict, y_prob_dict,
+                        save_dir=save_dir,
+                        prefix=prefix
+                    )
+                    # Store calibration results in metrics
+                    for task_name, result in calibration_results.items():
+                        val_metrics[f'{task_name}_calibration_quality'] = result['quality']
+                except Exception as e:
+                    print(f"⚠️  Calibration analysis failed: {e}")
+
     if accelerator.is_main_process:
         print("\n[Multi-Task Validation Summary]")
         print(f"Total Val Loss: {total_loss:.4f}")
@@ -565,13 +619,22 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
             print(f"\n[Hierarchical Performance Metrics]")
             print(f"[Edema Detection]   AUROC={val_metrics['level1_auroc']:.4f}  "
                 f"AUPRC={val_metrics['level1_auprc']:.4f}  "
-                f"Brier={val_metrics['level1_brier']:.4f}")
+                f"Brier={val_metrics['level1_brier']:.4f}  "
+                f"ECE={val_metrics.get('Edema Detection_ece', float('nan')):.4f}")
 
             print(f"[Subtype Classification] AUROC={val_metrics['level2_auroc']:.4f}  "
-                f"AUPRC={val_metrics['level2_auprc']:.4f}")
+                f"AUPRC={val_metrics['level2_auprc']:.4f}  "
+                f"ECE={val_metrics.get('Subtype Classification_ece', float('nan')):.4f}")
 
             print(f"[3-class Classification] AUROC={val_metrics['level3_auroc']:.4f}  "
-                f"AUPRC={val_metrics['level3_auprc']:.4f}\n")
+                f"AUPRC={val_metrics['level3_auprc']:.4f}")
+
+            # Print 3-class per-class ECE
+            for class_name in ['Negative', 'NCPE', 'CPE']:
+                ece_key = f'3-class: {class_name}_ece'
+                if ece_key in val_metrics:
+                    print(f"  └─ {class_name} ECE={val_metrics[ece_key]:.4f}")
+            print()
 
     return total_loss, bce_avg, ce_avg, ucl_avg, scl_avg, info_ucl_avg, val_metrics
 

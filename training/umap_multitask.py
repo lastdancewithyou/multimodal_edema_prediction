@@ -121,7 +121,7 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
             pca_edema = PCA(n_components=pca_dim, random_state=args.random_seed)
             edema_emb_pca = pca_edema.fit_transform(edema_emb)
 
-            umap_edema = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=args.random_seed)
+            umap_edema = UMAP(n_components=2, n_neighbors=50, min_dist=0.0, spread=1.0, metric='cosine', random_state=args.random_seed)
             edema_2d = umap_edema.fit_transform(edema_emb_pca)
 
             fitted_reducers['edema'] = {'pca': pca_edema, 'umap': umap_edema}
@@ -168,7 +168,7 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
             pca_subtype = PCA(n_components=pca_dim, random_state=args.random_seed)
             subtype_emb_pca = pca_subtype.fit_transform(subtype_emb)
 
-            umap_subtype = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=args.random_seed)
+            umap_subtype = UMAP(n_components=2, n_neighbors=50, min_dist=0.0, spread=1.0, metric='cosine', random_state=args.random_seed)
             subtype_2d = umap_subtype.fit_transform(subtype_emb_pca)
 
             fitted_reducers['subtype'] = {'pca': pca_subtype, 'umap': umap_subtype}
@@ -220,7 +220,18 @@ def plot_multitask_umap(args, model, dataloader, device, accelerator, dataset, e
             pca_combined = PCA(n_components=pca_dim, random_state=args.random_seed)
             combined_emb_pca = pca_combined.fit_transform(combined_emb)
 
-            umap_combined = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=args.random_seed)
+            # Adjusted UMAP parameters for better global structure visualization
+            # n_neighbors: larger value captures more global structure
+            # min_dist: smaller value allows tighter clusters
+            # spread: controls how spread out the embedding is
+            umap_combined = UMAP(
+                n_components=2,
+                n_neighbors=50,      # Increased from 15 to capture global structure
+                min_dist=0.0,        # Tighter clusters
+                spread=1.0,          # Default spread
+                metric='cosine',
+                random_state=args.random_seed
+            )
             combined_2d = umap_combined.fit_transform(combined_emb_pca)
 
             fitted_reducers['combined'] = {'pca': pca_combined, 'umap': umap_combined}

@@ -6,7 +6,7 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="Multi_task", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="4", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="20", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
 
     # Modality Selection
@@ -66,9 +66,9 @@ def parse_arguments():
     parser.add_argument('--ucl_temperature', type=float, default=0.1, help='Temperature for unsupervised contrastive loss')
     
     # SupCon Loss
-    parser.add_argument('--use_supcon', type=bool, default=False)
+    parser.add_argument('--use_supcon', type=bool, default=True)
     parser.add_argument('--scl_weight', type=float, default=0.1, help='Supervised contrastive loss weight')
-    parser.add_argument('--scl_temperature', type=float, default=0.1, help='Temperature for supervised contrastive loss')
+    parser.add_argument('--scl_temperature', type=float, default=0.3, help='Temperature for supervised contrastive loss')
 
     # InFoNCE Loss
     parser.add_argument('--use_infonce', type=bool, default=False)
@@ -100,19 +100,13 @@ def parse_arguments():
     parser.add_argument('--num_latents', type=int, default=6, help='number of rows in latent matrix of cross attention module')
     parser.add_argument('--num_iterations', type=int, default=2, help='cross attention iteration number')
 
-    ## Projection_head
-    # parser.add_argument('--use_projection', type=bool, default=True, help='Use projection head for contrastive learning in Stage 1. If False, use encoder output (z) directly.')
-    # parser.add_argument('--head_input_dim', type=int, default=256, help='projection head input dim')  # Updated for Perceiver-TS (512-dim output)
-    # parser.add_argument('--head_hidden_dim1', type=int, default=128, help='projection head first hidden dim')
-    # parser.add_argument('--head_hidden_dim2', type=int, default=128, help='projection head second hidden dim - Keep 512 for better contrastive clustering')
-
     # Visualization
     ## UMAP
-    # parser.add_argument('--pca_components', type=int, default=32, help='Number of PCA components (recommended: projection_dim // 4)')
-    # parser.add_argument('--umap_n_neighbors', type=int, default=10, help='UMAP n_neighbors')
-    # parser.add_argument('--umap_min_dist', type=float, default=0.2, help='UMAP min_dist')
-    # parser.add_argument('--umap_metric', type=str, default='cosine', help='UMAP metric (default: euclidean)')
-    # parser.add_argument('--umap_save_dir', type=str, default=None, help='UMAP save directory')
+    parser.add_argument('--pca_components', type=int, default=32, help='Number of PCA components (recommended: projection_dim // 4)')
+    parser.add_argument('--umap_n_neighbors', type=int, default=10, help='UMAP n_neighbors')
+    parser.add_argument('--umap_min_dist', type=float, default=0.2, help='UMAP min_dist')
+    parser.add_argument('--umap_metric', type=str, default='cosine', help='UMAP metric (default: euclidean)')
+    parser.add_argument('--umap_save_dir', type=str, default=None, help='UMAP save directory')
 
     ## Label Smoothing
     parser.add_argument('--use_label_smooth', type=bool, default=True, help='Use label smoothing for regularization')
@@ -126,16 +120,16 @@ def parse_arguments():
     parser.add_argument('--use_two_stage', type=bool, default=False, help='Use two-stage training: contrastive pretraining + classification')
     parser.add_argument('--stage1_only', type=bool, default=False, help='Run only stage 1 (contrastive pretraining)')
     parser.add_argument('--stage2_only', type=bool, default=False, help='Run only stage 2 (classification from pretrained)')
-    # parser.add_argument('--stage1_epochs', type=int, default=40, help='Number of epochs for stage 1 (contrastive pretraining)')
-    # parser.add_argument('--stage2_epochs', type=int, default=30, help='Number of epochs for stage 2 (classification)')
-    # parser.add_argument('--stage1_lr', type=float, default=1e-4, help='Learning rate for stage 1')
-    # parser.add_argument('--stage2_lr', type=float, default=5e-5, help='Learning rate for stage 2')
-    # parser.add_argument('--save_stage1_model', type=bool, default=True, help='Save stage 1 model checkpoint')
-    # parser.add_argument('--stage1_model_path', type=str, 
-    #                     default=None,
-    #                     # default="/home/DAHS1/gangmin/my_research/src/output/stage1_models/experiment_33_stage1.pth", 
-    #                     help='Path to save/load stage 1 model'
-    #                     )
+    parser.add_argument('--stage1_epochs', type=int, default=40, help='Number of epochs for stage 1 (contrastive pretraining)')
+    parser.add_argument('--stage2_epochs', type=int, default=30, help='Number of epochs for stage 2 (classification)')
+    parser.add_argument('--stage1_lr', type=float, default=1e-4, help='Learning rate for stage 1')
+    parser.add_argument('--stage2_lr', type=float, default=5e-5, help='Learning rate for stage 2')
+    parser.add_argument('--save_stage1_model', type=bool, default=True, help='Save stage 1 model checkpoint')
+    parser.add_argument('--stage1_model_path', type=str, 
+                        default=None,
+                        # default="/home/DAHS1/gangmin/my_research/src/output/stage1_models/experiment_33_stage1.pth", 
+                        help='Path to save/load stage 1 model'
+                        )
 
     # # Stage 2 Training Strategy: Linear Probing vs Fine-tuning
     # parser.add_argument('--freeze_encoder_stage2', type=bool, default=False, help='Freeze encoder in stage 2 (Linear Probing). If not set, fine-tune encoder.')
@@ -148,7 +142,7 @@ def parse_arguments():
         args.wandb_run_name = f"{args.experiment_id}: [GPU 0] temp=0.7/Optimal_hyperparam_search/Img_Text_Tuning/Fine-tuning"
     # single stage
     else:
-        args.wandb_run_name = f"{args.experiment_id}: [GPU 1] SupCon/classifierLR_changed/Window_count_changed"
+        args.wandb_run_name = f"{args.experiment_id}: [GPU 1] Demo_effect_check"
 
     # ===================================================================================================
 
