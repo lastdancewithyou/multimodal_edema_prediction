@@ -5,6 +5,7 @@ import torchxrayvision as xrv
 from transformers import AutoModel
 
 from models.encoder import TransformerTSEncoder, DemographicEncoder, TSMixerEncoder
+from models.cxrformer_model import CXformer
 from utils import timer
 
 
@@ -41,6 +42,47 @@ class MultiModalEncoder(nn.Module):
         _img_trainable = sum(p.numel() for p in self.img_encoder.parameters() if p.requires_grad)
         _img_total     = sum(p.numel() for p in self.img_encoder.parameters())
         print(f"[MultiModalEncoder] DenseNet121: {_img_trainable:,} / {_img_total:,} params trainable")
+
+        ##########################################################################################
+        # Image Encoder: cxFormer
+        # self.img_encoder = CXformer.from_pretrained("m42-health/CXformer-base", context_dim=256)
+
+        # # Enable gradient checkpointing for memory efficiency
+        # self.img_encoder.gradient_checkpointing = True
+
+        # # Freeze all parameters initially
+        # for param in self.img_encoder.parameters():
+        #     param.requires_grad = False
+
+        # # Unfreeze cross-attention layers (randomly initialized, need fine-tuning)
+        # _cxformer_unfreeze = [
+        #     "blocks.6.cross_attn",   # Cross-attention in block 6
+        #     "blocks.7.cross_attn",   # Cross-attention in block 7
+        #     "blocks.8.cross_attn",   # Cross-attention in block 8
+        #     "blocks.9.cross_attn",   # Cross-attention in block 9
+        #     "blocks.10.cross_attn",  # Cross-attention in block 10
+        #     "blocks.11.cross_attn",  # Cross-attention in block 11
+        #     "blocks.6.norm_cross",   # Layer norms for cross-attention
+        #     "blocks.7.norm_cross",
+        #     "blocks.8.norm_cross",
+        #     "blocks.9.norm_cross",
+        #     "blocks.10.norm_cross",
+        #     "blocks.11.norm_cross",
+        #     "blocks.11.norm2",       # Last block's FFN norm
+        #     "blocks.11.mlp",         # Last block's FFN
+        #     "norm",                  # Final layer norm
+        # ]
+        # for name, param in self.img_encoder.named_parameters():
+        #     if any(name.startswith(prefix) for prefix in _cxformer_unfreeze):
+        #         param.requires_grad = True
+
+        # _img_trainable = sum(p.numel() for p in self.img_encoder.parameters() if p.requires_grad)
+        # _img_total     = sum(p.numel() for p in self.img_encoder.parameters())
+        # print(f"[MultiModalEncoder] CXFormer: {_img_trainable:,} / {_img_total:,} params trainable")
+
+        # # CXFormer output dimension (ViT-Base: 768)
+        # self.cxformer_output_dim = 768
+        ##########################################################################################
 
         # Text Encoder: BioClinicalBERT
         model_name = "emilyalsentzer/Bio_ClinicalBERT"

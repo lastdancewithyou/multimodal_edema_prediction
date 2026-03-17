@@ -6,19 +6,21 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="Multi_task", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="20", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="29", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
 
     # Modality Selection
     parser.add_argument("--disable_cxr", type=bool, default=False, help="이미지 모달리티 활성화 여부")
     parser.add_argument("--disable_txt", type=bool, default=False, help="텍스트 모달리티 활성화 여부")
     parser.add_argument('--use_demographic', type=bool, default=True, help='Use demographic information')
-    parser.add_argument('--img_to_3ch', type=bool, default=False, help='Convert grayscale to 3-channel (for ResNet)')
+
+    parser.add_argument('--img_to_3ch', type=bool, default=False, help='Convert grayscale to 3-channel by repeating channel 1 (for CXFormer/ResNet)')
+    # parser.add_argument('--use_img_augmentation', type=bool, default=False, help='Use per-window image augmentation for diversity') # False - v2 / True - v3
 
     # dataset & sampler
-    parser.add_argument('--train_batch_size', type=int, default=96)
-    parser.add_argument('--val_batch_size', type=int, default=96)
-    parser.add_argument('--test_batch_size', type=int, default=96)
+    parser.add_argument('--train_batch_size', type=int, default=64)
+    parser.add_argument('--val_batch_size', type=int, default=64)
+    parser.add_argument('--test_batch_size', type=int, default=64)
 
     parser.add_argument('--train_ratio', type=float, default=0.75, help='Train dataset ratio')
     parser.add_argument('--val_ratio', type=float, default=0.15, help='Validation dataset ratio')
@@ -29,26 +31,6 @@ def parse_arguments():
     parser.add_argument('--prediction_horizon', type=int, default=8, help='Hours ahead to predict for early prediction')
     parser.add_argument('--window_size', type=int, default=24, help='Sliding window size')
     parser.add_argument('--stride', type=int, default=1, help='Sliding window moving stride')
-
-    # Augmentation (Gaussian noise on fused window embeddings)
-    # parser.add_argument('--aug_noise_type', type=str, default='gaussian', help='Noise type for augmentation: gaussian | uniform | laplace')
-    # parser.add_argument('--aug_epsilon', type=float, default=0.2, help='Noise scale for augmentation (controls cosine similarity between views)')
-
-    # # Supervised Contrastive Loss (Basic SupCon)
-    # parser.add_argument('--use_supcon', type=bool, default=True, help='Enable supervised contrastive loss')
-    # parser.add_argument('--scl_weight', type=float, default=0.3, help='Supervised contrastive loss weight') # Lambda
-    # parser.add_argument('--scl_temperature', type=float, default=0.1, help='Temperature for supervised contrastive loss')
-
-    # Target-based Supervised Contrastive Loss
-    # parser.add_argument('--use_target_supcon', type=bool, default=False, help='Enable Target_SupCon loss (KCL + TSC)')
-    # parser.add_argument('--target_supcon_weight', type=float, default=1.0, help='Target_SupCon loss weight')
-    # parser.add_argument('--target_supcon_temperature', type=float, default=0.2, help='Temperature for Target_SupCon KCL')
-    # parser.add_argument('--target_supcon_queue_size', type=int, default=2048, help='Queue size for Target_SupCon')
-    # parser.add_argument('--target_supcon_K', type=int, default=6, help='Max number of positives per anchor in Target_SupCon')       # 0으로 설정 시 지도대조학습과 동일함.
-    # parser.add_argument('--target_supcon_tw', type=float, default=0.5, help='Weight for TSC loss in Target_SupCon')
-    # parser.add_argument('--target_supcon_momentum', type=float, default=0.9, help='Momentum for centroid EMA in Target_SupCon')
-    # parser.add_argument('--target_path', type=str, default=None, help='Path to optimal target .npy file for Target_SupCon')
-    # parser.add_argument('--target_supcon_tr', type=int, default=9, help="Target vector")
 
     #################################### Multi-task Learning ####################################
     # Binary Cross-Entropy
@@ -66,7 +48,7 @@ def parse_arguments():
     parser.add_argument('--ucl_temperature', type=float, default=0.1, help='Temperature for unsupervised contrastive loss')
     
     # SupCon Loss
-    parser.add_argument('--use_supcon', type=bool, default=True)
+    parser.add_argument('--use_supcon', type=bool, default=False)
     parser.add_argument('--scl_weight', type=float, default=0.1, help='Supervised contrastive loss weight')
     parser.add_argument('--scl_temperature', type=float, default=0.3, help='Temperature for supervised contrastive loss')
 
@@ -78,9 +60,9 @@ def parse_arguments():
 
     # Single-Stage Training
     parser.add_argument('--single_stage_epochs', type=int, default=30, help='Number of epochs for single-stage training')
-    parser.add_argument('--single_learning_rate', type=float, default=5e-5, help='Learning rate at single training stage')
+    parser.add_argument('--single_learning_rate', type=float, default=1e-4, help='Learning rate at single training stage')
     parser.add_argument('--single_patience', type=int, default=5, help='Early stopping patience') # Stage 1 early stopping patience
-    
+
     # Gradient Accumulation for Multi-GPU
     # parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help='Gradient accumulation steps - 멀티 GPU 안정성 향상')
 
@@ -142,7 +124,7 @@ def parse_arguments():
         args.wandb_run_name = f"{args.experiment_id}: [GPU 0] temp=0.7/Optimal_hyperparam_search/Img_Text_Tuning/Fine-tuning"
     # single stage
     else:
-        args.wandb_run_name = f"{args.experiment_id}: [GPU 1] Demo_effect_check"
+        args.wandb_run_name = f"{args.experiment_id}: True_Normalized_img(224by224)/Performance_Restoration"
 
     # ===================================================================================================
 

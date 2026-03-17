@@ -30,7 +30,8 @@ from models.main_architecture import MultiModalEncoder, MultiModalContrastiveMod
 from loss.losses import MultiModalLoss
 from loss.target_metrics import visualize_target_supcon
 from utils import stage2_Earlystopping, timer, plot_latent_time_attention, Earlystopping, stage1_earlystopping
-from training.umap_multitask import plot_multitask_umap
+from analysis.umap_multitask import plot_multitask_umap
+
 
 ##################################################################################################
 # Model Training Control Center
@@ -100,8 +101,6 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
     print(f"      CE Loss: {'Enabled' if args.use_ce else 'Disabled'} (λ={args.ce_weight})")
     print(f"      UCL Loss: {'Enabled' if args.use_temporal_ucl else 'Disabled'} (λ={args.ucl_weight})")
     print(f"   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    # if args.use_target_supcon:
-    #     print(f"   Target_SupCon (Optional): Enabled (λ={args.target_supcon_weight})")
     print("="*80 + "\n")
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -156,33 +155,30 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
     edema_classifier_params = list(model.edema_classifier.parameters())
     subtype_classifier_params = list(model.subtype_classifier.parameters())
 
-    # Differential learning rates: encoder > edema_classifier > subtype_classifier
     param_groups = [
         {
             'params': encoder_params,
-            'lr': args.single_learning_rate,  # Full LR
-            'weight_decay': 5e-5
+            'lr': args.single_learning_rate,
+            'weight_decay': 1e-4
         },
         {
             'params': edema_classifier_params,
-            'lr': args.single_learning_rate * 0.5,  # 50% of full LR 
-            'weight_decay': 5e-5
+            'lr': args.single_learning_rate,
+            'weight_decay': 1e-4
         },
         {
             'params': subtype_classifier_params,
-            'lr': args.single_learning_rate * 0.1,  # 10% of full LR
-            'weight_decay': 5e-5
+            'lr': args.single_learning_rate * 0.5,
+            'weight_decay': 1e-3
         }
     ]
 
     optimizer = torch.optim.AdamW(param_groups)
-
-    print(f"\n🎯 [Optimizer Configuration - Differential Learning Rates]")
-    print(f"   Encoder LR: {args.single_learning_rate:.2e} (weight_decay: 5e-5)")
-    print(f"   Edema Classifier LR: {args.single_learning_rate * 0.5:.2e} (weight_decay: 5e-5)")
-    print(f"   Subtype Classifier LR: {args.single_learning_rate * 0.1:.2e} (weight_decay: 5e-5)")
-
     model, optimizer, loss_module = accelerator.prepare(model, optimizer, loss_module)
+    print(f"\n🎯 [Optimizer Configuration - Differential Learning Rates]")
+    print(f"   Encoder LR: {args.single_learning_rate:.2e}")
+    print(f"   Edema Classifier LR: {args.single_learning_rate * 0.5:.2e}")
+    print(f"   Subtype Classifier LR: {args.single_learning_rate * 0.1:.2e}")
 
     # ==================== Scheduler Configuration ====================
     warmup_epochs = 3
@@ -490,39 +486,39 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
             best_val_auprc = val_metrics['level3_auprc']
 
         # ==================== Multi-Task UMAP Visualization ====================
-        if accelerator.is_main_process and ((epoch + 1) == 1 or (epoch + 1) % 5 == 0 or (epoch + 1) == args.single_stage_epochs):
-            print("🖼️ Generating Training UMAP...")
-            train_umap_dir = os.path.join(args.umap_save_dir, 'train')
-            train_reducers = plot_multitask_umap(
-                args=args,
-                model=model,
-                dataloader=train_loader,
-                device=accelerator.device,
-                accelerator=accelerator,
-                dataset=train_loader.dataset,
-                epoch=epoch+1,
-                save_dir=train_umap_dir,
-                max_samples=40000,
-                umap_reducers=None
-            )
-            print("✅ Training UMAP completed!")
+        # if accelerator.is_main_process and ((epoch + 1) == 1 or (epoch + 1) % 5 == 0 or (epoch + 1) == args.single_stage_epochs):
+        #     print("🖼️ Generating Training UMAP...")
+        #     train_umap_dir = os.path.join(args.umap_save_dir, 'train')
+        #     train_reducers = plot_multitask_umap(
+        #         args=args,
+        #         model=model,
+        #         dataloader=train_loader,
+        #         device=accelerator.device,
+        #         accelerator=accelerator,
+        #         dataset=train_loader.dataset,
+        #         epoch=epoch+1,
+        #         save_dir=train_umap_dir,
+        #         max_samples=40000,
+        #         umap_reducers=None
+        #     )
+        #     print("✅ Training UMAP completed!")
 
-            # Validation UMAP (transform using train PCA + UMAP coordinate system)
-            print("🖼️ Generating Validation UMAP...")
-            val_umap_dir = os.path.join(args.umap_save_dir, 'val')
-            plot_multitask_umap(
-                args=args,
-                model=model,
-                dataloader=val_loader,
-                device=accelerator.device,
-                accelerator=accelerator,
-                dataset=val_loader.dataset,
-                epoch=epoch+1,
-                save_dir=val_umap_dir,
-                max_samples=None,
-                umap_reducers=train_reducers  # Val mode: use train PCA + UMAP
-            )
-            print("✅ Validation UMAP completed!")
+        #     # Validation UMAP (transform using train PCA + UMAP coordinate system)
+        #     print("🖼️ Generating Validation UMAP...")
+        #     val_umap_dir = os.path.join(args.umap_save_dir, 'val')
+        #     plot_multitask_umap(
+        #         args=args,
+        #         model=model,
+        #         dataloader=val_loader,
+        #         device=accelerator.device,
+        #         accelerator=accelerator,
+        #         dataset=val_loader.dataset,
+        #         epoch=epoch+1,
+        #         save_dir=val_umap_dir,
+        #         max_samples=None,
+        #         umap_reducers=train_reducers  # Val mode: use train PCA + UMAP
+        #     )
+        #     print("✅ Validation UMAP completed!")
 
         if accelerator.is_main_process:
             log_dict = {
@@ -609,23 +605,23 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
         })
 
     # ==================== UMAP Visualization ====================
-    if accelerator.is_main_process:
-        print("\n" + "="*80)
-        print("🖼️ Generating Test UMAP...")
-        test_umap_dir = os.path.join(args.umap_save_dir, 'test')
-        plot_multitask_umap(
-            args=args,
-            model=model,
-            dataloader=test_loader,
-            device=accelerator.device,
-            accelerator=accelerator,
-            dataset=test_loader.dataset,
-            epoch=epoch+1,
-            save_dir=test_umap_dir,
-            max_samples=None,
-            umap_reducers=train_reducers  # Test mode: use train PCA + UMAP
-        )
-        print("✅ Test UMAP completed!")
+    # if accelerator.is_main_process:
+    #     print("\n" + "="*80)
+    #     print("🖼️ Generating Test UMAP...")
+    #     test_umap_dir = os.path.join(args.umap_save_dir, 'test')
+    #     plot_multitask_umap(
+    #         args=args,
+    #         model=model,
+    #         dataloader=test_loader,
+    #         device=accelerator.device,
+    #         accelerator=accelerator,
+    #         dataset=test_loader.dataset,
+    #         epoch=epoch+1,
+    #         save_dir=test_umap_dir,
+    #         max_samples=None,
+    #         umap_reducers=train_reducers  # Test mode: use train PCA + UMAP
+    #     )
+        # print("✅ Test UMAP completed!")
 
     print("\n" + "="*80)
     print("✅ MULTI-TASK TRAINING COMPLETED!")

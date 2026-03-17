@@ -33,3 +33,6 @@ logs/
 
 # Env
 .env
+
+/output/
+/augmentation_debug/

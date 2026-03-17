@@ -18,11 +18,11 @@ def load_preprocessed_data():
     demo_df = pd.read_feather(root_dir + 'processed/final_demo_df.ftr')
 
     # 5 days
-    # ts_df = pd.read_feather(root_dir + 'src/test/final_ts_dataset_1228.ftr') # Min-max scaling
-    # ts_df = pd.read_feather(root_dir + 'src/test/final_ts_dataset_2026_0126.ftr') # Feature-specific scaling
     ts_df = pd.read_feather(root_dir + 'src/test/final_ts_dataset_2026_0223.ftr') # No observed_mask, sentinel=-2
 
-    img_df = pd.read_feather(root_dir + 'src/test/total_cxr_df_5days_20260128.ftr')
+    # img_df = pd.read_feather(root_dir + 'src/test/total_cxr_df_5days_20260128.ftr')
+    img_df = pd.read_feather(root_dir + 'src/test/total_cxr_df_5days_20260316.ftr')
+
     text_df = pd.read_feather(root_dir + 'src/test/final_text_df_20260128.ftr')
     return ts_df, img_df, text_df, demo_df
 

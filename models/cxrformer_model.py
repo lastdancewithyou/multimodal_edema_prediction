@@ -504,6 +504,9 @@ class CXformer(nn.Module):
 
         self.norm = norm_layer(embed_dim)
 
+        # Gradient checkpointing flag
+        self.gradient_checkpointing = False
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -562,9 +565,15 @@ class CXformer(nn.Module):
         n_self_attn = self.depth - self.n_cross_attn_blocks
         for i, blk in enumerate(self.blocks):
             if i < n_self_attn:
-                x = blk(x)
+                if self.gradient_checkpointing and self.training:
+                    x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+                else:
+                    x = blk(x)
             else:
-                x = blk(x, context)
+                if self.gradient_checkpointing and self.training:
+                    x = torch.utils.checkpoint.checkpoint(blk, x, context, use_reentrant=False)
+                else:
+                    x = blk(x, context)
 
         x = self.norm(x)
         return {
