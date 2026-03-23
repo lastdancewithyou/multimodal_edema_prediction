@@ -1,13 +1,3 @@
-# CXformer: DINOv2 ViT-Base with Cross-Attention for vision-language tasks.
-#
-# Architecture:
-#   Block ×6  (self-attention only, indices 0-5)
-#   CrossAttentionBlock ×6  (self-attention + cross-attention + FFN, indices 6-11)
-#
-# Pretrained weights from HuggingFace (m42-health/CXformer-base) are loaded with
-# strict=False so that only matching keys (all except cross-attention layers) are
-# restored.  Cross-attention layers are randomly initialised and fine-tuned.
-
 import math
 from functools import partial
 from typing import Callable, Optional, Tuple, Union
@@ -16,7 +6,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn.init import trunc_normal_
-
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 
 # ---------------------------------------------------------------------------
 # DropPath (Stochastic Depth)
@@ -369,35 +360,47 @@ class CrossAttentionBlock(Block):
         self.ls_cross = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path_cross = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-    def forward(self, x: Tensor, context: Tensor) -> Tensor:
+    def forward(self, x: Tensor, context: Optional[Tensor] = None) -> Tensor:
         """
         Args:
             x:       image tokens  [B, N, dim]
-            context: text tokens   [B, M, context_dim]
+            context: text tokens   [B, M, context_dim] (optional)
+                     If None, only self-attention and FFN are performed (cross-attention is skipped)
         Returns:
             [B, N, dim]
         """
         def attn_residual_func(x: Tensor) -> Tensor:
             return self.ls1(self.attn(self.norm1(x)))
 
-        def cross_attn_residual_func(x: Tensor) -> Tensor:
-            return self.ls_cross(self.cross_attn(self.norm_cross(x), context))
-
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
 
+        # Self-attention + FFN
         if self.training and self.sample_drop_ratio > 0.1:
             x = drop_add_residual_stochastic_depth(x, attn_residual_func, self.sample_drop_ratio)
-            x = x + self.drop_path_cross(cross_attn_residual_func(x))
-            x = drop_add_residual_stochastic_depth(x, ffn_residual_func, self.sample_drop_ratio)
         elif self.training and self.sample_drop_ratio > 0.0:
             x = x + self.drop_path1(attn_residual_func(x))
-            x = x + self.drop_path_cross(cross_attn_residual_func(x))
-            x = x + self.drop_path2(ffn_residual_func(x))
         else:
             x = x + attn_residual_func(x)
-            x = x + cross_attn_residual_func(x)
+
+        # Cross-attention (only if context is provided)
+        if context is not None:
+            def cross_attn_residual_func(x: Tensor) -> Tensor:
+                return self.ls_cross(self.cross_attn(self.norm_cross(x), context))
+
+            if self.training and self.sample_drop_ratio > 0.0:
+                x = x + self.drop_path_cross(cross_attn_residual_func(x))
+            else:
+                x = x + cross_attn_residual_func(x)
+
+        # FFN
+        if self.training and self.sample_drop_ratio > 0.1:
+            x = drop_add_residual_stochastic_depth(x, ffn_residual_func, self.sample_drop_ratio)
+        elif self.training and self.sample_drop_ratio > 0.0:
+            x = x + self.drop_path2(ffn_residual_func(x))
+        else:
             x = x + ffn_residual_func(x)
+
         return x
 
 
@@ -406,35 +409,6 @@ class CrossAttentionBlock(Block):
 # ---------------------------------------------------------------------------
 
 class CXformer(nn.Module):
-    """
-    DINOv2 ViT-Base with cross-attention injected in the last 6 transformer blocks.
-
-    Block layout (depth=12):
-        indices 0-5  : Block             (self-attention only)
-        indices 6-11 : CrossAttentionBlock (self-attn + cross-attn + FFN)
-
-    Pretrained weight loading:
-        state_dict = torch.load(...)  # or from HuggingFace hub
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        # missing keys   -> cross_attn layers (expected, will be fine-tuned)
-        # unexpected keys -> none (all pretrained keys match)
-
-    Args:
-        img_size:            input image size (default 224)
-        patch_size:          patch size (default 14, matches CXformer-base)
-        in_chans:            number of image channels (default 3)
-        embed_dim:           token dimension (default 768 for ViT-Base)
-        depth:               total number of transformer blocks (default 12)
-        num_heads:           number of attention heads (default 12)
-        mlp_ratio:           hidden dim multiplier in FFN (default 4.0)
-        context_dim:         text embedding dimension fed into cross-attention
-        qkv_bias:            bias in QKV projections (default True)
-        drop_path_rate:      stochastic depth rate (default 0.0)
-        init_values:         LayerScale init value (default 1.0, matches CXformer-base)
-        num_register_tokens: number of register tokens (default 4, matches CXformer-base)
-        n_cross_attn_blocks: number of trailing blocks to use CrossAttentionBlock (default 6)
-    """
-
     def __init__(
         self,
         img_size: int = 224,
@@ -452,7 +426,7 @@ class CXformer(nn.Module):
         init_values: Optional[float] = 1.0,
         num_register_tokens: int = 4,
         n_cross_attn_blocks: int = 6,
-    ) -> None:
+    ):
         super().__init__()
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
@@ -549,11 +523,12 @@ class CXformer(nn.Module):
         x = torch.cat((x[:, :1], reg_tokens, x[:, 1:]), dim=1)
         return x
 
-    def forward(self, x: Tensor, context: Tensor) -> dict:
+    def forward(self, x: Tensor, context: Optional[Tensor] = None) -> dict:
         """
         Args:
             x:       images   [B, C, H, W]
-            context: text embeddings  [B, M, context_dim]
+            context: text embeddings  [B, M, context_dim] (optional)
+                     If None, only self-attention is performed (cross-attention is skipped)
 
         Returns:
             dict with:
@@ -563,17 +538,27 @@ class CXformer(nn.Module):
         x = self.prepare_tokens(x)
 
         n_self_attn = self.depth - self.n_cross_attn_blocks
-        for i, blk in enumerate(self.blocks):
-            if i < n_self_attn:
+
+        if context is None:
+            # context가 None이면 self-attention만 수행
+            for blk in self.blocks:
                 if self.gradient_checkpointing and self.training:
                     x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
                 else:
                     x = blk(x)
-            else:
-                if self.gradient_checkpointing and self.training:
-                    x = torch.utils.checkpoint.checkpoint(blk, x, context, use_reentrant=False)
+        else:
+            # context가 있으면 원래대로 self-attn + cross-attn 수행
+            for i, blk in enumerate(self.blocks):
+                if i < n_self_attn:
+                    if self.gradient_checkpointing and self.training:
+                        x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+                    else:
+                        x = blk(x)
                 else:
-                    x = blk(x, context)
+                    if self.gradient_checkpointing and self.training:
+                        x = torch.utils.checkpoint.checkpoint(blk, x, context, use_reentrant=False)
+                    else:
+                        x = blk(x, context)
 
         x = self.norm(x)
         return {
@@ -725,7 +710,6 @@ class CXformer(nn.Module):
         if local_path is not None:
             # ── Local file ────────────────────────────────────────────────
             if local_path.endswith(".safetensors"):
-                from safetensors.torch import load_file
                 state_dict = load_file(local_path)
             else:
                 state_dict = torch.load(local_path, map_location="cpu")
@@ -735,8 +719,6 @@ class CXformer(nn.Module):
             # hf_hub_download stores files in ~/.cache/huggingface/hub/.
             # On repeated calls it returns the cached path immediately without
             # making a network request (unless the remote file has changed).
-            from huggingface_hub import hf_hub_download
-            from safetensors.torch import load_file
             ckpt_path = hf_hub_download(repo_id=model_id, filename="model.safetensors")
             state_dict = load_file(ckpt_path)
             source = model_id
@@ -757,3 +739,99 @@ class CXformer(nn.Module):
             print(f"  Unexpected keys: {unexpected}")
 
         return model
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, linear: nn.Linear, r: int = 16, alpha: int = 32, dropout: float = 0.0):
+        super().__init__()
+        self.linear = linear
+        self.r = r
+        self.scaling = alpha / r
+
+        in_dim = linear.in_features
+        out_dim = linear.out_features
+
+        self.lora_A = nn.Parameter(torch.empty(in_dim, r))
+        self.lora_B = nn.Parameter(torch.zeros(r, out_dim))
+
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
+
+        self.linear.weight.requires_grad_(False)
+        if self.linear.bias is not None:
+            self.linear.bias.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.linear(x)
+        lora = (self.dropout(x @ self.lora_A)) @ self.lora_B
+        return base + lora * self.scaling
+
+    def extra_repr(self) -> str:
+        return (f"in={self.linear.in_features}, out={self.linear.out_features}, "
+                f"r={self.r}, scaling={self.scaling:.3f}")
+
+
+def apply_lora_to_cxformer(
+    model: nn.Module,
+    r: int = 16,
+    alpha: int = 32,
+    dropout: float = 0.1,
+    target_keys: tuple = ("attn.qkv", "attn.proj"),  # Cross-attention 제외 (랜덤 초기화 상태이므로 full fine-tuning)
+) -> nn.Module:
+
+    # Step 1: 전체 freeze
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    # Step 2: 교체 대상을 먼저 수집 (순회 중 교체 방지)
+    lora_targets = []
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if any(k in name for k in target_keys):
+            lora_targets.append(name)
+
+    # Step 3: LoRA 적용 (Self-attention만)
+    replaced = set()
+    for name in lora_targets:
+        if name in replaced:
+            continue
+
+        parent = model
+        *path, last = name.split('.')
+        for p in path:
+            parent = getattr(parent, p)
+
+        module = getattr(parent, last)
+
+        # 이미 LoRALinear인 경우 스킵 (혹시 모를 중복 방지)
+        if isinstance(module, LoRALinear):
+            continue
+
+        setattr(parent, last, LoRALinear(module, r, alpha, dropout))
+        replaced.add(name)
+
+    # Step 4: Cross-attention layers는 full fine-tuning (unfreeze)
+    cross_attn_params = 0
+    cross_attn_layers = []
+    for name, param in model.named_parameters():
+        if "cross_attn" in name:
+            param.requires_grad_(True)
+            cross_attn_params += param.numel()
+            cross_attn_layers.append(name)
+
+    # lora_params = 0
+    # for name, module in model.named_modules():
+    #     if isinstance(module, LoRALinear):
+    #         lora_params += module.lora_A.numel() + module.lora_B.numel()
+
+    # total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # total_params = sum(p.numel() for p in model.parameters())
+
+    # print(f"[LoRA] Applied to {len(replaced)} self-attention layers ({lora_params:,} params)")
+    # print(f"[Full Fine-tuning] Unfroze {len(cross_attn_layers)} cross-attention layers ({cross_attn_params:,} params)")
+    # print(f"[Total] Trainable params: {total_trainable:,} / {total_params:,} "
+    #       f"({100 * total_trainable / total_params:.2f}%)")
+
+    return model

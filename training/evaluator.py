@@ -13,8 +13,9 @@ from sklearn.preprocessing import label_binarize
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 
-from utils import timer
+from utils.utils import timer
 from training.engine import prepare_multiview_inputs_v2, train_batch
 from analysis.calibration import ExpectedCalibrationError, analyze_calibration
 
@@ -27,12 +28,6 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
     bce_count = torch.zeros(1, device=device, dtype=torch.float32)
     ce_sum = torch.zeros(1, device=device, dtype=torch.float32)
     ce_count = torch.zeros(1, device=device, dtype=torch.float32)
-    ucl_sum = torch.zeros(1, device=device, dtype=torch.float32)
-    ucl_count = torch.zeros(1, device=device, dtype=torch.float32)
-    scl_sum = torch.zeros(1, device=device, dtype=torch.float32)
-    scl_count = torch.zeros(1, device=device, dtype=torch.float32)
-    info_ucl_sum = torch.zeros(1, device=device, dtype=torch.float32)
-    info_ucl_count = torch.zeros(1, device=device, dtype=torch.float32)
 
     val_edema_preds_list = []
     val_edema_labels_list = []
@@ -41,7 +36,7 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
 
     with torch.no_grad():
         for batch in tqdm(dataloader, total=len(dataloader), desc="🤖 <Multi-Task Validation>"):
-            _, batch_bce, batch_ce, batch_ucl, batch_scl, batch_info_ucl, batch_outputs, batch_counts = train_batch(
+            _, batch_bce, batch_ce, batch_outputs, batch_counts = train_batch(
                 args=args,
                 model=model,
                 batch=batch,
@@ -54,28 +49,16 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
                 disable_txt=disable_txt,
                 bce_weight=args.bce_weight,
                 ce_weight=args.ce_weight,
-                ucl_weight=args.ucl_weight,
-                scl_weight=args.scl_weight,
-                infonce_weight=args.infonce_weight,
             )
 
             bce_ct_local = torch.as_tensor(batch_counts['bce_count'], device=device, dtype=torch.float32)
             ce_ct_local = torch.as_tensor(batch_counts['ce_count'], device=device, dtype=torch.float32)
-            ucl_ct_local = torch.as_tensor(batch_counts['ucl_count'], device=device, dtype=torch.float32)
-            scl_ct_local = torch.as_tensor(batch_counts['scl_count'], device=device, dtype=torch.float32)
-            infonce_ct_local = torch.as_tensor(batch_counts['infonce_count'], device=device, dtype=torch.float32)
 
             bce_sum += torch.as_tensor(batch_bce, device=device, dtype=torch.float32) * bce_ct_local
             bce_count += bce_ct_local
             ce_sum += torch.as_tensor(batch_ce, device=device, dtype=torch.float32) * ce_ct_local
             ce_count += ce_ct_local
-            ucl_sum += torch.as_tensor(batch_ucl, device=device, dtype=torch.float32) * ucl_ct_local
-            ucl_count += ucl_ct_local
-            scl_sum += torch.as_tensor(batch_scl, device=device, dtype=torch.float32) * scl_ct_local
-            scl_count += scl_ct_local
-            info_ucl_sum += torch.as_tensor(batch_info_ucl, device=device, dtype=torch.float32) * infonce_ct_local
-            info_ucl_count += infonce_ct_local
-            
+
             edema_logits = batch_outputs['edema_logits'].squeeze(-1)  # [B, W]
             subtype_logits = batch_outputs['subtype_logits']           # [B, W, 2]
             edema_labels = batch_outputs['edema_labels']               # [B, W]
@@ -104,44 +87,69 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
         total_bce_count = accelerator.gather_for_metrics(bce_count).sum()
         total_ce_sum = accelerator.gather_for_metrics(ce_sum).sum()
         total_ce_count = accelerator.gather_for_metrics(ce_count).sum()
-        total_ucl_sum = accelerator.gather_for_metrics(ucl_sum).sum()
-        total_ucl_count = accelerator.gather_for_metrics(ucl_count).sum()
-        total_scl_sum = accelerator.gather_for_metrics(scl_sum).sum()
-        total_scl_count = accelerator.gather_for_metrics(scl_count).sum()
-        total_info_ucl_sum = accelerator.gather_for_metrics(info_ucl_sum).sum()
-        total_info_ucl_count = accelerator.gather_for_metrics(info_ucl_count).sum()
     else:
         total_bce_sum = bce_sum
         total_bce_count = bce_count
         total_ce_sum = ce_sum
         total_ce_count = ce_count
-        total_ucl_sum = ucl_sum
-        total_ucl_count = ucl_count
-        total_scl_sum = scl_sum
-        total_scl_count = scl_count
-        total_info_ucl_sum = info_ucl_sum
-        total_info_ucl_count = info_ucl_count
 
     bce_avg = (total_bce_sum / (total_bce_count + 1e-8)).item()
     ce_avg = (total_ce_sum / (total_ce_count + 1e-8)).item()
-    ucl_avg = (total_ucl_sum / (total_ucl_count + 1e-8)).item()
-    scl_avg = (total_scl_sum / (total_scl_count + 1e-8)).item()
-    info_ucl_avg = (total_info_ucl_sum / (total_info_ucl_count + 1e-8)).item()
 
     bce_contrib = args.bce_weight * bce_avg 
     ce_contrib = args.ce_weight * ce_avg
-    ucl_contrib = args.ucl_weight * ucl_avg
-    scl_contrib = args.scl_weight * scl_avg
-    info_ucl_contrib = args.infonce_weight * info_ucl_avg
-    total_loss = bce_contrib + ce_contrib + ucl_contrib + scl_contrib + info_ucl_contrib
+    total_loss = bce_contrib + ce_contrib
 
-    # Validation metrics - Multi-task learning (same structure as training)
+    # Gather predictions from all GPUs
+    if accelerator.num_processes > 1:
+        local_preds = {
+            'p_pos': [p.cpu() for p in val_edema_preds_list],
+            'p_sub': [p.cpu() for p in val_subtype_preds_list],
+            'edema': [e.cpu() for e in val_edema_labels_list],
+            'subtype': [s.cpu() for s in val_subtype_labels_list]
+        }
+
+        # Gather to rank 0 only
+        if accelerator.is_main_process:
+            gathered_preds = [None] * accelerator.num_processes
+            dist.gather_object(local_preds, gathered_preds, dst=0)
+
+            all_p_pos = []
+            all_p_sub = []
+            all_edema = []
+            all_subtype = []
+
+            for gpu_preds in gathered_preds:
+                all_p_pos.extend(gpu_preds['p_pos'])
+                all_p_sub.extend(gpu_preds['p_sub'])
+                all_edema.extend(gpu_preds['edema'])
+                all_subtype.extend(gpu_preds['subtype'])
+
+            p_pos_all = torch.cat(all_p_pos, dim=0).numpy() if all_p_pos else np.array([])
+            p_sub_all = torch.cat(all_p_sub, dim=0).numpy() if all_p_sub else np.array([])
+            edema_all = torch.cat(all_edema, dim=0).numpy() if all_edema else np.array([])
+            subtype_all = torch.cat(all_subtype, dim=0).numpy() if all_subtype else np.array([])
+        else:
+            dist.gather_object(local_preds, dst=0)
+            p_pos_all = None
+            p_sub_all = None
+            edema_all = None
+            subtype_all = None
+
+        dist.barrier() # GPU 1 waits for GPU 0 to finish metric computation
+    else:
+        # Single GPU
+        if len(val_edema_preds_list) > 0:
+            p_pos_all = torch.cat(val_edema_preds_list, dim=0).numpy()
+            p_sub_all = torch.cat(val_subtype_preds_list, dim=0).numpy()
+            edema_all = torch.cat(val_edema_labels_list, dim=0).numpy()
+            subtype_all = torch.cat(val_subtype_labels_list, dim=0).numpy()
+        else:
+            p_pos_all = None
+
+    # Validation metrics - Multi-task learning
     val_metrics = {}
-    if accelerator.is_main_process and len(val_edema_preds_list) > 0:
-        p_pos_all = torch.cat(val_edema_preds_list, dim=0).numpy()      # [N] P(edema=1)
-        p_sub_all = torch.cat(val_subtype_preds_list, dim=0).numpy()    # [N, 2] P(NCPE|pos), P(CPE|pos)
-        edema_all = torch.cat(val_edema_labels_list, dim=0).numpy()     # [N] in {0, 1, -1}
-        subtype_all = torch.cat(val_subtype_labels_list, dim=0).numpy() # [N] in {0, 1, -1}
+    if accelerator.is_main_process and p_pos_all is not None and len(p_pos_all) > 0:
 
         # ==================== Level 1: Binary Edema Detection (0 vs 1) ====================
         mask_l1 = (edema_all == 0) | (edema_all == 1)
@@ -239,14 +247,12 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
 
         # Compute calibration metrics
         if len(y_true_dict) > 0:
-            # Quick ECE calculation (no plots during training)
             ece_calc = ExpectedCalibrationError(n_bins=15)
 
             for task_name in y_true_dict.keys():
                 ece, _ = ece_calc.compute(y_true_dict[task_name], y_prob_dict[task_name])
                 val_metrics[f'{task_name}_ece'] = ece
 
-            # For final epoch or specific epochs, generate plots
             if epoch == "final" or (epoch is not None and epoch % 10 == 0):
                 save_dir = f'./output/calibration/{args.run_name}'
                 prefix = f'epoch_{epoch}' if epoch != "final" else 'final'
@@ -281,49 +287,50 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
             print(f"[3-class Classification] AUROC={val_metrics['level3_auroc']:.4f}  "
                 f"AUPRC={val_metrics['level3_auprc']:.4f}")
 
-            # Print 3-class per-class ECE
             for class_name in ['Negative', 'NCPE', 'CPE']:
                 ece_key = f'3-class: {class_name}_ece'
                 if ece_key in val_metrics:
                     print(f"  └─ {class_name} ECE={val_metrics[ece_key]:.4f}")
             print()
 
-    return total_loss, bce_avg, ce_avg, ucl_avg, scl_avg, info_ucl_avg, val_metrics
+    return total_loss, bce_avg, ce_avg, val_metrics
 
 
 # Test 함수
 def test(args, model, dataloader, loss_module, device, accelerator, dataset):
-    test_loss, test_bce_avg, test_ce_avg, test_ucl_avg, test_scl, test_info_ucl, test_metrics = validate_multitask(
+    test_loss, test_bce_avg, test_ce_avg, test_metrics = validate_multitask(
         args, model, dataloader, loss_module, device, accelerator, dataset, epoch="final"
     )
 
-    wandb_test_metrics = {
-        # Level 1: Binary Edema Detection
-        'test/level1_auroc': test_metrics['level1_auroc'],
-        'test/level1_auprc': test_metrics['level1_auprc'],
-        'test/level1_brier': test_metrics['level1_brier'],
-        # Level 2: Subtype Classification
-        'test/level2_auroc': test_metrics['level2_auroc'],
-        'test/level2_auprc': test_metrics['level2_auprc'],
-        # Level 3: 3-class Combined
-        'test/level3_auroc': test_metrics['level3_auroc'],
-        'test/level3_auprc': test_metrics['level3_auprc'],
-    }
+    wandb_test_metrics = {}
+    if accelerator.is_main_process and test_metrics:
+        wandb_test_metrics = {
+            # Level 1: Binary Edema Detection
+            'test/level1_auroc': test_metrics['level1_auroc'],
+            'test/level1_auprc': test_metrics['level1_auprc'],
+            'test/level1_brier': test_metrics['level1_brier'],
+            # Level 2: Subtype Classification
+            'test/level2_auroc': test_metrics['level2_auroc'],
+            'test/level2_auprc': test_metrics['level2_auprc'],
+            # Level 3: 3-class Combined
+            'test/level3_auroc': test_metrics['level3_auroc'],
+            'test/level3_auprc': test_metrics['level3_auprc'],
+        }
 
-    print("\n" + "="*80)
-    print("📊 [Final Test Results]")
-    print("="*80)
+        print("\n" + "="*80)
+        print("📊 [Final Test Results]")
+        print("="*80)
 
-    print(f"\n   [Hierarchical Performance Metrics]")
-    print(f"[Edema Detection]   AUROC={test_metrics['level1_auroc']:.4f}  "
-        f"AUPRC={test_metrics['level1_auprc']:.4f}  "
-        f"Brier={test_metrics['level1_brier']:.4f}")
+        print(f"\n   [Hierarchical Performance Metrics]")
+        print(f"[Edema Detection]   AUROC={test_metrics['level1_auroc']:.4f}  "
+            f"AUPRC={test_metrics['level1_auprc']:.4f}  "
+            f"Brier={test_metrics['level1_brier']:.4f}")
 
-    print(f"[Subtype Classification] AUROC={test_metrics['level2_auroc']:.4f}  "
-        f"AUPRC={test_metrics['level2_auprc']:.4f}")
+        print(f"[Subtype Classification] AUROC={test_metrics['level2_auroc']:.4f}  "
+            f"AUPRC={test_metrics['level2_auprc']:.4f}")
 
-    print(f"[3-class Classification] AUROC={test_metrics['level3_auroc']:.4f}  "
-        f"AUPRC={test_metrics['level3_auprc']:.4f}")
-    print("="*80 + "\n")
+        print(f"[3-class Classification] AUROC={test_metrics['level3_auroc']:.4f}  "
+            f"AUPRC={test_metrics['level3_auprc']:.4f}")
+        print("="*80 + "\n")
 
-    return test_loss, test_bce_avg, test_ce_avg, test_ucl_avg, test_scl, test_info_ucl, test_metrics, wandb_test_metrics
+    return test_loss, test_bce_avg, test_ce_avg, test_metrics, wandb_test_metrics

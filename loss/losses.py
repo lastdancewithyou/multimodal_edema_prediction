@@ -8,17 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # from training.run import parse_arguments
-from utils import timer
+from utils.utils import timer
 
 
 OUTPUT_DIR = "/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/output/"
 
 
 class MultiModalLoss(nn.Module):
-    """
-    - Loss들을 관리하는 최상위 모듈
-    - 현재는 라벨 없는 데이터를 사용하는 Loss는 포함되어 있지 않음.
-    """
     def __init__(self, args, class_weights=None):
         super().__init__()
 
@@ -53,37 +49,6 @@ class MultiModalLoss(nn.Module):
         # ==================== Binary Cross-Entropy Loss (Edema Detection) ====================
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')  # reduction='none' for manual filtering
         print(f"[Loss] BCE Loss initialized for edema detection")
-        
-
-        # ==================== Temporal Neighbor based Contrastive Learning (For Generalization) ====================
-        self.use_temporal_ucl = args.use_temporal_ucl
-        if self.use_temporal_ucl:
-            self.ucl_loss_fn = ConstrainttimeLoss(ucl_beta=args.ucl_beta)
-            self.ucl_temperature = args.ucl_temperature
-            print(f"[Loss] Temporal UCL enabled (temperature={self.ucl_temperature})")
-        else: 
-            self.ucl_loss_fn = None
-            print(f"[Loss] Temporal UCL disabled")
-
-        # ==================== Supervised Contrastive Loss ====================
-        self.use_supcon = args.use_supcon
-        if self.use_supcon:
-            self.supcon_loss_fn = SupConLoss()
-            self.scl_temperature = args.scl_temperature
-            print(f"[Loss] Supervised Contrastive Loss enabled (temperature={self.scl_temperature})")
-        else:
-            self.supcon_loss_fn = None
-            print(f"[Loss] Supervised Contrastive Loss disabled")
-
-        # ==================== InfoNCE Contrastive Loss ====================
-        self.use_infonce = args.use_infonce
-        if self.use_infonce:
-            self.infonce_loss_fn = InfoNCELoss()
-            self.infonce_temperature = args.infonce_temperature
-            print(f"[Loss] InfoNCE Contrastive Loss enabled (temperature={self.infonce_temperature})")
-        else:
-            self.infonce_loss_fn = None
-            print(f"[Loss] InfoNCE Contrastive Loss disabled")
 
     ###########################################################################
     def cross_entropy(self, subtype_logits, subtype_labels, edema_labels, window_mask):
@@ -145,14 +110,11 @@ class MultiModalLoss(nn.Module):
 
     def forward(self,
                 # Model outputs
-                edema_logits, subtype_logits, valid_embeddings,
-                window_time_indices, batch_indices,
+                edema_logits, subtype_logits, valid_embeddings, window_time_indices, batch_indices,
                 # Labels
                 edema_labels, subtype_labels, window_mask,
                 # Loss weights
-                bce_weight=0.0, ce_weight=0.0, ucl_weight=0.0, scl_weight=0.0, infonce_weight=0.0,
-                # Misc
-                device=None, accelerator=None
+                bce_weight=0.0, ce_weight=0.0, device=None, accelerator=None
         ):
         if device is None:
             device = edema_logits.device
@@ -173,45 +135,6 @@ class MultiModalLoss(nn.Module):
             ce_loss = torch.tensor(0.0, device=device, requires_grad=False)
             ce_count = 0
 
-        # -------------------- (2) Temporal UCL Loss --------------------
-        if self.use_temporal_ucl and ucl_weight > 0.0:
-            with timer("Temporal UCL Loss", accelerator):
-                ucl_loss, ucl_count = self.ucl_loss_fn(
-                    embeddings=valid_embeddings,
-                    time_indices=window_time_indices,
-                    batch_indices=batch_indices,
-                    temperature=self.ucl_temperature,
-                    accelerator=accelerator
-                )
-        else:
-            ucl_loss = torch.tensor(0.0, device=device, requires_grad=False)
-            ucl_count = 0
-
-        # -------------------- (3) Supervised Contrastive Loss (SupCon) --------------------
-        if self.use_supcon and scl_weight > 0.0:
-            with timer("Supervised Contrastive Loss", accelerator):
-                # SupCon uses edema labels for contrastive learning
-                scl_loss, scl_count = self.supcon_loss_fn(
-                    embeddings=valid_embeddings,
-                    labels=edema_labels,
-                    window_mask=window_mask,
-                    temperature=self.scl_temperature
-                )
-        else:
-            scl_loss = torch.tensor(0.0, device=device, requires_grad=False)
-            scl_count = 0
-
-        # -------------------- (4) InfoNCE Contrastive Loss --------------------
-        if self.use_infonce and infonce_weight > 0.0:
-            with timer("InfoNCE Contrastive Loss", accelerator):
-                infonce_loss, infonce_count = self.infonce_loss_fn(
-                    embeddings=valid_embeddings,
-                    temperature=self.infonce_temperature
-                )
-        else:
-            infonce_loss = torch.tensor(0.0, device=device, requires_grad=False)
-            infonce_count = 0
-
         # -------------------- NaN Detection --------------------
         if torch.isnan(bce_loss) or torch.isinf(bce_loss):
             print(f"[WARNING] BCE Loss is NaN/Inf: {bce_loss.item()}")
@@ -219,35 +142,19 @@ class MultiModalLoss(nn.Module):
         if torch.isnan(ce_loss) or torch.isinf(ce_loss):
             print(f"[WARNING] CE Loss is NaN/Inf: {ce_loss.item()}")
 
-        if torch.isnan(ucl_loss) or torch.isinf(ucl_loss):
-            print(f"[WARNING] Temporal UCL Loss is NaN/Inf: {ucl_loss.item()}")
-
-        if torch.isnan(scl_loss) or torch.isinf(scl_loss):
-            print(f"[WARNING] SCL Loss is NaN/Inf: {scl_loss.item()}")
-
-        if torch.isnan(infonce_loss) or torch.isinf(infonce_loss):
-            print(f"[WARNING] InfoNCE Loss is NaN/Inf: {infonce_loss.item()}")
-
-
         # -------------------- Total Loss --------------------
         total_loss = (
             bce_weight * bce_loss +
-            ce_weight * ce_loss +
-            ucl_weight * ucl_loss +
-            scl_weight * scl_loss +
-            infonce_weight * infonce_loss
+            ce_weight * ce_loss
         )
 
         # -------------------- Sample Counts --------------------
         loss_counts = {
             'bce_count': bce_count,
-            'ce_count': ce_count,
-            'ucl_count': ucl_count,
-            'scl_count': scl_count,
-            'infonce_count': infonce_count
+            'ce_count': ce_count
         }
 
-        return total_loss, bce_loss, ce_loss, ucl_loss, scl_loss, infonce_loss, loss_counts
+        return total_loss, bce_loss, ce_loss, loss_counts
     
     # validation & test
     def inference(self, classification_input, logits, labels, window_mask):

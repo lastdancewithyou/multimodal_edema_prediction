@@ -8,7 +8,7 @@ import torch.functional as F
 # from torch.utils.checkpoint import checkpoint
 
 from training.run import parse_arguments
-from utils import timer
+from utils.utils import timer
 
 
 # Demographic modality encoder

@@ -1,26 +1,35 @@
 import os
 import argparse
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
 
     # wandb
-    parser.add_argument('--project_name', type=str, default="Multi_task", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="29", help="Experiment ID")
+    parser.add_argument('--project_name', type=str, default="Model Novelty development", help="Wandb project name")
+    parser.add_argument('--experiment_id', type=str, default="5", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
+    parser.add_argument('--wandb_on', type=bool, default=False, help='Enable Weights & Biases logging')
 
     # Modality Selection
     parser.add_argument("--disable_cxr", type=bool, default=False, help="이미지 모달리티 활성화 여부")
     parser.add_argument("--disable_txt", type=bool, default=False, help="텍스트 모달리티 활성화 여부")
-    parser.add_argument('--use_demographic', type=bool, default=True, help='Use demographic information')
+    parser.add_argument('--use_clinical_prompt', type=bool, default=True, help='Use demographic information')
 
-    parser.add_argument('--img_to_3ch', type=bool, default=False, help='Convert grayscale to 3-channel by repeating channel 1 (for CXFormer/ResNet)')
+    parser.add_argument('--img_to_3ch', type=bool, default=True, help='Convert grayscale to 3-channel by repeating channel 1 (for CXFormer/ResNet)')
     # parser.add_argument('--use_img_augmentation', type=bool, default=False, help='Use per-window image augmentation for diversity') # False - v2 / True - v3
 
+    # Fusion architecture ablation
+    parser.add_argument('--use_segmented_attention', type=bool, default=True,
+                        help='Use segmented temporal attention (True) vs full global attention (False) for TS fusion')
+    parser.add_argument('--use_cls_global', type=bool, default=False,
+                        help='Use CLS token for causal global context (past-only summary for each latent)')
+
     # dataset & sampler
-    parser.add_argument('--train_batch_size', type=int, default=64)
-    parser.add_argument('--val_batch_size', type=int, default=64)
-    parser.add_argument('--test_batch_size', type=int, default=64)
+    parser.add_argument('--train_batch_size', type=int, default=16)
+    parser.add_argument('--val_batch_size', type=int, default=16)
+    parser.add_argument('--test_batch_size', type=int, default=16)
 
     parser.add_argument('--train_ratio', type=float, default=0.75, help='Train dataset ratio')
     parser.add_argument('--val_ratio', type=float, default=0.15, help='Validation dataset ratio')
@@ -31,6 +40,8 @@ def parse_arguments():
     parser.add_argument('--prediction_horizon', type=int, default=8, help='Hours ahead to predict for early prediction')
     parser.add_argument('--window_size', type=int, default=24, help='Sliding window size')
     parser.add_argument('--stride', type=int, default=1, help='Sliding window moving stride')
+    parser.add_argument('--use_last_point_only', type=bool, default=False,
+                        help='시계열 모델의 당위성을 입증하기 위한 가장 최근 데이터만으로 예측을 수행하는 컨트롤 파라미터')
 
     #################################### Multi-task Learning ####################################
     # Binary Cross-Entropy
@@ -62,9 +73,6 @@ def parse_arguments():
     parser.add_argument('--single_stage_epochs', type=int, default=30, help='Number of epochs for single-stage training')
     parser.add_argument('--single_learning_rate', type=float, default=1e-4, help='Learning rate at single training stage')
     parser.add_argument('--single_patience', type=int, default=5, help='Early stopping patience') # Stage 1 early stopping patience
-
-    # Gradient Accumulation for Multi-GPU
-    # parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help='Gradient accumulation steps - 멀티 GPU 안정성 향상')
 
     # model
     ## time-series modal
@@ -124,7 +132,7 @@ def parse_arguments():
         args.wandb_run_name = f"{args.experiment_id}: [GPU 0] temp=0.7/Optimal_hyperparam_search/Img_Text_Tuning/Fine-tuning"
     # single stage
     else:
-        args.wandb_run_name = f"{args.experiment_id}: True_Normalized_img(224by224)/Performance_Restoration"
+        args.wandb_run_name = f"{args.experiment_id}: Dropout/LR=1e-4/ReduceOnPlateau/Cross_attn_LR"
 
     # ===================================================================================================
 

@@ -1,5 +1,6 @@
 import os
 import numpy as np
+import pandas as pd
 from sklearn.model_selection import train_test_split
 import random
 import hashlib
@@ -7,10 +8,10 @@ from tqdm.auto import tqdm
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader, Sampler, DistributedSampler
+from torch.utils.data import Dataset, DataLoader, Sampler
 import torchvision.transforms as T
 
-from utils import timer, seed_worker
+from utils.utils import timer, seed_worker
 
 # IMAGE_DIR
 # CACHED_IMAGE_DIR = "/home/DAHS1/gangmin/my_research/CXR/pt_20260128/" # before edge cut
@@ -21,7 +22,7 @@ CACHED_IMAGE_DIR = "/home/DAHS1/gangmin/my_research/CXR/cached_images_224_0317" 
 
 
 class SCL_Multi_Dataset(Dataset):
-    def __init__(self, args, merged_df, demo_df):
+    def __init__(self, args, merged_df):
         self.args = args
         self.window_size = args.window_size
         self.stride = args.stride
@@ -31,30 +32,14 @@ class SCL_Multi_Dataset(Dataset):
         self.stay_groups = self.merged_df.groupby('stay_id') # stay_id 식별자를 기준으로 grouping
         self.stay_ids = list(self.stay_groups.groups.keys())
 
-        exclude_cols = ['hadm_id', 'stay_id', 'hour_slot', 'Edema', 'subtype_label', 'cxr_flag', 'hash_path', 'text_flag', 'tokenized_text']
+        # Exclude clinical_prompt and prompt_id from time-series features
+        exclude_cols = ['hadm_id', 'stay_id', 'hour_slot', 'Edema', 'subtype_label',
+                        'cxr_flag', 'hash_path', 'text_flag', 'tokenized_text',
+                        'clinical_prompt', 'prompt_id']
         all_feature_cols = [col for col in self.merged_df.columns if col not in exclude_cols]
 
         self.ts_features = all_feature_cols  # Includes both features and observed_mask
         print(f"[Dataset] Total features (including observed_mask): {len(self.ts_features)}")
-
-        self.demo_df = demo_df
-
-        # ========== Demo 사용 여부 제어 ==========
-        if self.demo_df is not None:
-            exclude_demo_cols = ['hadm_id']
-            self.demo_cols = [col for col in self.demo_df.columns if col not in exclude_demo_cols]
-            self.num_demo_features = len(self.demo_cols)
-
-            self.hadm_to_demo = {}
-            for _, row in self.demo_df.iterrows():
-                hadm_id = row['hadm_id']
-                demo_values = [row[col] for col in self.demo_cols]
-                self.hadm_to_demo[hadm_id] = demo_values
-
-        else:
-            self.demo_cols = []
-            self.num_demo_features = 0
-            self.hadm_to_demo = {}
 
         self.label_metadata = self._extract_label_metadata() # valid한 window만 학습에 사용할 수 있도록 stay_id별로 생성 가능한 label series를 미리 계산함.
 
@@ -82,30 +67,39 @@ class SCL_Multi_Dataset(Dataset):
         self.label_metadata = valid_label_metadata
         self.stay_index_map = new_stay_index_map
 
-        # ========== image / text mapping 사전 구축 ==========
-        # collate_fn에서 배치를 구성할 때, 중복 이미지/텍스트를 제거하고 unique한 것만 인코딩하기 위함
+        # ========== image / text / clinical_prompt mapping 사전 구축 ==========
+        # collate_fn에서 배치를 구성할 때, 중복 이미지/텍스트/프롬프트를 제거하고 unique한 것만 인코딩하기 위함
         self.image_map = {}
         self.text_map = {}
+        self.prompt_map = {}
 
         for stay_id in self.stay_ids:
             stay_data = self.stay_groups.get_group(stay_id).sort_values('hour_slot')
 
             # cxr_flag == 1인 hour_slot만 매핑에 추가함.
             img_dict = {t: path for t, path, flag in zip(
-                stay_data['hour_slot'], 
+                stay_data['hour_slot'],
                 stay_data['hash_path'],
                 stay_data['cxr_flag']
             ) if flag == 1}
 
-            # text_flag == 1인 hour_slot만 매핑에 추가함.
+            # text_flag == 1인 hour_slot만 매핑에 추가함 (radiology report)
             text_dict = {t: token for t, token, flag in zip(
                 stay_data['hour_slot'],
                 stay_data['tokenized_text'],
                 stay_data['text_flag']
             ) if flag == 1}
 
+            # prompt_id를 키로 clinical_prompt 매핑 (환자별 고유 ID 기반, -1 포함)
+            prompt_dict = {}
+            for _, row in stay_data.iterrows():
+                pid = int(row['prompt_id'])  # -1 포함하여 모든 prompt_id 저장
+                if pid not in prompt_dict:  # 중복 방지
+                    prompt_dict[pid] = row['clinical_prompt']
+
             self.image_map[stay_id] = img_dict
             self.text_map[stay_id] = text_dict
+            self.prompt_map[stay_id] = prompt_dict
 
         # ========== Image caching ==========
         self.image_cache = {}
@@ -119,11 +113,9 @@ class SCL_Multi_Dataset(Dataset):
                 f"[ERROR] Invalid image filename: {hash_filename}\n"
             )
 
-        # Check cache
         if hash_filename in self.image_cache:
             return self.image_cache[hash_filename]
 
-        # Load from disk
         file_path = os.path.join(CACHED_IMAGE_DIR, hash_filename)
         if not os.path.exists(file_path):
             raise RuntimeError(
@@ -171,15 +163,19 @@ class SCL_Multi_Dataset(Dataset):
         # Time-series features 추출 (observed_mask 포함)
         ts_feature_values = torch.tensor(stay_data[self.ts_features].astype(np.float32).to_numpy(), dtype=torch.float32)
 
-        # 각 hour_slot에 이미지와 텍스트가 있으면 hour_slot 값, 없으면 -1
+        # Clinical prompt_id 시리즈 (환자별 고유 ID)
+        prompt_ids = stay_data['prompt_id'].to_numpy()
+
+        # 각 hour_slot에 이미지/텍스트/프롬프트가 있으면 해당 인덱스, 없으면 -1
         img_index_series = [t if t in self.image_map[stay_id] else -1 for t in hour_slots]
         text_index_series = [t if t in self.text_map[stay_id] else -1 for t in hour_slots]
+        prompt_index_series = [int(pid) if pd.notna(pid) and pid != -1 and int(pid) in self.prompt_map[stay_id] else -1
+                               for pid in prompt_ids]
 
         sequence_series, edema_label_series, subtype_label_series, has_cxr_series, has_text_series, valid_mask_series = [], [], [], [], [], []
         L = len(stay_data)
 
         # ========== Sliding Window 생성 ==========
-        # ICU stay 길이가 window_size + prediction_horizon 이상인 경우
         if L >= self.window_size + self.prediction_horizon:
 
             max_start_idx = L - self.window_size - self.prediction_horizon  # Window의 시점 후 prediction_horizon 이후에도 라벨이 존재해야 함
@@ -190,13 +186,15 @@ class SCL_Multi_Dataset(Dataset):
                 window_ts = ts_feature_values[i:i + self.window_size]
                 window_img = img_index_series[i:i + self.window_size]
                 window_text = text_index_series[i:i + self.window_size]
+                window_prompt = prompt_index_series[i:i + self.window_size]
 
                 window_sequence = [
                     {
                         'time_step': int(window_hours[j]),
                         'ts_features': window_ts[j],  # Includes observed_mask_* as regular features
                         'img_index': window_img[j],
-                        'txt_index': window_text[j]
+                        'txt_index': window_text[j],
+                        'prompt_index': window_prompt[j]  # Clinical prompt ID
                     }
                     for j in range(self.window_size)
                 ]
@@ -227,15 +225,6 @@ class SCL_Multi_Dataset(Dataset):
         # 생성된 모든 window는 유효함 (window_mask=1) - 이후 collate_fn에서 배치 간 length를 맞춰줄 때 window_mask에 0을 할당함.
         window_mask = [1] * len(sequence_series)
 
-        # 인구통계학적 정보 (hadm_id를 기준으로 함)
-        demo_features = None
-        if self.demo_df is not None and len(self.demo_cols) > 0:
-            hadm_id = stay_data['hadm_id'].iloc[0]
-
-            if hadm_id in self.hadm_to_demo:
-                demo_values = self.hadm_to_demo[hadm_id]
-                demo_features = torch.tensor(demo_values, dtype=torch.float32)
-        
         return {
             'stay_id': stay_id,
             'modality_series': sequence_series,
@@ -244,8 +233,7 @@ class SCL_Multi_Dataset(Dataset):
             'edema_label_series': edema_label_series,
             'subtype_label_series': subtype_label_series,
             'window_mask': window_mask,
-            'valid_mask_series' : valid_mask_series,
-            'demo_features': demo_features
+            'valid_mask_series': valid_mask_series
         }
     
     def collate_fn(self, batch):
@@ -264,12 +252,14 @@ class SCL_Multi_Dataset(Dataset):
 
         max_windows = max(len(x) for x in modality_series_list) # 배치 내 최대 윈도우 개수 (패딩 기준)
 
-        # ==================== 배치 내 고유 이미지/텍스트 추출 ====================
+        # ==================== 배치 내 고유 이미지/텍스트/프롬프트 추출 ====================
         unique_img_paths = []  # 배치 전체에서 중복 제거된 이미지 경로
         unique_txt_keys = []   # 배치 전체에서 중복 제거된 텍스트 키 (stay_id, hour_slot)
+        unique_prompt_keys = []  # 배치 전체에서 중복 제거된 프롬프트 키 (stay_id, prompt_id)
 
         img_path_to_idx = {}  # {hash_path: unique_list_idx}
         txt_key_to_idx = {}   # {(stay_id, hour_slot): unique_list_idx}
+        prompt_key_to_idx = {}  # {(stay_id, prompt_id): unique_list_idx}
 
         # 배치 전체를 순회하며 고유 항목 수집
         for item in batch:
@@ -284,7 +274,7 @@ class SCL_Multi_Dataset(Dataset):
                             img_path_to_idx[img_path] = len(unique_img_paths)
                             unique_img_paths.append(img_path)
 
-                    # 텍스트 키 추출 (stay_id, hour_slot)
+                    # 텍스트 키 추출 (stay_id, hour_slot) - radiology report
                     txt_hour = step['txt_index']  # hour_slot or -1
                     if txt_hour != -1:
                         txt_key = (stay_id, txt_hour)
@@ -292,13 +282,22 @@ class SCL_Multi_Dataset(Dataset):
                             txt_key_to_idx[txt_key] = len(unique_txt_keys)
                             unique_txt_keys.append(txt_key)
 
+                    # Clinical prompt 키 추출 (stay_id, prompt_id)
+                    # -1도 포함 ("No clinical information available." 등)
+                    prompt_id = step['prompt_index']  # prompt_id (including -1)
+                    prompt_key = (stay_id, prompt_id)
+                    if prompt_key not in prompt_key_to_idx:
+                        prompt_key_to_idx[prompt_key] = len(unique_prompt_keys)
+                        unique_prompt_keys.append(prompt_key)
+
         # ==================== 텐서 초기화 ====================
         ts_feature_dim = batch[0]['modality_series'][0][0]['ts_features'].shape[-1]
         ts_tensor = torch.zeros(len(batch), max_windows, args.window_size, ts_feature_dim)
 
-        # -1: 이미지/텍스트 없음, 0~N-1: unique_list의 인덱스
+        # -1: 이미지/텍스트/프롬프트 없음, 0~N-1: unique_list의 인덱스
         img_index_tensor = torch.full((len(batch), max_windows, args.window_size), fill_value=-1, dtype=torch.long)
         text_index_tensor = torch.full((len(batch), max_windows, args.window_size), fill_value=-1, dtype=torch.long)
+        prompt_index_tensor = torch.full((len(batch), max_windows, args.window_size), fill_value=-1, dtype=torch.long)
 
         # 절대 시간 정보 (hour_slot) - Time2Vec에서 사용
         time_steps_tensor = torch.zeros(len(batch), max_windows, args.window_size, dtype=torch.float32)
@@ -336,15 +335,20 @@ class SCL_Multi_Dataset(Dataset):
                         txt_key = (stay_id, txt_hour)
                         text_index_tensor[i, j, t] = txt_key_to_idx[txt_key]
 
+                    # Clinical prompt index (always has value, including -1)
+                    prompt_id = step['prompt_index']
+                    prompt_key = (stay_id, prompt_id)
+                    prompt_index_tensor[i, j, t] = prompt_key_to_idx[prompt_key]
+
             window_mask_tensor[i, :num_windows] = torch.tensor(window_mask_list[i][:num_windows], dtype=torch.bool)
             edema_label_tensor[i, :num_windows] = torch.tensor(edema_label_series_list[i], dtype=torch.long)
             subtype_label_tensor[i, :num_windows] = torch.tensor(subtype_label_series_list[i], dtype=torch.long)
 
-        # ==================== Demographic features ====================
-        demo_features_list = [item['demo_features'] for item in batch]
-        demographic_tensor = None
-        if demo_features_list[0] is not None:
-            demographic_tensor = torch.stack(demo_features_list, dim=0)
+        # ==================== Clinical Prompt Extraction ====================
+        # Extract unique prompt texts (raw text for tokenization in model forward)
+        unique_prompt_texts = []
+        for stay_id, prompt_id in unique_prompt_keys:
+            unique_prompt_texts.append(self.prompt_map[stay_id][prompt_id])
 
         return {
             'stay_ids': stay_ids,
@@ -352,13 +356,14 @@ class SCL_Multi_Dataset(Dataset):
             'time_steps': time_steps_tensor,             # [B, W, T] - hour_slot
             'img_index_tensor': img_index_tensor,        # [B, W, T] → 0~N-1 (unique_img_paths 인덱스)
             'text_index_tensor': text_index_tensor,      # [B, W, T] → 0~M-1 (unique_txt_keys 인덱스)
+            'prompt_index_tensor': prompt_index_tensor,  # [B, W, T] → 0~P-1 (unique_prompt_keys 인덱스)
             'unique_img_paths': unique_img_paths,        # List[str] - 배치 내 고유 이미지 경로 (길이 N)
             'unique_txt_keys': unique_txt_keys,          # List[(stay_id, hour_slot)] - 배치 내 고유 텍스트 키 (길이 M)
+            'unique_prompt_texts': unique_prompt_texts,  # List[str] - 배치 내 고유 clinical prompt 텍스트 (길이 P)
             'window_mask': window_mask_tensor,           # [B, W]
             'valid_seq_mask': valid_seq_mask_tensor,     # [B, W, T]
             'edema_labels': edema_label_tensor,          # [B, W] - Binary edema labels
             'subtype_labels': subtype_label_tensor,      # [B, W] - Subtype labels (0, 1, 2, or -1)
-            'demo_features': demographic_tensor          # [B, D_demo] or None
         }
 
     def _extract_label_metadata(self):
@@ -411,13 +416,10 @@ class SCL_Multi_Dataset(Dataset):
 #######################################################################
 # 데이터셋 정의
 #######################################################################
-def get_dataloaders(ts_df, cxr_df, text_df, demo_df, args, accelerator=None, num_workers=8):
-    if not args.use_demographic:
-        demo_df = None
-    
+def get_dataloaders(ts_df, cxr_df, text_df, clinical_prompt_df, args, accelerator=None, num_workers=8):
     # 데이터 병합
     with timer("Dataset 병합"):
-        merged_df = merged_dataframes(ts_df, cxr_df, text_df)
+        merged_df = merged_dataframes(ts_df, cxr_df, text_df, clinical_prompt_df)
 
     # 데이터 분할
     train_df, val_df, test_df = split_dataset(
@@ -428,10 +430,9 @@ def get_dataloaders(ts_df, cxr_df, text_df, demo_df, args, accelerator=None, num
     )
 
     with timer("Dataset 생성"):
-        train_dataset = SCL_Multi_Dataset(args, train_df, demo_df)
-        val_dataset = SCL_Multi_Dataset(args, val_df, demo_df)
-        test_dataset = SCL_Multi_Dataset(args, test_df, demo_df)
-        args.num_demo_features = train_dataset.num_demo_features
+        train_dataset = SCL_Multi_Dataset(args, train_df)
+        val_dataset = SCL_Multi_Dataset(args, val_df)
+        test_dataset = SCL_Multi_Dataset(args, test_df)
 
     with timer("윈도우 라벨 분포 계산"):
         train_dist = calculate_window_label_distribution(train_dataset, "Train")
@@ -553,11 +554,47 @@ def get_dataloaders(ts_df, cxr_df, text_df, demo_df, args, accelerator=None, num
 # 데이터셋 정의를 위한 기타 함수
 #######################################################################
 # merging dataframes
-def merged_dataframes(ts_df, img_df, text_df): 
+def merged_dataframes(ts_df, img_df, text_df, clinical_prompt_df):
     merged_df = (ts_df
             .merge(img_df, on=['stay_id', 'hour_slot'], how='outer')
             .merge(text_df, on=['stay_id','hour_slot'], how='outer')
+            .merge(clinical_prompt_df[['hadm_id', 'stay_id', 'hour_slot', 'clinical_prompt', 'prompt_id']],
+                   on=['hadm_id', 'stay_id', 'hour_slot'], how='left')
     )
+
+    ########################################################################
+    # Analyze modality combinations at hour_slot level
+    print(f"\n{'='*80}")
+    print(f"📊 HOUR_SLOT LEVEL MODALITY COMBINATION ANALYSIS")
+    print(f"{'='*80}")
+
+    # Define modality flags
+    has_ts = merged_df['hour_slot'].notna()  # TS always exists (from ts_df)
+    has_img = merged_df['cxr_flag'].notna() & (merged_df['cxr_flag'] == 1)
+    has_text = merged_df['text_flag'].notna() & (merged_df['text_flag'] == 1)
+
+    # Count combinations
+    ts_only = (has_ts & ~has_img & ~has_text).sum()
+    ts_img = (has_ts & has_img & ~has_text).sum()
+    ts_text = (has_ts & ~has_img & has_text).sum()
+    ts_img_text = (has_ts & has_img & has_text).sum()
+
+    total_hourslots = len(merged_df)
+
+    print(f"\n[Merged DataFrame] Total hour_slots: {total_hourslots:,}")
+    print(f"{'─'*80}")
+    print(f"Modality Combinations:")
+    print(f"  TS only:              {ts_only:>8,} ({ts_only/total_hourslots*100:>5.2f}%)")
+    print(f"  TS + Image:           {ts_img:>8,} ({ts_img/total_hourslots*100:>5.2f}%)")
+    print(f"  TS + Text:            {ts_text:>8,} ({ts_text/total_hourslots*100:>5.2f}%)")
+    print(f"  TS + Image + Text:    {ts_img_text:>8,} ({ts_img_text/total_hourslots*100:>5.2f}%)")
+    print(f"{'─'*80}")
+    print(f"Multimodal Coverage:")
+    print(f"  At least Image:       {(has_img).sum():>8,} ({(has_img).sum()/total_hourslots*100:>5.2f}%)")
+    print(f"  At least Text:        {(has_text).sum():>8,} ({(has_text).sum()/total_hourslots*100:>5.2f}%)")
+    print(f"  At least one extra:   {(has_img | has_text).sum():>8,} ({(has_img | has_text).sum()/total_hourslots*100:>5.2f}%)")
+    print(f"{'='*80}\n")
+    ########################################################################
     return merged_df
 
 

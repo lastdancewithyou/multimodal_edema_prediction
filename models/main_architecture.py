@@ -2,11 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchxrayvision as xrv
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer
 
-from models.encoder import TransformerTSEncoder, DemographicEncoder, TSMixerEncoder
-from models.cxrformer_model import CXformer
-from utils import timer
+from models.encoder import TransformerTSEncoder, TSMixerEncoder
+from models.cxrformer_model import CXformer, apply_lora_to_cxformer
+from peft import LoraConfig, get_peft_model, TaskType
+from utils.utils import timer
 
 
 class MultiModalEncoder(nn.Module):
@@ -27,89 +28,54 @@ class MultiModalEncoder(nn.Module):
             dropout=0.1
         )
 
-        # Image Encoder: DenseNet121 from torchxrayvision (pretrained on MIMIC-CXR)
-        self.img_encoder = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch")
-        for param in self.img_encoder.parameters():
-            param.requires_grad = False
-
-        _densenet_unfreeze = [
-            "features.denseblock4",
-            "features.norm5",
-        ]
-        for name, param in self.img_encoder.named_parameters():
-            if any(name.startswith(prefix) for prefix in _densenet_unfreeze):
-                param.requires_grad = True
-        _img_trainable = sum(p.numel() for p in self.img_encoder.parameters() if p.requires_grad)
-        _img_total     = sum(p.numel() for p in self.img_encoder.parameters())
-        print(f"[MultiModalEncoder] DenseNet121: {_img_trainable:,} / {_img_total:,} params trainable")
-
         ##########################################################################################
-        # Image Encoder: cxFormer
-        # self.img_encoder = CXformer.from_pretrained("m42-health/CXformer-base", context_dim=256)
-
-        # # Enable gradient checkpointing for memory efficiency
-        # self.img_encoder.gradient_checkpointing = True
-
-        # # Freeze all parameters initially
+        # Image Encoder: DenseNet121 from torchxrayvision (pretrained on MIMIC-CXR)
+        # self.img_encoder = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch")
         # for param in self.img_encoder.parameters():
         #     param.requires_grad = False
 
-        # # Unfreeze cross-attention layers (randomly initialized, need fine-tuning)
-        # _cxformer_unfreeze = [
-        #     "blocks.6.cross_attn",   # Cross-attention in block 6
-        #     "blocks.7.cross_attn",   # Cross-attention in block 7
-        #     "blocks.8.cross_attn",   # Cross-attention in block 8
-        #     "blocks.9.cross_attn",   # Cross-attention in block 9
-        #     "blocks.10.cross_attn",  # Cross-attention in block 10
-        #     "blocks.11.cross_attn",  # Cross-attention in block 11
-        #     "blocks.6.norm_cross",   # Layer norms for cross-attention
-        #     "blocks.7.norm_cross",
-        #     "blocks.8.norm_cross",
-        #     "blocks.9.norm_cross",
-        #     "blocks.10.norm_cross",
-        #     "blocks.11.norm_cross",
-        #     "blocks.11.norm2",       # Last block's FFN norm
-        #     "blocks.11.mlp",         # Last block's FFN
-        #     "norm",                  # Final layer norm
+        # _densenet_unfreeze = [
+        #     "features.denseblock4",
+        #     "features.norm5",
         # ]
         # for name, param in self.img_encoder.named_parameters():
-        #     if any(name.startswith(prefix) for prefix in _cxformer_unfreeze):
+        #     if any(name.startswith(prefix) for prefix in _densenet_unfreeze):
         #         param.requires_grad = True
-
         # _img_trainable = sum(p.numel() for p in self.img_encoder.parameters() if p.requires_grad)
         # _img_total     = sum(p.numel() for p in self.img_encoder.parameters())
-        # print(f"[MultiModalEncoder] CXFormer: {_img_trainable:,} / {_img_total:,} params trainable")
-
-        # # CXFormer output dimension (ViT-Base: 768)
-        # self.cxformer_output_dim = 768
+        # print(f"[MultiModalEncoder] DenseNet121: {_img_trainable:,} / {_img_total:,} params trainable")
         ##########################################################################################
+        img_model = CXformer.from_pretrained("m42-health/CXformer-base", context_dim=768)
 
+        # Enable gradient checkpointing to save memory
+        img_model.gradient_checkpointing = True
+
+        self.img_encoder = apply_lora_to_cxformer(
+            img_model,
+            r=16,
+            alpha=32,
+            dropout=0.1
+        )
+        
         # Text Encoder: BioClinicalBERT
-        model_name = "emilyalsentzer/Bio_ClinicalBERT"
-        self.language_model = AutoModel.from_pretrained(model_name)
-        for param in self.language_model.parameters():
+        language_model = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
+
+        for param in language_model.parameters():
             param.requires_grad = False
 
-        _bert_unfreeze = [
-            "encoder.layer.10",
-            "encoder.layer.11",
-            "pooler",
-        ]
-        for name, param in self.language_model.named_parameters():
-            if any(name.startswith(prefix) for prefix in _bert_unfreeze):
-                param.requires_grad = True
-        _txt_trainable = sum(p.numel() for p in self.language_model.parameters() if p.requires_grad)
-        _txt_total     = sum(p.numel() for p in self.language_model.parameters())
-        print(f"[MultiModalEncoder] BioClinicalBERT: {_txt_trainable:,} / {_txt_total:,} params trainable")
-
-        # Demographic Encoder
-        num_demo_features = args.num_demo_features
-        self.demo_encoder = DemographicEncoder(
-            input_dim=num_demo_features,
-            output_dim=256,
-            dropout_rate=0.1
+        language_lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.1,
+            target_modules=["query", "key", "value"],
+            bias="none",
         )
-        print(f"[MultiModalEncoder] DemographicEncoder initialized with {num_demo_features} input features")
+
+        self.text_encoder = get_peft_model(language_model, language_lora_config)
+
+        # Clinical Prompt Tokenizer (shares same BioClinicalBERT tokenizer)
+        self.prompt_tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
 
         # TS-Centric Fusion Module
         self.ts_centric_fusion = TimeSeriesCentricCrossAttention_v4(
@@ -117,19 +83,22 @@ class MultiModalEncoder(nn.Module):
             d_model=256,
             num_heads=8,
             ts_input_dim=512,       # TS encoder output dim
-            img_input_dim=1024,     # DenseNet121 feature dim
+            img_input_dim=768,     # DenseNet121 feature dim
             txt_input_dim=768,      # BioClinicalBERT hidden size
-            cxr_dropout=0.1,
-            text_dropout=0.1,
+            disable_cxr=disable_cxr,
+            disable_txt=disable_txt,
         )
 
         # Attention Pooling
         self.attention_pooling = AttentionPooling(input_dim=256)
 
-    def forward(self, args, ts_series, cxr_data, text_data, has_cxr, has_text,
-                window_mask, seq_valid_mask, demo_features=None, time_steps=None):
+    def forward(self, args, ts_series, cxr_data, text_data, prompt_data, has_cxr, has_text,
+                window_mask, seq_valid_mask, time_steps=None):
         """
         Forward pass through all modality encoders, fusion, and attention pooling to get embedding for contrastive learning & CLassification.
+
+        Args:
+            prompt_data: dict with 'unique_prompt_texts' and 'prompt_index_tensor'
 
         Returns:
             window_embeddings: [B, W, 256] - Pooled window-level embeddings
@@ -138,7 +107,29 @@ class MultiModalEncoder(nn.Module):
         device = ts_series.device
         B, W, T, D = ts_series.shape
 
-        # Modality-specific encoding (Concept of Projection)
+        # ================ Clinical Prompt Encoding ================
+        with timer("Clinical Prompt Encoder", None):
+            unique_prompt_texts = prompt_data['unique_prompt_texts']
+            prompt_index_tensor = prompt_data['prompt_index_tensor']  # [B, W, T]
+
+            # Tokenize unique prompts
+            tokenized_prompts = self.prompt_tokenizer(
+                unique_prompt_texts,
+                padding=True,
+                truncation=True,
+                max_length=256,
+                return_tensors='pt'
+            ).to(device)
+
+            # Encode with BioClinicalBERT
+            prompt_outputs = self.text_encoder(
+                input_ids=tokenized_prompts['input_ids'],
+                attention_mask=tokenized_prompts['attention_mask']
+            )
+
+            # Extract CLS token embeddings [N_unique_prompts, 768]
+            unique_prompt_embeddings = prompt_outputs.last_hidden_state[:, 0, :]
+
         # ================ Time-series Encoding ================
         with timer("TS Encoder", None):
             ts_series_flat = ts_series.view(B * W, T, D)
@@ -164,10 +155,11 @@ class MultiModalEncoder(nn.Module):
         """
         - 같은 이미지와 텍스트가 window 형태의 데이터 입력에서는 여러 시간대에 재사용됨.
         - Forward pass 과정에서 GPU에 고유한 이미지와 텍스트만 올림으로써 최적화를 도모함.
+        - Clinical prompt context를 각 이미지의 시간적으로 정확한 context로 전달하여 referencing 가능하게 함.
         """
         if not self.disable_cxr:
             with timer("IMG Encoder", None):
-                img_tensor = torch.zeros(B, W, T, 1024, device=device, dtype=ts_embeddings.dtype) # 처음에는 모두 0으로 초기화
+                img_tensor = torch.zeros(B, W, T, 768, device=device, dtype=ts_embeddings.dtype) # CXFormer ViT-Base: 768
                 has_img = torch.zeros(B, W, T, device=device, dtype=torch.bool)
 
                 unique_images = cxr_data['unique_images']       # unique한 이미지만
@@ -175,20 +167,43 @@ class MultiModalEncoder(nn.Module):
                 pos = cxr_data['positions']                     # (batch, window, timestep)
 
                 if unique_images.numel() > 0:
-                    unique_features = self.img_encoder.features(unique_images)  # [N_unique, 1024, 7, 7]
-                    unique_features = F.adaptive_avg_pool2d(unique_features, (1, 1)).flatten(1)  # [N_unique, 1024]
+                    # Map clinical prompt context to each UNIQUE image
+                    # pos는 중복 포함 모든 위치 (1183개), unique_images는 중복 제거된 이미지 (79개)
+                    # unique_indices[i]는 i번째 위치의 이미지가 몇 번째 unique image인지를 나타냄
+
+                    # Get prompts for all positions first
+                    b_pos, w_pos, t_pos = pos[:, 0].long(), pos[:, 1].long(), pos[:, 2].long()
+                    all_prompt_indices = prompt_index_tensor[b_pos, w_pos, t_pos]  # [1183] - 모든 위치의 prompt index
+
+                    # For each unique image, get the prompt from its first occurrence
+                    # unique_indices: [1183] - 각 위치가 몇 번째 unique image인지
+                    num_unique_images = unique_images.size(0)  # 79
+                    unique_prompt_indices = torch.zeros(num_unique_images, dtype=torch.long, device=device)
+
+                    # For each unique image, find the first occurrence and use that prompt
+                    for i in range(num_unique_images):
+                        first_occurrence_mask = (unique_indices == i)
+                        first_occurrence_idx = first_occurrence_mask.nonzero(as_tuple=False)[0].item()
+                        unique_prompt_indices[i] = all_prompt_indices[first_occurrence_idx]
+
+                    # Now get context embeddings for unique images only
+                    image_context_embeddings = unique_prompt_embeddings[unique_prompt_indices]  # [79, 768]
+                    image_context_embeddings = image_context_embeddings.unsqueeze(1)  # [79, 1, 768]
+
+                    # Encode images with clinical prompt as context
+                    outputs = self.img_encoder(unique_images, context=image_context_embeddings)
+                    unique_features = outputs["x_norm_clstoken"]
                     scattered = unique_features[unique_indices]
                     scattered = scattered.to(dtype=ts_embeddings.dtype)
 
-                    b, w, t = pos[:, 0].long(), pos[:, 1].long(), pos[:, 2].long()
-                    img_tensor[b, w, t] = scattered     # 원래 위치 (b, w, t)에 이미지 임베딩 넣기
-                    has_img[b, w, t] = True             # 이미지 존재 여부 마스킹
+                    img_tensor[b_pos, w_pos, t_pos] = scattered     # 원래 위치 (b, w, t)에 이미지 임베딩 넣기
+                    has_img[b_pos, w_pos, t_pos] = True             # 이미지 존재 여부 마스킹
 
                 img_embeddings = img_tensor
 
         # Turn off Image modality (For ablation study)
         else:
-            img_embeddings = torch.zeros(B, W, T, 1024, device=device, dtype=ts_embeddings.dtype)
+            img_embeddings = torch.zeros(B, W, T, 768, device=device, dtype=ts_embeddings.dtype)
             has_img = torch.zeros(B, W, T, device=device, dtype=torch.bool)
             has_cxr = torch.zeros_like(has_cxr)
 
@@ -207,7 +222,7 @@ class MultiModalEncoder(nn.Module):
                 pos = text_data['positions']
 
                 if unique_input_ids.numel() > 0:
-                    outputs = self.language_model(unique_input_ids, attention_mask=unique_attention_mask)
+                    outputs = self.text_encoder(unique_input_ids, attention_mask=unique_attention_mask)
                     cls_embeddings = outputs.last_hidden_state[:, 0, :]  # [N_unique, 768]
                     scattered = cls_embeddings[unique_indices]
                     scattered = scattered.to(dtype=ts_embeddings.dtype)
@@ -229,7 +244,7 @@ class MultiModalEncoder(nn.Module):
             """
             Multi-modal Embeddings
             ts_embeddings: [B, W, T, 512]
-            img_embeddings: [B, W, T, 1024] - sparse
+            img_embeddings: [B, W, T, 768] - sparse
             text_embeddings: [B, W, T, 768] - sparse
             """
             BW = B * W
@@ -237,7 +252,7 @@ class MultiModalEncoder(nn.Module):
             seq_mask_flat = seq_valid_mask.reshape(BW, T).float()       # 실제 데이터가 들어있는 time step을 뽑아냄.
             ts_flat_masked = ts_flat * seq_mask_flat.unsqueeze(-1)
 
-            img_flat = img_embeddings.reshape(BW, T, 1024)
+            img_flat = img_embeddings.reshape(BW, T, 768)
             txt_flat = text_embeddings.reshape(BW, T, 768)
 
             has_img_flat = has_img.reshape(BW, T)
@@ -271,7 +286,7 @@ class MultiModalEncoder(nn.Module):
                 # MultiModal Fusion
                 updated_latent, seg_valid_batch = self.ts_centric_fusion(
                     ts_embeddings=ts_kv,                        # [Nwin, T, 512]
-                    img_embeddings=img_kv,                      # [Nwin, T, 1024]
+                    img_embeddings=img_kv,                      # [Nwin, T, 768]
                     text_embeddings=txt_kv,                     # [Nwin, T, 768]
                     time_indices=time_idx,                      # [Nwin, T] - 시간 정보
                     img_key_padding_mask=img_pad,               # [Nwin, T] - 이미지 없는 곳 표시
@@ -297,28 +312,6 @@ class MultiModalEncoder(nn.Module):
         valid_seg_valid = seg_valid_flat[window_valid_mask]     # [Nwin, L]
         pooled_emb = self.attention_pooling(valid_fused, seg_valid_mask=valid_seg_valid) # 유효한 window만 attention pooling에 사용함.
 
-        # ================ Demographic Embedding Integration ================
-        # Add patient-level demographic information to window embeddings
-        if demo_features is not None:
-            demo_emb = self.demo_encoder(demo_features)  
-            demo_emb_expanded = demo_emb.unsqueeze(1).expand(-1, W, -1)
-            demo_emb_flat = demo_emb_expanded.reshape(BW, 256)
-            demo_emb_valid = demo_emb_flat[window_valid_mask]
-
-            # Residual addition
-            before_add = pooled_emb.clone()
-            pooled_emb = pooled_emb + demo_emb_valid
-
-            ######################################################################
-            # # Analyze demographic influence 
-            # if torch.rand(1).item() < 0.01:
-            #     demo_l2 = torch.norm(demo_emb_valid, p=2, dim=1).mean().item()
-            #     pooled_l2_before = torch.norm(before_add, p=2, dim=1).mean().item()
-            #     pooled_l2_after = torch.norm(pooled_emb, p=2, dim=1).mean().item()
-            #     relative_change = (pooled_l2_after - pooled_l2_before) / (pooled_l2_before + 1e-8) * 100
-            #     print(f"[Demo Influence] L2 norm - Demo: {demo_l2:.4f} | Pooled Before: {pooled_l2_before:.4f} | After: {pooled_l2_after:.4f} | Change: {relative_change:.2f}%")
-            ###################################################################### 
-
         # [B, W, 256]으로 복원함. (배치 간 Shape 맞춰주기)
         window_embeddings_flat = torch.zeros(BW, 256, device=device, dtype=pooled_emb.dtype)
         window_embeddings_flat[window_valid_mask] = pooled_emb
@@ -327,10 +320,7 @@ class MultiModalEncoder(nn.Module):
         return window_embeddings, window_mask
 
 
-##################################################################################################
-# Stage 1: Representation Learning Model
-##################################################################################################
-class MultiModalContrastiveModel(nn.Module):
+class MultiModalMultiTaskModel(nn.Module):
     def __init__(self, encoder):
         super().__init__()
 
@@ -342,16 +332,16 @@ class MultiModalContrastiveModel(nn.Module):
         # Hierarchical classifier for subtype classification
         self.subtype_classifier = nn.Linear(256, 2)  # [B, W, 256] → [B, W, num_subtypes]
 
-    def forward(self, args, ts_series, cxr_data, text_data, has_cxr, has_text,
-            window_mask, seq_valid_mask, demo_features=None, time_steps=None,
+    def forward(self, args, ts_series, cxr_data, text_data, prompt_data, has_cxr, has_text,
+            window_mask, seq_valid_mask, time_steps=None,
         ):
 
         B, W = window_mask.shape
 
         # Encoder
         window_embeddings, _ = self.encoder(
-            args, ts_series, cxr_data, text_data, has_cxr, has_text,
-            window_mask, seq_valid_mask, demo_features, time_steps
+            args, ts_series, cxr_data, text_data, prompt_data, has_cxr, has_text,
+            window_mask, seq_valid_mask, time_steps
         )
 
         # Binary logits for edema detection
@@ -384,72 +374,6 @@ class MultiModalContrastiveModel(nn.Module):
             'window_time_indices': window_time_indices_flat,    # [Nwin]
             'batch_indices': batch_indices_flat,                # [Nwin]
         }
-
-
-##################################################################################################
-# Stage 2: Classification Model
-##################################################################################################
-
-class MultiModalClassificationModel(nn.Module):
-    """
-    Stage 2 Model: Pretrained Encoder + Linear Classifier
-
-    - Used for classification with cross-entropy loss.
-    - Freeze the encoder to perform linear probing, or apply cross-entropy-based fine-tuning.
-
-    Architecture:
-        Input → Encoder (frozen/fine-tuned) → [B, W, 256]
-              → Linear Classifier → [B, W, num_classes]
-              → CE Loss
-
-    Returns:
-        - window_embeddings: [B, W, 256] Pooled embeddings
-        - logits: [B, W, num_classes] Classification logits
-    """
-
-    def __init__(self, encoder, args, freeze_encoder=False):
-        super().__init__()
-
-        # Pretrained encoder from Stage 1
-        self.encoder = encoder
-
-        if freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-            print("[MultiModalClassificationModel] 🧊 Encoder frozen (Linear probing mode)")
-        else:
-            print("[MultiModalClassificationModel] 🔥 Encoder trainable (Fine-tuning mode)")
-
-        # Linear classifier
-        self.classifier = SingleClassifier(input_dim=256, num_classes=args.num_classes)
-        for param in self.classifier.parameters():
-            param.requires_grad = True # Classifier는 두 mode에서 모두 학습 대상임.
-
-        print(f"[MultiModalClassificationModel] ✅ Stage 2 model initialized")
-        print(f"   - Encoder frozen: {freeze_encoder}")
-
-    def forward(self, args, ts_series, cxr_data, text_data, has_cxr, has_text,
-                window_mask, seq_valid_mask, demo_features=None, time_steps=None):
-        """
-        Forward pass for Stage 2 classification.
-
-        Flow:
-            1. Encoder → [B, W, 256]
-            2. Linear Classifier → [B, W, num_classes]
-
-        Returns:
-            window_embeddings: [B, W, 256] - Pooled embeddings
-            logits: [B, W, num_classes] - Classification logits
-        """
-        window_embeddings, _ = self.encoder(
-            args, ts_series, cxr_data, text_data, has_cxr, has_text,
-            window_mask, seq_valid_mask, demo_features, time_steps
-        )
-
-        # ================ Classification ================
-        logits = self.classifier(window_embeddings)  # [B, W, num_classes]
-
-        return window_embeddings, logits
 
 
 class AttentionPooling(nn.Module):
@@ -519,16 +443,185 @@ def build_hard_segments(T, L):
     return segments
 
 
+# class TimeSeriesCentricCrossAttention_v5(nn.Module):
+#     def __init__(self, args, d_model=256, num_heads=8,
+#                 ts_input_dim=512, img_input_dim=768, txt_input_dim=768,
+#                 cxr_dropout=0.1, text_dropout=0.1,
+#                 disable_cxr=False, disable_txt=False
+#         ):
+#         super().__init__()
+#         self.d_model = d_model                      # latent embedding dimension
+#         self.num_heads = num_heads                  # Multi-head attention head 개수
+#         self.num_latents = args.num_latents         # Latent array query 개수
+#         self.disable_cxr = disable_cxr
+#         self.disable_txt = disable_txt
+
+#         # Latent embeddings
+#         self.latent_init = nn.Parameter(torch.empty(1, self.num_latents, d_model))
+#         nn.init.uniform_(self.latent_init, -0.02, 0.02)
+
+#         # Cross-attention modules with modality-specific input dimensions
+#         self.ts_cross_attn = TemporalMultiheadAttention_v2(
+#             d_model, num_heads, key_input_dim=ts_input_dim,
+#         )
+#         self.img_cross_attn = TemporalMultiheadAttention_v2(
+#             d_model, num_heads, key_input_dim=img_input_dim,
+#         )
+#         self.text_cross_attn = TemporalMultiheadAttention_v2(
+#             d_model, num_heads, key_input_dim=txt_input_dim,
+#         )
+
+#         self.ctx_cross_attn = TemporalMultiheadAttention_v2(
+#             d_model, num_heads, key_input_dim=768  # BioClinicalBERT dim
+#         )
+
+#         # latent 간 정보 교환
+#         self.tsmixer = TSMixerEncoder(
+#             d_model=d_model,
+#             max_seq_len=self.num_latents,
+#             num_layers=2,
+#             # dropout=dropout
+#         )
+
+#         # Modality-specific Time2Vec for time encoding - 이미지와 텍스트에 시간 정보를 줘서 어느 시점에 촬영했는지에 대한 정보를 부여함.
+#         self.time2vec_img = Time2Vec(img_input_dim) 
+#         self.time2vec_txt = Time2Vec(txt_input_dim) 
+
+#         self.ln_time_img = nn.LayerNorm(img_input_dim)
+#         self.ln_time_txt = nn.LayerNorm(txt_input_dim)
+#         self.ln_latent = nn.LayerNorm(d_model)
+
+#         self.debug_ts_attn = None
+#         # self.residual_dropout = nn.Dropout(dropout)
+
+#     def forward(
+#             self, ctx_embeddings, ts_embeddings, img_embeddings=None, text_embeddings=None, time_indices=None,
+#             img_key_padding_mask=None, text_key_padding_mask=None, seq_valid_mask=None,
+#             num_iterations=2
+#         ):
+
+#         B, T, _ = ts_embeddings.shape
+#         L = self.num_latents
+
+#         # ================ Time emb add to Img, Text modality after projection ================
+#         time_emb_img_raw = self.time2vec_img(time_indices.unsqueeze(-1))  # [B, T, 768]
+#         time_emb_img = self.ln_time_img(time_emb_img_raw)
+
+#         time_emb_txt_raw = self.time2vec_txt(time_indices.unsqueeze(-1))  # [B, T, 768]
+#         time_emb_txt = self.ln_time_txt(time_emb_txt_raw)
+
+#         latent = self.latent_init.expand(B, -1, -1)
+
+#         # 유효하지 않은 time step 마스킹.
+#         ts_key_padding_mask = None
+#         if seq_valid_mask is not None:
+#             ts_key_padding_mask = ~seq_valid_mask.bool()
+
+#         # T개 time step을 L개 구간으로 나눔.
+#         segments = build_hard_segments(T, L)
+
+#         # 각 segment가 유효한 데이터를 포함하는지 확인함.
+#         seg_valid = torch.zeros(B, L, device=ts_embeddings.device, dtype=torch.bool)
+#         if seq_valid_mask is not None:
+#             seq_mask_bool = seq_valid_mask.bool()
+#             for i, (s, e) in enumerate(segments):
+#                 seg_valid[:, i] = seq_mask_bool[:, s:e].any(dim=1)
+#         else:
+#             seg_valid[:, :] = True
+
+#         # ================ Iterative Fusion ================
+#         for iter in range(num_iterations):
+#             self.ts_cross_attn.save_attn = (iter == 0) # 첫 iteration만 attention 저장함. (첫 에포크 첫 배치 시각화용)
+
+#             ctx_out = self.ctx_cross_attn(
+#                 query=latent,
+#                 key=ctx_embeddings,
+#                 value=ctx_embeddings
+#             )
+#             latent = latent + ctx_out
+
+#             # ==================== TS -> Latent ====================
+#             latent_updates = []
+#             all_attention_weights = []
+
+#             # 각 segment 별 독립적으로 cross-attention 수행함.
+#             for i, (s, e) in enumerate(segments):
+#                 q_i = latent[:, i:i+1, :] # [B, 1, D] - i번째 latent query
+#                 k_i = ts_embeddings[:, s:e, :] # [B, seg, D] - i번째 구간의 TS
+#                 v_i = k_i
+
+#                 kp_i = None
+#                 if ts_key_padding_mask is not None:
+#                     kp_i = ts_key_padding_mask[:, s:e]  # [B, seg] - padding mask
+
+#                 out_i = self.ts_cross_attn(
+#                     query=q_i,
+#                     key=k_i,
+#                     value=v_i,
+#                     key_padding_mask=kp_i
+#                 )
+
+#                 # For visualization
+#                 if self.ts_cross_attn.last_attn is not None:
+#                     attn = self.ts_cross_attn.last_attn.squeeze(1)  # [B, 1, seg] -> [B, seg]
+#                     attn_full = torch.zeros(B, T, device=attn.device)
+#                     attn_full[:, s:e] = attn
+#                     all_attention_weights.append(attn_full)
+
+#                 latent_updates.append(out_i)
+
+#             ts_out = torch.cat(latent_updates, dim=1) # [B, L, 256]
+#             latent = latent + ts_out
+#             # latent = latent + self.residual_dropout(ts_out)
+
+#             if len(all_attention_weights) > 0: # For debugging
+#                 self.debug_ts_attn = torch.stack(all_attention_weights, dim=1)
+
+#             # ==================== IMG -> Latent ====================
+#             if not self.disable_cxr and img_embeddings is not None and img_embeddings.size(1) > 0:
+#                 img_with_time = img_embeddings + time_emb_img
+
+#                 img_out = self.img_cross_attn(
+#                     query=latent,
+#                     key=img_with_time,
+#                     value=img_with_time,
+#                     key_padding_mask=img_key_padding_mask
+#                 )
+#                 latent = latent + img_out
+#                 # latent = latent + self.residual_dropout(img_out)
+
+#             # ==================== Text -> Latent ====================
+#             if not self.disable_txt and text_embeddings is not None and text_embeddings.size(1) > 0:
+#                 text_with_time = text_embeddings + time_emb_txt
+
+#                 text_out = self.text_cross_attn(
+#                     query=latent,
+#                     key=text_with_time,
+#                     value=text_with_time,
+#                     key_padding_mask=text_key_padding_mask
+#                 )
+#                 latent = latent + text_out
+#                 # latent = latent + self.residual_dropout(text_out)
+
+#             # ==================== Temporal Mixing ====================
+#             seg_padding_mask = ~seg_valid
+#             latent = self.tsmixer(latent, src_key_padding_mask=seg_padding_mask) # [B, L, 256]
+#             latent = self.ln_latent(latent)
+
+#         return latent, seg_valid
+
+
 class TimeSeriesCentricCrossAttention_v4(nn.Module):
     def __init__(self, args, d_model=256, num_heads=8,
-                ts_input_dim=512, img_input_dim=1024, txt_input_dim=768,
-                cxr_dropout=0.1, text_dropout=0.1
+                ts_input_dim=512, img_input_dim=768, txt_input_dim=768,
+                disable_cxr=False, disable_txt=False
         ):
         super().__init__()
         self.d_model = d_model                      # latent embedding dimension
         self.num_heads = num_heads                  # Multi-head attention head 개수
         self.num_latents = args.num_latents         # Latent array query 개수
-        # dropout = max(cxr_dropout, text_dropout)    # 현재는 dropout 일괄 적용
+        self.disable_cxr = disable_cxr
+        self.disable_txt = disable_txt
 
         # Latent embeddings
         self.latent_init = nn.Parameter(torch.empty(1, self.num_latents, d_model))
@@ -536,35 +629,31 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
 
         # Cross-attention modules with modality-specific input dimensions
         self.ts_cross_attn = TemporalMultiheadAttention_v2(
-            d_model, num_heads, key_input_dim=ts_input_dim,
+            d_model, num_heads, key_input_dim=ts_input_dim, attn_dropout=0.1
         )
         self.img_cross_attn = TemporalMultiheadAttention_v2(
-            d_model, num_heads, key_input_dim=img_input_dim,
+            d_model, num_heads, key_input_dim=img_input_dim, attn_dropout=0.1
         )
         self.text_cross_attn = TemporalMultiheadAttention_v2(
-            d_model, num_heads, key_input_dim=txt_input_dim,
+            d_model, num_heads, key_input_dim=txt_input_dim, attn_dropout=0.1
         )
 
         # latent 간 정보 교환
         self.tsmixer = TSMixerEncoder(
             d_model=d_model,
             max_seq_len=self.num_latents,
-            num_layers=2,
-            # dropout=dropout
+            num_layers=2
         )
 
-        # Modality-specific Time2Vec for time encoding (시계열에는 넣어야 할지 말지 확정하지 못함)
-        self.time2vec_ts = Time2Vec(ts_input_dim)
+        # Modality-specific Time2Vec for time encoding
         self.time2vec_img = Time2Vec(img_input_dim) 
         self.time2vec_txt = Time2Vec(txt_input_dim) 
 
-        self.ln_time_ts = nn.LayerNorm(ts_input_dim)
         self.ln_time_img = nn.LayerNorm(img_input_dim)
         self.ln_time_txt = nn.LayerNorm(txt_input_dim)
-        # self.ln_latent = nn.LayerNorm(d_model)
+        self.ln_latent = nn.LayerNorm(d_model)
 
         self.debug_ts_attn = None
-        # self.residual_dropout = nn.Dropout(dropout)
 
     def forward(
             self, ts_embeddings, img_embeddings=None, text_embeddings=None, time_indices=None,
@@ -575,11 +664,8 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
         B, T, _ = ts_embeddings.shape
         L = self.num_latents
 
-        # ================ Time emb add to TS, img, Text modality after projection ================
-        time_emb_ts_raw = self.time2vec_ts(time_indices.unsqueeze(-1))
-        time_emb_ts = self.ln_time_ts(time_emb_ts_raw)
-
-        time_emb_img_raw = self.time2vec_img(time_indices.unsqueeze(-1))  # [B, T, 1024]
+        # ================ Time emb add to Img, Text modality after projection ================
+        time_emb_img_raw = self.time2vec_img(time_indices.unsqueeze(-1))  # [B, T, 768]
         time_emb_img = self.ln_time_img(time_emb_img_raw)
 
         time_emb_txt_raw = self.time2vec_txt(time_indices.unsqueeze(-1))  # [B, T, 768]
@@ -612,13 +698,10 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
             latent_updates = []
             all_attention_weights = []
 
-            ts_with_time = ts_embeddings + time_emb_ts
-            # ts_with_time = ts_embeddings # time emb 사용하지 않는 경우
-
             # 각 segment 별 독립적으로 cross-attention 수행함.
             for i, (s, e) in enumerate(segments):
                 q_i = latent[:, i:i+1, :] # [B, 1, D] - i번째 latent query
-                k_i = ts_with_time[:, s:e, :] # [B, seg, D] - i번째 구간의 TS
+                k_i = ts_embeddings[:, s:e, :] # [B, seg, D] - i번째 구간의 TS
                 v_i = k_i
 
                 kp_i = None
@@ -643,15 +726,13 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
 
             ts_out = torch.cat(latent_updates, dim=1) # [B, L, 256]
             latent = latent + ts_out
-            # latent = latent + self.residual_dropout(ts_out)
 
             if len(all_attention_weights) > 0: # For debugging
                 self.debug_ts_attn = torch.stack(all_attention_weights, dim=1)
 
             # ==================== IMG -> Latent ====================
-            if img_embeddings is not None and img_embeddings.size(1) > 0:
+            if not self.disable_cxr and img_embeddings is not None and img_embeddings.size(1) > 0:
                 img_with_time = img_embeddings + time_emb_img
-                # img_with_time = img_embeddings # time emb 사용하지 않는 경우
 
                 img_out = self.img_cross_attn(
                     query=latent,
@@ -660,12 +741,10 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
                     key_padding_mask=img_key_padding_mask
                 )
                 latent = latent + img_out
-                # latent = latent + self.residual_dropout(img_out)
 
             # ==================== Text -> Latent ====================
-            if text_embeddings is not None and text_embeddings.size(1) > 0:
+            if not self.disable_txt and text_embeddings is not None and text_embeddings.size(1) > 0:
                 text_with_time = text_embeddings + time_emb_txt
-                # text_with_time = text_embeddings # time emb 사용하지 않는 경우
 
                 text_out = self.text_cross_attn(
                     query=latent,
@@ -674,12 +753,11 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
                     key_padding_mask=text_key_padding_mask
                 )
                 latent = latent + text_out
-                # latent = latent + self.residual_dropout(text_out)
 
-            # Temporal Mixing
+            # ==================== Temporal Mixing ====================
             seg_padding_mask = ~seg_valid
             latent = self.tsmixer(latent, src_key_padding_mask=seg_padding_mask) # [B, L, 256]
-            # latent = self.ln_latent(latent)
+            latent = self.ln_latent(latent)
 
         return latent, seg_valid
 
@@ -689,11 +767,12 @@ class TemporalMultiheadAttention_v2(nn.Module):
     Modality-speicifc input을 받아 projection 후 MHA를 수행함.
     Latent Query는 256차원으로 고정함.
     """
-    def __init__(self, d_model, num_heads, key_input_dim=None, value_input_dim=None):
+    def __init__(self, d_model, num_heads, key_input_dim=None, value_input_dim=None, attn_dropout=0.1):
         super().__init__()
         self.d_model = d_model                          # Query dim
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
+        self.attn_dropout = attn_dropout                # Attention dropout
         self.q_proj = nn.Linear(d_model, d_model)       # Query Projection
 
         k_in = key_input_dim if key_input_dim is not None else d_model
@@ -748,6 +827,7 @@ class TemporalMultiheadAttention_v2(nn.Module):
         out = F.scaled_dot_product_attention(
             Q, K, V,
             attn_mask=attn_mask,
+            dropout_p=self.attn_dropout if self.training else 0.0,
             is_causal=False
         )
 
@@ -755,85 +835,6 @@ class TemporalMultiheadAttention_v2(nn.Module):
         out = out.transpose(1, 2).reshape(B, T_q, D)
         out = self.out_proj(out)
         return out
-
-
-class AugmentationModule(nn.Module):
-    def __init__(self, noise_type='gaussian', epsilon=0.1, num_views=2):
-        super().__init__()
-        self.noise_type = noise_type
-        self.epsilon = epsilon
-        self.num_views = num_views
-
-        valid_noise_types = ['gaussian', 'uniform', 'poisson', 'laplace']
-        if noise_type not in valid_noise_types:
-            raise ValueError(f"증강 방법 선택 과정에서 오타 발생함.")
-        print(f"[ModalityAugmentation] Initialized with noise_type={noise_type}, epsilon={epsilon}, num_views={num_views}")
-
-    def _sample_noise(self, shape, device):
-        # [N, 256] → [N, 2, 256]
-        if self.noise_type == 'gaussian':
-            omega = torch.randn(shape, device=device)
-
-        elif self.noise_type == 'uniform':
-            omega = 2 * torch.rand(shape, device=device) - 1
-
-        elif self.noise_type == 'poisson':
-            omega = torch.poisson(torch.ones(shape, device=device)) - 1.0
-
-        elif self.noise_type == 'laplace':
-            u = torch.rand(shape, device=device) - 0.5
-            omega = torch.sign(u) * torch.log(1 - 2 * u.abs())
-        return omega
-
-    def forward(self, embeddings):
-        """
-        1. Modality embedding에 증강을 적용할 것이냐. - 환자의 원래 상태를 가장 잘 보존할 것이기 때문에 적절한 방법론일 것이라고 고려 중임.
-        2. Latent level에 증강을 적용할 것이냐. - 이 경우 attention pooling 전에 적용해야 하기 때문에 모델 구조 변경 필요함.
-        3. Window level에 증강을 적용할 것이냐. - window level에 적용하는 것이 가장 간단해서 현재 시범 적용 중임.
-        """
-        device = embeddings.device
-
-        # Latent level augmentation
-        if embeddings.dim() == 3:
-            N, L, D = embeddings.shape
-
-            embeddings_flat = embeddings.reshape(N * L, D) # [N, L, D] → [N*L, D]
-            embeddings_norm = F.normalize(embeddings_flat, p=2, dim=-1)
-
-            # Generate independent augmented views
-            augmented_list = []
-            for _ in range(self.num_views):
-                omega = self._sample_noise(embeddings_norm.shape, device)
-                delta = omega * torch.sign(embeddings_norm)
-                delta_norm = F.normalize(delta, p=2, dim=-1) * self.epsilon
-                z_aug = embeddings_norm + delta_norm
-                z_aug = F.normalize(z_aug, p=2, dim=-1)
-                augmented_list.append(z_aug)
-
-            augmented_views = torch.stack(augmented_list, dim=1)  # [N*L, V, D]
-            augmented_views = augmented_views.reshape(N, L, self.num_views, D)  # [N, L, V, D]
-
-        # Window level augmentation
-        elif embeddings.dim() == 2:
-            N, D = embeddings.shape
-
-            embeddings_norm = F.normalize(embeddings, p=2, dim=-1)  # [N, D]
-
-            augmented_list = []
-            for _ in range(self.num_views):
-                omega = self._sample_noise(embeddings_norm.shape, device)  # [N, D]
-                delta = omega * torch.sign(embeddings_norm)
-                delta_norm = F.normalize(delta, p=2, dim=-1) * self.epsilon
-                z_aug = embeddings_norm + delta_norm
-                z_aug = F.normalize(z_aug, p=2, dim=-1)
-                augmented_list.append(z_aug)
-
-            augmented_views = torch.stack(augmented_list, dim=1)  # [N, V, D]
-
-        else:
-            raise ValueError(f"Expected 2D or 3D input, but embedding shape was {embeddings.shape}.")
-
-        return augmented_views
 
 
 class Time2Vec(nn.Module):

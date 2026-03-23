@@ -26,17 +26,17 @@ from training.run import parse_arguments
 from training.data_processing import get_dataloaders
 from training.engine import train_batch
 from training.evaluator import test, validate_multitask
-from models.main_architecture import MultiModalEncoder, MultiModalContrastiveModel, MultiModalClassificationModel
+from models.main_architecture import MultiModalEncoder, MultiModalMultiTaskModel
 from loss.losses import MultiModalLoss
 from loss.target_metrics import visualize_target_supcon
-from utils import stage2_Earlystopping, timer, plot_latent_time_attention, Earlystopping, stage1_earlystopping
+from utils.utils import stage2_Earlystopping, timer, plot_latent_time_attention, Earlystopping, stage1_earlystopping
 from analysis.umap_multitask import plot_multitask_umap
 
 
 ##################################################################################################
 # Model Training Control Center
 ##################################################################################################
-def train_multimodal_model(ts_df, img_df, text_df, demo_df, args):
+def train_multimodal_model(ts_df, img_df, text_df, clinical_prompt_df, args):
     if args.stage1_only:
         print("🔀 Running Stage 1 Only (Contrastive Pretraining)")
         return train_representation(ts_df, img_df, text_df, demo_df, args)
@@ -51,43 +51,43 @@ def train_multimodal_model(ts_df, img_df, text_df, demo_df, args):
 
     else:
         print("🔀 Using Single-Stage Training Strategy")
-        return train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args)
+        return train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_df, args)
 
 
-def train_two_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
-    mode = "Linear Probing" if args.freeze_encoder_stage2 else "Fine-tuning"
+# def train_two_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
+#     mode = "Linear Probing" if args.freeze_encoder_stage2 else "Fine-tuning"
 
-    print("\n" + "="*80)
-    print("🚀 TWO-STAGE TRAINING PROCESS")
-    print("="*80)
-    print(f"📋 Stage 1: Representation Pretraining ({args.stage1_epochs} epochs)")
-    print(f"📋 Stage 2: Classification {mode} ({args.stage2_epochs} epochs)")
-    print("="*80 + "\n")
+#     print("\n" + "="*80)
+#     print("🚀 TWO-STAGE TRAINING PROCESS")
+#     print("="*80)
+#     print(f"📋 Stage 1: Representation Pretraining ({args.stage1_epochs} epochs)")
+#     print(f"📋 Stage 2: Classification {mode} ({args.stage2_epochs} epochs)")
+#     print("="*80 + "\n")
 
-    # Stage 1: Representation Pretraining
-    pretrained_encoder = train_representation(ts_df, img_df, text_df, demo_df, args)
+#     # Stage 1: Representation Pretraining
+#     pretrained_encoder = train_representation(ts_df, img_df, text_df, demo_df, args)
 
-    # Stage 2: Classification Fine-tuning (pass pretrained encoder directly)
-    results = train_classifier_with_ce(ts_df, img_df, text_df, demo_df, args, pretrained_encoder=pretrained_encoder)
+#     # Stage 2: Classification Fine-tuning (pass pretrained encoder directly)
+#     results = train_classifier_with_ce(ts_df, img_df, text_df, demo_df, args, pretrained_encoder=pretrained_encoder)
 
-    print("\n" + "="*80)
-    print("✅ TWO-STAGE TRAINING COMPLETED!")
-    print("="*80)
-    print(f"🏆 Final Results:")
-    print(f"   Mode: {mode}")
-    print(f"   Val AUROC: {results['val_auroc']:.4f}")
-    print(f"   Val AUPRC: {results['val_auprc']:.4f}")
-    print(f"   Test AUROC: {results['test_auroc']:.4f}")
-    print(f"   Test AUPRC: {results['test_auprc']:.4f}")
-    print("="*80 + "\n")
+#     print("\n" + "="*80)
+#     print("✅ TWO-STAGE TRAINING COMPLETED!")
+#     print("="*80)
+#     print(f"🏆 Final Results:")
+#     print(f"   Mode: {mode}")
+#     print(f"   Val AUROC: {results['val_auroc']:.4f}")
+#     print(f"   Val AUPRC: {results['val_auprc']:.4f}")
+#     print(f"   Test AUROC: {results['test_auroc']:.4f}")
+#     print(f"   Test AUPRC: {results['test_auprc']:.4f}")
+#     print("="*80 + "\n")
 
-    return results
+#     return results
 
 
 ##################################################################################################
 # # Single-Stage Training Function
 ##################################################################################################
-def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
+def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_df, args):
     print("\n" + "="*80)
     print("SINGLE-STAGE MULTI-TASK TRAINING")
     print("="*80)
@@ -111,6 +111,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
     )
     accelerator.replace_sampler = False
     device = accelerator.device
+    wandb_on = args.wandb_on
 
     if accelerator.is_main_process:
         print(f"\n{'='*60}")
@@ -120,89 +121,190 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
         print(f"   Mixed Precision: bf16")
         print(f"{'='*60}\n")
 
-        wandb.init(
-            project=args.project_name,
-            name=args.wandb_run_name,
-            config=vars(args),
-            tags=["single_stage", "multi_task"]
-        )
+        if wandb_on:
+            wandb.init(
+                project=args.project_name,
+                name=args.wandb_run_name,
+                config=vars(args),
+                tags=["single_stage", "multi_task"]
+            )
 
     # DataLoader
     with timer("Dataset Loading"):
-        train_loader, val_loader, test_loader, train_sampler = get_dataloaders(
-            ts_df, img_df, text_df, demo_df, args, accelerator
-        )
+        train_loader, val_loader, test_loader, train_sampler = get_dataloaders(ts_df, img_df, text_df, clinical_prompt_df, args, accelerator)
 
     encoder = MultiModalEncoder(args, disable_cxr=args.disable_cxr, disable_txt=args.disable_txt).to(device)
-    model = MultiModalContrastiveModel(encoder).to(device)
+    model = MultiModalMultiTaskModel(encoder).to(device)
     accelerator.print(f"[모달리티 상태] CXR 사용: {not model.encoder.disable_cxr}, TEXT 사용: {not model.encoder.disable_txt}")
 
+    def count_params(module):
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return total, trainable
+
+    print(f"\n{'='*80}")
+    print(f"📊 DETAILED MODEL PARAMETER BREAKDOWN")
+    print(f"{'='*80}")
+
+    # 1. Encoder Components
+    print(f"\n🔹 [1] Modality-Specific Encoders")
+    ts_total, ts_trainable = count_params(model.encoder.ts_encoder)
+    print(f"   Time-Series Encoder:")
+    print(f"      Total: {ts_total:>12,} | Trainable: {ts_trainable:>12,} ({100*ts_trainable/ts_total:.1f}%)")
+
+    img_total, img_trainable = count_params(model.encoder.img_encoder)
+    print(f"   Image Encoder:")
+    print(f"      Total: {img_total:>12,} | Trainable: {img_trainable:>12,} ({100*img_trainable/img_total:.1f}%)")
+
+    txt_total, txt_trainable = count_params(model.encoder.text_encoder)
+    print(f"   Text Encoder:")
+    print(f"      Total: {txt_total:>12,} | Trainable: {txt_trainable:>12,} ({100*txt_trainable/txt_total:.1f}%)")
+
+    # 2. Fusion Module
+    print(f"\n🔹 [2] Multimodal Fusion Module")
+    fusion_total, fusion_trainable = count_params(model.encoder.ts_centric_fusion)
+    print(f"   TS-Centric Cross-Attention:")
+    print(f"      Total: {fusion_total:>12,} | Trainable: {fusion_trainable:>12,} ({100*fusion_trainable/fusion_total:.1f}%)")
+
+    # Detailed fusion components
+    latent_params = model.encoder.ts_centric_fusion.latent_init.numel()
+    ts_ca_total, ts_ca_trainable = count_params(model.encoder.ts_centric_fusion.ts_cross_attn)
+    img_ca_total, img_ca_trainable = count_params(model.encoder.ts_centric_fusion.img_cross_attn)
+    txt_ca_total, txt_ca_trainable = count_params(model.encoder.ts_centric_fusion.text_cross_attn)
+    tsmixer_total, tsmixer_trainable = count_params(model.encoder.ts_centric_fusion.tsmixer)
+
+    print(f"      ├─ Latent Array Init:     {latent_params:>12,}")
+    print(f"      ├─ TS Cross-Attn:         {ts_ca_trainable:>12,}")
+    print(f"      ├─ IMG Cross-Attn:        {img_ca_trainable:>12,}")
+    print(f"      ├─ TXT Cross-Attn:        {txt_ca_trainable:>12,}")
+    print(f"      └─ TSMixer:               {tsmixer_trainable:>12,}")
+
+    # 3. Attention Pooling
+    print(f"\n🔹 [3] Attention Pooling")
+    pool_total, pool_trainable = count_params(model.encoder.attention_pooling)
+    print(f"   Attention Pooling Layer:")
+    print(f"      Total: {pool_total:>12,} | Trainable: {pool_trainable:>12,} ({100*pool_trainable/pool_total:.1f}%)")
+
+    # 4. Task-Specific Heads
+    print(f"\n🔹 [4] Task-Specific Prediction Heads")
+    edema_total, edema_trainable = count_params(model.edema_classifier)
+    print(f"   Binary Classifier (Edema Detection):")
+    print(f"      Total: {edema_total:>12,} | Trainable: {edema_trainable:>12,} ({100*edema_trainable/edema_total:.1f}%)")
+
+    subtype_total, subtype_trainable = count_params(model.subtype_classifier)
+    print(f"   Subtype Classifier (Cardiogenic/Non-cardiogenic):")
+    print(f"      Total: {subtype_total:>12,} | Trainable: {subtype_trainable:>12,} ({100*subtype_trainable/subtype_total:.1f}%)")
+
+    # 5. Overall Summary
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    print(f"\n📊 [Model Parameters]")
-    print(f"   Total: {total_params:,}")
-    print(f"   Trainable: {trainable_params:,}")
-    print(f"   Frozen: {total_params - trainable_params:,}")
-    print(f"   Trainable Ratio: {100 * trainable_params / total_params:.1f}%")
+    print(f"\n{'─'*80}")
+    print(f"🏆 OVERALL MODEL STATISTICS")
+    print(f"{'─'*80}")
+    print(f"   Total Parameters:       {total_params:>15,}")
+    print(f"   Trainable Parameters:   {trainable_params:>15,}")
+    print(f"   Frozen Parameters:      {total_params - trainable_params:>15,}")
+    print(f"   Trainable Ratio:        {100 * trainable_params / total_params:>14.1f}%")
+    print(f"{'='*80}\n")
 
     # Loss Module
     loss_module = MultiModalLoss(args, class_weights=None)
 
-    # ==================== Optimizer (Differential Learning Rate) ====================
-    encoder_params = [p for n, p in model.named_parameters()
-                    if 'edema_classifier' not in n and 'subtype_classifier' not in n and p.requires_grad]
-    edema_classifier_params = list(model.edema_classifier.parameters())
-    subtype_classifier_params = list(model.subtype_classifier.parameters())
+    # ==================== Optimizer (5-Tier Differential Learning Rate) ====================
+    base_lr = args.single_learning_rate
+
+    lora_params, cross_attn_params, core_params = [], [], []
+
+    # Edema classifier
+    edema_params = list(model.edema_classifier.parameters())
+
+    # Subtype classifier
+    subtype_params = list(model.subtype_classifier.parameters())
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Skip classifiers
+        if 'subtype_classifier' in name or 'edema_classifier' in name:
+            continue
+
+        # Cross-Attention parameters (랜덤 초기화, 높은 lr 필요)
+        if 'cross_attn' in name or 'norm_cross' in name or 'ls_cross' in name:
+            cross_attn_params.append(param)
+
+        # LoRA parameters (CXFormer + BioClinicalBERT)
+        elif ('lora_A' in name or 'lora_B' in name):
+            lora_params.append(param)
+
+        # TS Encoder, Fusion, Pooling
+        else:
+            core_params.append(param)
 
     param_groups = [
+        # LoRA (Fine-tuning pretrained)
         {
-            'params': encoder_params,
-            'lr': args.single_learning_rate,
+            'params': lora_params,
+            'lr': base_lr * 0.5,  # 0.1 → 0.5 (증가)
             'weight_decay': 1e-4
         },
+        # Cross-Attention (랜덤 초기화, 가장 높은 lr)
         {
-            'params': edema_classifier_params,
-            'lr': args.single_learning_rate,
+            'params': cross_attn_params,
+            'lr': base_lr * 2.0,  # 2배로 빠르게 학습
             'weight_decay': 1e-4
         },
+        # Core Trainable Components (Fusion, TS Encoder, Pooling)
         {
-            'params': subtype_classifier_params,
-            'lr': args.single_learning_rate * 0.5,
+            'params': core_params,
+            'lr': base_lr * 1.0,
+            'weight_decay': 1e-4
+        },
+        # Edema Classifier (간단한 linear, 기본 lr)
+        {
+            'params': edema_params,
+            'lr': base_lr * 1.0,
+            'weight_decay': 1e-3
+        },
+        # Subtype Classifier (간단한 linear, 기본 lr)
+        {
+            'params': subtype_params,
+            'lr': base_lr * 1.0,
             'weight_decay': 1e-3
         }
     ]
 
     optimizer = torch.optim.AdamW(param_groups)
     model, optimizer, loss_module = accelerator.prepare(model, optimizer, loss_module)
-    print(f"\n🎯 [Optimizer Configuration - Differential Learning Rates]")
-    print(f"   Encoder LR: {args.single_learning_rate:.2e}")
-    print(f"   Edema Classifier LR: {args.single_learning_rate * 0.5:.2e}")
-    print(f"   Subtype Classifier LR: {args.single_learning_rate * 0.1:.2e}")
 
     # ==================== Scheduler Configuration ====================
-    warmup_epochs = 3
+    warmup_epochs = 5  # 3 → 5 (Cross-attention 안정화)
+
+    # Warmup scheduler
     warmup_scheduler = lr_scheduler.LinearLR(
         optimizer,
         start_factor=0.1,
         total_iters=warmup_epochs
     )
-    main_scheduler = lr_scheduler.CosineAnnealingLR(
+
+    # ReduceLROnPlateau: Validation loss 기반 adaptive lr 조절
+    main_scheduler = lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        T_max=args.single_stage_epochs - warmup_epochs,
-        eta_min=args.single_learning_rate * 0.01
-    )
-    scheduler = lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, main_scheduler],
-        milestones=[warmup_epochs]
+        mode='min',           # Minimize validation loss
+        factor=0.5,           # lr을 절반으로 감소
+        patience=5,           # 5 epoch 동안 개선 없으면 lr 감소
+        min_lr=1e-6           # 최소 lr 제한
     )
 
     print(f"\n📅 [Scheduler Configuration]")
     print(f"   Warmup Epochs: {warmup_epochs}")
     print(f"   Warmup Start Factor: 0.1")
-    print(f"   CosineAnnealing T_max: {args.single_stage_epochs - warmup_epochs}")
-    print(f"   Minimum LR (eta_min): {args.single_learning_rate * 0.01:.2e}")
+    print(f"   Main Scheduler: ReduceLROnPlateau")
+    print(f"   ├─ Mode: min (validation loss)")
+    print(f"   ├─ Factor: 0.5")
+    print(f"   ├─ Patience: 5 epochs")
+    print(f"   └─ Min LR: 1e-6")
 
     # Early Stopping
     single_best_model_path = os.path.join(args.best_model_dir, "single_stage_best_model.pth")
@@ -227,12 +329,6 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
         bce_count = torch.zeros(1, device=device, dtype=torch.float32)
         ce_sum = torch.zeros(1, device=device, dtype=torch.float32)
         ce_count = torch.zeros(1, device=device, dtype=torch.float32)
-        ucl_sum = torch.zeros(1, device=device, dtype=torch.float32)
-        ucl_count = torch.zeros(1, device=device, dtype=torch.float32)
-        scl_sum = torch.zeros(1, device=device, dtype=torch.float32)
-        scl_count = torch.zeros(1, device=device, dtype=torch.float32)
-        info_ucl_sum = torch.zeros(1, device=device, dtype=torch.float32)
-        info_ucl_count = torch.zeros(1, device=device, dtype=torch.float32)
 
         train_edema_preds_list = []
         train_edema_labels_list = []
@@ -251,7 +347,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                                                 desc=f"[Rank {local_rank}] Epoch {epoch+1}/{args.single_stage_epochs}",
                                                 position=local_rank, leave=True, dynamic_ncols=True)):
             with accelerator.accumulate(model):
-                total_batch_loss, batch_bce, batch_ce, batch_ucl, batch_scl, batch_info_ucl, batch_outputs, batch_counts = train_batch(
+                total_batch_loss, batch_bce, batch_ce, batch_outputs, batch_counts = train_batch(
                     args=args,
                     model=model,
                     batch=batch,
@@ -264,9 +360,6 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                     disable_txt=args.disable_txt,
                     bce_weight=args.bce_weight,
                     ce_weight=args.ce_weight,
-                    ucl_weight=args.ucl_weight,
-                    scl_weight=args.scl_weight,
-                    infonce_weight=args.infonce_weight,
                 )
 
                 accelerator.backward(total_batch_loss)
@@ -277,21 +370,12 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
             # Get loss-specific sample counts
             bce_ct_local = torch.as_tensor(batch_counts['bce_count'], device=device, dtype=torch.float32)
             ce_ct_local = torch.as_tensor(batch_counts['ce_count'], device=device, dtype=torch.float32)
-            ucl_ct_local = torch.as_tensor(batch_counts['ucl_count'], device=device, dtype=torch.float32)
-            scl_ct_local = torch.as_tensor(batch_counts['scl_count'], device=device, dtype=torch.float32)
-            infonce_ct_local = torch.as_tensor(batch_counts['infonce_count'], device=device, dtype=torch.float32)
 
             # Accumulate losses weighted by their actual sample counts
             bce_sum += torch.as_tensor(batch_bce, device=device, dtype=torch.float32) * bce_ct_local
             bce_count += bce_ct_local
             ce_sum += torch.as_tensor(batch_ce, device=device, dtype=torch.float32) * ce_ct_local
             ce_count += ce_ct_local
-            ucl_sum += torch.as_tensor(batch_ucl, device=device, dtype=torch.float32) * ucl_ct_local
-            ucl_count += ucl_ct_local
-            scl_sum += torch.as_tensor(batch_scl, device=device, dtype=torch.float32) * scl_ct_local
-            scl_count += scl_ct_local
-            info_ucl_sum += torch.as_tensor(batch_info_ucl, device=device, dtype=torch.float32) * infonce_ct_local
-            info_ucl_count += infonce_ct_local
 
             with torch.no_grad():
                 edema_logits = batch_outputs['edema_logits'].squeeze(-1)  # [B, W]
@@ -324,38 +408,74 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
             dist.all_reduce(bce_count, op=dist.ReduceOp.SUM)
             dist.all_reduce(ce_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(ce_count, op=dist.ReduceOp.SUM)
-            dist.all_reduce(ucl_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(ucl_count, op=dist.ReduceOp.SUM)
-            dist.all_reduce(scl_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(scl_count, op=dist.ReduceOp.SUM)
-            dist.all_reduce(info_ucl_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(info_ucl_count, op=dist.ReduceOp.SUM)
 
         # Calculate average losses
         bce_avg = (bce_sum / (bce_count + 1e-8)).item()
         ce_avg = (ce_sum / (ce_count + 1e-8)).item()
-        ucl_avg = (ucl_sum / (ucl_count + 1e-8)).item()
-        scl_avg = (scl_sum / (scl_count + 1e-8)).item()
-        info_ucl_avg = (info_ucl_sum / (info_ucl_count + 1e-8)).item()
 
         # Weighted contributions
         bce_contrib = args.bce_weight * bce_avg
         ce_contrib = args.ce_weight * ce_avg
-        ucl_contrib = args.ucl_weight * ucl_avg
-        scl_contrib = args.scl_weight * scl_avg
-        info_ucl_contrib = args.infonce_weight * info_ucl_avg
-        avg_total_loss = bce_contrib + ce_contrib + ucl_contrib + scl_contrib + info_ucl_contrib
+        avg_total_loss = bce_contrib + ce_contrib
 
-        # Scheduler step
-        scheduler.step()
+        # Warmup scheduler step (first 5 epochs)
+        if epoch < warmup_epochs:
+            warmup_scheduler.step()
+
+        # Gather train predictions from all GPUs
+        if accelerator.num_processes > 1:
+            local_preds = {
+                'p_pos': [p.cpu() for p in train_edema_preds_list],
+                'p_sub': [p.cpu() for p in train_subtype_preds_list],
+                'edema': [e.cpu() for e in train_edema_labels_list],
+                'subtype': [s.cpu() for s in train_subtype_labels_list]
+            }
+
+            # Gather to rank 0 only
+            if accelerator.is_main_process:
+                gathered_preds = [None] * accelerator.num_processes
+                dist.gather_object(local_preds, gathered_preds, dst=0)
+
+                # Combine all predictions from all GPUs
+                all_p_pos = []
+                all_p_sub = []
+                all_edema = []
+                all_subtype = []
+
+                for gpu_preds in gathered_preds:
+                    all_p_pos.extend(gpu_preds['p_pos'])
+                    all_p_sub.extend(gpu_preds['p_sub'])
+                    all_edema.extend(gpu_preds['edema'])
+                    all_subtype.extend(gpu_preds['subtype'])
+
+                # Concatenate and convert to numpy
+                p_pos_all = torch.cat(all_p_pos, dim=0).numpy() if all_p_pos else np.array([])
+                p_sub_all = torch.cat(all_p_sub, dim=0).numpy() if all_p_sub else np.array([])
+                edema_all = torch.cat(all_edema, dim=0).numpy() if all_edema else np.array([])
+                subtype_all = torch.cat(all_subtype, dim=0).numpy() if all_subtype else np.array([])
+            else:
+                # GPU 1: Send data to rank 0 and set to None
+                dist.gather_object(local_preds, dst=0)
+                p_pos_all = None
+                p_sub_all = None
+                edema_all = None
+                subtype_all = None
+
+            # Synchronize: GPU 1 waits for GPU 0 to finish metric computation
+            dist.barrier()
+        else:
+            # Single GPU
+            if len(train_edema_preds_list) > 0:
+                p_pos_all = torch.cat(train_edema_preds_list, dim=0).numpy()
+                p_sub_all = torch.cat(train_subtype_preds_list, dim=0).numpy()
+                edema_all = torch.cat(train_edema_labels_list, dim=0).numpy()
+                subtype_all = torch.cat(train_subtype_labels_list, dim=0).numpy()
+            else:
+                p_pos_all = None
 
         # Train metrics - Multi-task learning
         train_metrics = {}
-        if accelerator.is_main_process and len(train_edema_preds_list) > 0:
-            p_pos_all = torch.cat(train_edema_preds_list, dim=0).numpy()      # [N] P(edema=1)
-            p_sub_all = torch.cat(train_subtype_preds_list, dim=0).numpy()    # [N, 2] P(NCPE|pos), P(CPE|pos)
-            edema_all = torch.cat(train_edema_labels_list, dim=0).numpy()     # [N] in {0, 1, -1}
-            subtype_all = torch.cat(train_subtype_labels_list, dim=0).numpy() # [N] in {1, 2, -1}
+        if accelerator.is_main_process and p_pos_all is not None and len(p_pos_all) > 0:
 
             # ==================== Level 1: Binary Edema Detection (0 vs 1) ====================
             mask_l1 = (edema_all == 0) | (edema_all == 1)
@@ -445,10 +565,6 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
             print(f"   [Loss Components]")
             print(f"      BCE (Edema): {bce_avg:.4f} → Weighted: {bce_contrib:.4f} (λ={args.bce_weight})")
             print(f"      CE (Subtype): {ce_avg:.4f} → Weighted: {ce_contrib:.4f} (λ={args.ce_weight})")
-            print(f"      Temporal UCL: {ucl_avg:.4f} → Weighted: {ucl_contrib:.4f} (λ={args.ucl_weight})")
-            print(f"      SCL (Edema): {scl_avg:.4f} → Weighted: {scl_contrib:.4f} (λ={args.scl_weight})")
-            print(f"      InfoNCE: {info_ucl_avg:.4f} → Weighted: {info_ucl_contrib:.4f} (λ={args.infonce_weight})")
-
 
             print(f"\n   [Hierarchical Performance Metrics]")
             print(f"[Edema Detection]   AUROC={train_metrics['level1_auroc']:.4f}  "
@@ -465,7 +581,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
         torch.cuda.empty_cache()
 
         # ==================== Validation ====================
-        val_loss, val_bce_avg, val_ce_avg, val_ucl_avg, val_scl_avg, val_info_ucl_avg, val_metrics = validate_multitask(
+        val_loss, val_bce_avg, val_ce_avg, val_metrics = validate_multitask(
             args=args,
             model=model,
             dataloader=val_loader,
@@ -478,12 +594,20 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
             disable_txt=args.disable_txt,
         )
 
-        # Early stopping based on Level 3 AUROC 
-        if val_metrics['level3_auroc'] > best_val_auroc:
-            best_val_auroc = val_metrics['level3_auroc']
+        # ReduceLROnPlateau scheduler step (after warmup, based on validation loss)
+        if epoch >= warmup_epochs:
+            main_scheduler.step(val_loss)
+            if accelerator.is_main_process:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"   📉 ReduceLROnPlateau - Current LR: {current_lr:.2e}, Val Loss: {val_loss:.4f}")
 
-        if val_metrics['level3_auprc'] > best_val_auprc:
-            best_val_auprc = val_metrics['level3_auprc']
+        # Early stopping based on Level 3 AUROC (only on main process)
+        if accelerator.is_main_process and val_metrics:
+            if val_metrics['level3_auroc'] > best_val_auroc:
+                best_val_auroc = val_metrics['level3_auroc']
+
+            if val_metrics['level3_auprc'] > best_val_auprc:
+                best_val_auprc = val_metrics['level3_auprc']
 
         # ==================== Multi-Task UMAP Visualization ====================
         # if accelerator.is_main_process and ((epoch + 1) == 1 or (epoch + 1) % 5 == 0 or (epoch + 1) == args.single_stage_epochs):
@@ -527,16 +651,10 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 "train/total_loss": avg_total_loss,
                 "train/bce_loss": bce_avg,
                 "train/ce_loss": ce_avg,
-                "train/temporal_ucl_loss": ucl_avg,
-                "train/scl_loss": scl_avg,
-                "train/info_ucl_loss": info_ucl_avg,
-    
+
                 "val/total_loss": val_loss,
                 "val/bce_loss": val_bce_avg,
                 "val/ce_loss": val_ce_avg,
-                "val/temporal_ucl_loss": val_ucl_avg,
-                "val/scl_loss": val_scl_avg,
-                "val/info_ucl_loss": val_info_ucl_avg,
 
                 #################### Hierarchical Metrics ####################
                 "val/level1_auroc": val_metrics['level1_auroc'],
@@ -546,7 +664,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 "val/level2_auprc": val_metrics['level2_auprc'],
                 "val/level3_auroc": val_metrics['level3_auroc'],
                 "val/level3_auprc": val_metrics['level3_auprc'],
-                
+
                 "train/level1_auroc": train_metrics['level1_auroc'],
                 "train/level1_auprc": train_metrics['level1_auprc'],
                 "train/level1_brier": train_metrics['level1_brier'],
@@ -556,9 +674,11 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
                 "train/level3_auprc": train_metrics['level3_auprc'],
             }
 
-            wandb.log(log_dict)
+            if wandb_on:
+                wandb.log(log_dict)
 
             # Early stopping
+            print(f"DEBUG [Rank 0]: Before early_stopper")
             if early_stopper(args, best_val_auroc, model, epoch):
                 stop_flag.fill_(1)
                 print(f"⛔ Early stopping triggered at epoch {epoch+1}")
@@ -583,7 +703,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
         accelerator.print(f"⚠️ Best model not found, using current model state")
 
     # ==================== Test ====================
-    test_loss, _, _, _, _, _, _, wandb_test_metrics = test(
+    test_loss, _, _, _, wandb_test_metrics = test(
         args=args,
         model=model,
         dataloader=test_loader,
@@ -593,16 +713,17 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
         dataset=test_loader.dataset
     )
 
-    if accelerator.is_main_process:
-        wandb.run.summary.update({
-            'final_test/total_loss': test_loss,
-            'final_test/level3_auroc': wandb_test_metrics['test/level3_auroc'],
-            'final_test/level3_auprc': wandb_test_metrics['test/level3_auprc'],
-            'final_test/level1_auroc': wandb_test_metrics['test/level1_auroc'],
-            'final_test/level1_auprc': wandb_test_metrics['test/level1_auprc'],
-            'final_test/level2_auroc': wandb_test_metrics['test/level2_auroc'],
-            'final_test/level2_auprc': wandb_test_metrics['test/level2_auprc'],
-        })
+    if wandb_on:
+        if accelerator.is_main_process:
+            wandb.run.summary.update({
+                'final_test/total_loss': test_loss,
+                'final_test/level3_auroc': wandb_test_metrics['test/level3_auroc'],
+                'final_test/level3_auprc': wandb_test_metrics['test/level3_auprc'],
+                'final_test/level1_auroc': wandb_test_metrics['test/level1_auroc'],
+                'final_test/level1_auprc': wandb_test_metrics['test/level1_auprc'],
+                'final_test/level2_auroc': wandb_test_metrics['test/level2_auroc'],
+                'final_test/level2_auprc': wandb_test_metrics['test/level2_auprc'],
+            })
 
     # ==================== UMAP Visualization ====================
     # if accelerator.is_main_process:
@@ -623,29 +744,35 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, demo_df, args):
     #     )
         # print("✅ Test UMAP completed!")
 
-    print("\n" + "="*80)
-    print("✅ MULTI-TASK TRAINING COMPLETED!")
-    print(f"   Best Val Level 3 AUROC: {best_val_auroc:.4f}")
-    print(f"   Best Val Level 3 AUPRC: {best_val_auprc:.4f}\n")
+    if accelerator.is_main_process:
+        print("\n" + "="*80)
+        print("✅ MULTI-TASK TRAINING COMPLETED!")
+        print(f"   Best Val Level 3 AUROC: {best_val_auroc:.4f}")
+        print(f"   Best Val Level 3 AUPRC: {best_val_auprc:.4f}\n")
 
-    print("   [Test Results - Hierarchical Metrics]")
-    print(f"   Level 1 (Edema Detection):        AUROC={wandb_test_metrics['test/level1_auroc']:.4f}  AUPRC={wandb_test_metrics['test/level1_auprc']:.4f}")
-    print(f"   Level 2 (Subtype Classification): AUROC={wandb_test_metrics['test/level2_auroc']:.4f}  AUPRC={wandb_test_metrics['test/level2_auprc']:.4f}")
-    print(f"   Level 3 (3-class Combined):       AUROC={wandb_test_metrics['test/level3_auroc']:.4f}  AUPRC={wandb_test_metrics['test/level3_auprc']:.4f}")
-    print("="*80 + "\n")
+        if wandb_test_metrics:
+            print("   [Test Results - Hierarchical Metrics]")
+            print(f"   Level 1 (Edema Detection):        AUROC={wandb_test_metrics['test/level1_auroc']:.4f}  AUPRC={wandb_test_metrics['test/level1_auprc']:.4f}")
+            print(f"   Level 2 (Subtype Classification): AUROC={wandb_test_metrics['test/level2_auroc']:.4f}  AUPRC={wandb_test_metrics['test/level2_auprc']:.4f}")
+            print(f"   Level 3 (3-class Combined):       AUROC={wandb_test_metrics['test/level3_auroc']:.4f}  AUPRC={wandb_test_metrics['test/level3_auprc']:.4f}")
+        print("="*80 + "\n")
 
-    results = {
-        'val_level3_auroc': best_val_auroc,
-        'val_level3_auprc': best_val_auprc,
-        'test_level1_auroc': wandb_test_metrics['test/level1_auroc'],
-        'test_level1_auprc': wandb_test_metrics['test/level1_auprc'],
-        'test_level2_auroc': wandb_test_metrics['test/level2_auroc'],
-        'test_level2_auprc': wandb_test_metrics['test/level2_auprc'],
-        'test_level3_auroc': wandb_test_metrics['test/level3_auroc'],
-        'test_level3_auprc': wandb_test_metrics['test/level3_auprc']
-    }
+    # Prepare results (both GPUs need this for return)
+    results = {}
+    if accelerator.is_main_process and wandb_test_metrics:
+        results = {
+            'val_level3_auroc': best_val_auroc,
+            'val_level3_auprc': best_val_auprc,
+            'test_level1_auroc': wandb_test_metrics['test/level1_auroc'],
+            'test_level1_auprc': wandb_test_metrics['test/level1_auprc'],
+            'test_level2_auroc': wandb_test_metrics['test/level2_auroc'],
+            'test_level2_auprc': wandb_test_metrics['test/level2_auprc'],
+            'test_level3_auroc': wandb_test_metrics['test/level3_auroc'],
+            'test_level3_auprc': wandb_test_metrics['test/level3_auprc']
+        }
 
-    if accelerator.num_processes > 1:
+    # Cleanup distributed resources
+    if dist.is_initialized():
         dist.destroy_process_group()
 
     return results
