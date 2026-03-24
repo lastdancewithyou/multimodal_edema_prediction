@@ -813,13 +813,14 @@ def apply_lora_to_cxformer(
         replaced.add(name)
 
     # Step 4: Cross-attention layers는 full fine-tuning (unfreeze)
-    cross_attn_params = 0
-    cross_attn_layers = []
-    for name, param in model.named_parameters():
-        if "cross_attn" in name:
-            param.requires_grad_(True)
-            cross_attn_params += param.numel()
-            cross_attn_layers.append(name)
+    # v5: Cross-attention 사용 안함 (context=None) - freeze 유지
+    # cross_attn_params = 0
+    # cross_attn_layers = []
+    # for name, param in model.named_parameters():
+    #     if "cross_attn" in name:
+    #         param.requires_grad_(True)
+    #         cross_attn_params += param.numel()
+    #         cross_attn_layers.append(name)
 
     # lora_params = 0
     # for name, module in model.named_modules():

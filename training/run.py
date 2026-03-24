@@ -8,23 +8,21 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="Model Novelty development", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="5", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="14", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
-    parser.add_argument('--wandb_on', type=bool, default=False, help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb_on', type=bool, default=True, help='Enable Weights & Biases logging')
 
-    # Modality Selection
+    # Modality Selection (True가 해당 모달리티 사용 중지)
+    parser.add_argument("--disable_prompt", type=bool, default=False, help="prompt 활성화 여부")
+    parser.add_argument('--use_clinical_prompt', type=bool, default=True, help='Use demographic information')
     parser.add_argument("--disable_cxr", type=bool, default=False, help="이미지 모달리티 활성화 여부")
     parser.add_argument("--disable_txt", type=bool, default=False, help="텍스트 모달리티 활성화 여부")
-    parser.add_argument('--use_clinical_prompt', type=bool, default=True, help='Use demographic information')
 
     parser.add_argument('--img_to_3ch', type=bool, default=True, help='Convert grayscale to 3-channel by repeating channel 1 (for CXFormer/ResNet)')
-    # parser.add_argument('--use_img_augmentation', type=bool, default=False, help='Use per-window image augmentation for diversity') # False - v2 / True - v3
 
     # Fusion architecture ablation
     parser.add_argument('--use_segmented_attention', type=bool, default=True,
                         help='Use segmented temporal attention (True) vs full global attention (False) for TS fusion')
-    parser.add_argument('--use_cls_global', type=bool, default=False,
-                        help='Use CLS token for causal global context (past-only summary for each latent)')
 
     # dataset & sampler
     parser.add_argument('--train_batch_size', type=int, default=16)
@@ -106,33 +104,11 @@ def parse_arguments():
     parser.add_argument('--best_model_dir', type=str, default=None, help='Directory to save best model checkpoint')
 
     ##################################################################################################################################
-    # Two-Stage Training Controller
-    parser.add_argument('--use_two_stage', type=bool, default=False, help='Use two-stage training: contrastive pretraining + classification')
-    parser.add_argument('--stage1_only', type=bool, default=False, help='Run only stage 1 (contrastive pretraining)')
-    parser.add_argument('--stage2_only', type=bool, default=False, help='Run only stage 2 (classification from pretrained)')
-    parser.add_argument('--stage1_epochs', type=int, default=40, help='Number of epochs for stage 1 (contrastive pretraining)')
-    parser.add_argument('--stage2_epochs', type=int, default=30, help='Number of epochs for stage 2 (classification)')
-    parser.add_argument('--stage1_lr', type=float, default=1e-4, help='Learning rate for stage 1')
-    parser.add_argument('--stage2_lr', type=float, default=5e-5, help='Learning rate for stage 2')
-    parser.add_argument('--save_stage1_model', type=bool, default=True, help='Save stage 1 model checkpoint')
-    parser.add_argument('--stage1_model_path', type=str, 
-                        default=None,
-                        # default="/home/DAHS1/gangmin/my_research/src/output/stage1_models/experiment_33_stage1.pth", 
-                        help='Path to save/load stage 1 model'
-                        )
-
-    # # Stage 2 Training Strategy: Linear Probing vs Fine-tuning
-    # parser.add_argument('--freeze_encoder_stage2', type=bool, default=False, help='Freeze encoder in stage 2 (Linear Probing). If not set, fine-tune encoder.')
-    # parser.add_argument('--stage2_patience', type=int, default=5, help='Early stopping patience for stage 2')
-    ##################################################################################################################################
 
     args = parser.parse_args([])
 
-    if args.use_two_stage:
-        args.wandb_run_name = f"{args.experiment_id}: [GPU 0] temp=0.7/Optimal_hyperparam_search/Img_Text_Tuning/Fine-tuning"
-    # single stage
-    else:
-        args.wandb_run_name = f"{args.experiment_id}: Dropout/LR=1e-4/ReduceOnPlateau/Cross_attn_LR"
+    # Single-stage training configuration
+    args.wandb_run_name = f"{args.experiment_id}: MLP_Attnpooling/Clinical Prompt Prefix(Yes gradient)"
 
     # ===================================================================================================
 
@@ -144,21 +120,6 @@ def parse_arguments():
 
     if args.umap_save_dir is None:
         args.umap_save_dir = f'./output/umap/{args.run_name}'
-    
-    if args.stage1_model_path is None:
-        args.stage1_model_path = f'./output/stage1_models/{args.run_name}_stage1.pth'
 
-    # Stage 2 단독 학습시에만 실제 저장된 모델 경로로 변경
-    if args.stage2_only:
-        actual_stage1_path = f'./output/stage1_models/experiment_{args.experiment_id}_stage1.pth'
-        if os.path.exists(actual_stage1_path):
-            args.stage1_model_path = actual_stage1_path
-            print(f"✅ [Stage 2 Only] Using existing Stage 1 model: {actual_stage1_path}")
-        else:
-            print(f"⚠️  [Stage 2 Only] Stage 1 model not found at: {actual_stage1_path}")
-            print(f"    Will try default path: {args.stage1_model_path}")
-
-    # if args.target_path is None and args.use_target_supcon:
-    #     args.target_path = f'./output/targets/optimal_target_{args.num_classes}_{args.head_hidden_dim2}.npy'
 
     return args

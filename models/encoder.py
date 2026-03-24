@@ -11,21 +11,6 @@ from training.run import parse_arguments
 from utils.utils import timer
 
 
-# Demographic modality encoder
-class DemographicEncoder(nn.Module):
-    def __init__(self, input_dim, output_dim=256, dropout_rate=0.1):
-        super().__init__()
-        self.demo_proj = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(128, output_dim)
-        )
-
-    def forward(self, demo_features):
-        return self.demo_proj(demo_features.float())
-
-
 # Temporal Mixing Block
 class TSMixerBlock(nn.Module):
     """
@@ -98,8 +83,19 @@ class TSMixerEncoder(nn.Module):
         x = self.norm(x)
         return x
 
+
 # Transformer
 class TransformerTSEncoder(nn.Module):
+    """
+    - Clinical prompt projection layer 추가: nn.Linear(768, hidden_size)
+    - Prefix token으로 clinical prompt CLS embedding 추가
+    - Positional encoding을 T+1 길이로 확장
+    - Padding mask를 prompt prefix를 고려하여 조정
+    - Output에서 prompt token 제거하여 원래 shape 유지
+    ┌─────────────────────────────────────────────────┐
+    │ [PROMPT] | HR_0 | BP_0 | ... | HR_23 | BP_23  │ ← Transformer Input
+    └─────────────────────────────────────────────────┘
+    """
     def __init__(self, input_size, hidden_size, window_size, num_layers=2, num_heads=8, dropout=0.1):
         super().__init__()
 
@@ -110,7 +106,12 @@ class TransformerTSEncoder(nn.Module):
         self.input_projection = nn.Linear(input_size, hidden_size)
         self.ln_output = nn.LayerNorm(hidden_size)
 
-        self.pos_encoder = PositionalEncoding(hidden_size, dropout, max_len=window_size)
+        # Clinical prompt projection (768 -> hidden_size)
+        self.prompt_projection = nn.Linear(768, hidden_size)
+        self.ln_prompt = nn.LayerNorm(hidden_size)
+
+        # Positional encoding (max_len = window_size + 1 for prompt prefix)
+        self.pos_encoder = PositionalEncoding(hidden_size, dropout, max_len=window_size + 1)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size,
@@ -124,18 +125,52 @@ class TransformerTSEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, seq_valid_lengths):
-        B, T, _ = x.shape # [B, T, D]        
-        x_proj = self.input_projection(x) # Input projection
-        x_proj = self.pos_encoder(x_proj) # Positional encoding
+    def forward(self, x, seq_valid_lengths, clinical_prompt=None):
+        """
+        Args:
+            x: [B, T, D] - Time-series input
+            seq_valid_lengths: [B] - Valid sequence lengths
+            clinical_prompt: [B, 768] - Clinical prompt CLS embeddings (optional)
 
-        # Create padding mask
-        mask = torch.zeros(B, T, dtype=torch.bool, device=x.device)
-        for i, valid_len in enumerate(seq_valid_lengths):
-            if valid_len < T:
-                mask[i, valid_len:] = True  # Mask positions after valid length
+        Returns:
+            output: [B, T, hidden_size] - Encoded time-series (prompt prefix removed)
+        """
+        B, T, _ = x.shape # [B, T, D]
+        x_proj = self.input_projection(x) # Input projection [B, T, hidden_size]
 
-        output = self.transformer_encoder(x_proj, src_key_padding_mask=mask)  # Transformer encoder - [B, T, hidden_size]
+        if clinical_prompt is not None:
+            # Add clinical prompt as prefix token (LLM-style)
+            prompt_token = self.prompt_projection(clinical_prompt)  # [B, 768] -> [B, hidden_size]
+            prompt_token = self.ln_prompt(prompt_token)
+            prompt_token = prompt_token.unsqueeze(1)  # [B, 1, hidden_size]
+
+            # Concatenate prompt prefix: [prompt | TS_0, TS_1, ..., TS_T-1]
+            x_proj = torch.cat([prompt_token, x_proj], dim=1)  # [B, T+1, hidden_size]
+
+            # Positional encoding for T+1 tokens
+            x_proj = self.pos_encoder(x_proj)
+
+            # Update padding mask to account for prompt prefix
+            mask = torch.zeros(B, T + 1, dtype=torch.bool, device=x.device)
+            mask[:, 0] = False  # Prompt token is always valid
+            for i, valid_len in enumerate(seq_valid_lengths):
+                if valid_len < T:
+                    mask[i, valid_len + 1:] = True  # Shift by 1 for prompt prefix
+        else:
+            # Original behavior (no prompt)
+            x_proj = self.pos_encoder(x_proj)
+
+            mask = torch.zeros(B, T, dtype=torch.bool, device=x.device)
+            for i, valid_len in enumerate(seq_valid_lengths):
+                if valid_len < T:
+                    mask[i, valid_len:] = True
+
+        output = self.transformer_encoder(x_proj, src_key_padding_mask=mask) 
+
+        # Remove prompt prefix from output
+        if clinical_prompt is not None:
+            output = output[:, 1:, :]  # [B, T, hidden_size] - remove first token (prompt)
+
         output = self.ln_output(output)
         output = self.dropout(output)
         return output

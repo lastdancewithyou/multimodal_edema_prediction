@@ -11,11 +11,12 @@ from utils.utils import timer
 
 
 class MultiModalEncoder(nn.Module):
-    def __init__(self, args, disable_cxr=False, disable_txt=False):
+    def __init__(self, args, disable_cxr=False, disable_txt=False, disable_prompt=False):
         super().__init__()
 
         self.disable_cxr = disable_cxr
         self.disable_txt = disable_txt
+        self.disable_prompt = disable_prompt
 
         # ==================== Modality-Specific Encoders ====================
         # Time-series Encoder
@@ -87,6 +88,7 @@ class MultiModalEncoder(nn.Module):
             txt_input_dim=768,      # BioClinicalBERT hidden size
             disable_cxr=disable_cxr,
             disable_txt=disable_txt,
+            disable_prompt=disable_prompt
         )
 
         # Attention Pooling
@@ -134,14 +136,46 @@ class MultiModalEncoder(nn.Module):
         with timer("TS Encoder", None):
             ts_series_flat = ts_series.view(B * W, T, D)
             seq_valid_mask_flat = seq_valid_mask.view(B * W, T)         # 윈도우 내 유효한 time step을 masking
-            seq_valid_lengths_flat = seq_valid_mask_flat.sum(dim=-1)   
+            seq_valid_lengths_flat = seq_valid_mask_flat.sum(dim=-1)
             window_mask_flat = window_mask.reshape(B * W)               # 패딩되지 않은 유효한 window 선별
 
             valid_indices = window_mask_flat.nonzero(as_tuple=False).squeeze(1)     # 유효한 window 인덱스 추출
             valid_ts_series = ts_series_flat[valid_indices]                         # 유효한 window만 선택
             valid_seq_lengths = seq_valid_lengths_flat[valid_indices]
 
-            valid_ts_encoded = self.ts_encoder(valid_ts_series, valid_seq_lengths)
+            # ===== Clinical Prompt Prefix for TS Encoder =====
+            """
+            - 각 window의 마지막 valid timestep의 clinical prompt 선택
+            - Valid window에만 prompt 전달
+            - TS encoder에 clinical prompt를 전달
+            """
+            # Use window-level prompt (last timestep prompt for each window)
+            if not self.disable_prompt:
+                # Get prompt for each window's last valid timestep
+                # prompt_index_tensor: [B, W, T]
+                # For each window, use the last valid timestep's prompt
+                window_prompt_indices = torch.zeros(B, W, dtype=torch.long, device=device)
+                for b in range(B):
+                    for w in range(W):
+                        if window_mask[b, w]:
+                            # Find last valid timestep in this window
+                            valid_mask = seq_valid_mask[b, w, :]
+                            if valid_mask.any():
+                                last_valid_t = valid_mask.nonzero(as_tuple=False)[-1].item()
+                                window_prompt_indices[b, w] = prompt_index_tensor[b, w, last_valid_t]
+
+                # Get prompt embeddings for valid windows [BW, 768] -> [Nwin, 768]
+                window_prompt_indices_flat = window_prompt_indices.view(B * W)
+                valid_window_prompts = unique_prompt_embeddings[window_prompt_indices_flat[valid_indices]]  # [Nwin, 768]
+            else:
+                valid_window_prompts = None
+
+            # Encode with clinical prompt prefix
+            valid_ts_encoded = self.ts_encoder(
+                valid_ts_series,
+                valid_seq_lengths,
+                clinical_prompt=valid_window_prompts  # [Nwin, 768] or None
+            )
 
             # 고정된 zero matrix를 만든 후, 유효한 window만 처리할 수 있도록 처리함.
             ts_encoded = torch.zeros(
@@ -380,20 +414,46 @@ class AttentionPooling(nn.Module):
     """
     L개의 latent를 하나의 window embedding으로 압축함.
     """
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, hidden_dim=256):
         super().__init__()
-        self.attn_fc = nn.Linear(input_dim, 1) # attention score 계산 (=중요도 개념)
+        
+        # Multi-layer attention scoring
+        self.attn_mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
 
     def forward(self, latent_emb, seg_valid_mask=None):
-        attn_scores = self.attn_fc(latent_emb).squeeze(-1)      # [N, L]
+        attn_scores = self.attn_mlp(latent_emb).squeeze(-1)      # [N, L]
 
-        # 유효하지 않은 latent는 attention에서 제외함.
         if seg_valid_mask is not None:
             attn_scores = attn_scores.masked_fill(~seg_valid_mask, float('-inf'))
 
         attn_weights = torch.softmax(attn_scores, dim=1)                      # [N, L]
         weighted_emb = (latent_emb * attn_weights.unsqueeze(-1)).sum(dim=1)   # [N, D]
         return weighted_emb
+
+
+# class AttentionPooling(nn.Module):
+#     """
+#     L개의 latent를 하나의 window embedding으로 압축함.
+#     """
+#     def __init__(self, input_dim):
+#         super().__init__()
+
+#         self.attn_fc = nn.Linear(input_dim, 1)
+
+#     def forward(self, latent_emb, seg_valid_mask=None):
+#         attn_scores = self.attn_fc(latent_emb).squeeze(-1)      # [N, L]
+
+#         # 유효하지 않은 latent는 attention에서 제외함.
+#         if seg_valid_mask is not None:
+#             attn_scores = attn_scores.masked_fill(~seg_valid_mask, float('-inf'))
+
+#         attn_weights = torch.softmax(attn_scores, dim=1)                      # [N, L]
+#         weighted_emb = (latent_emb * attn_weights.unsqueeze(-1)).sum(dim=1)   # [N, D]
+#         return weighted_emb
 
 
 class ProjectionHead(nn.Module):
@@ -446,8 +506,7 @@ def build_hard_segments(T, L):
 # class TimeSeriesCentricCrossAttention_v5(nn.Module):
 #     def __init__(self, args, d_model=256, num_heads=8,
 #                 ts_input_dim=512, img_input_dim=768, txt_input_dim=768,
-#                 cxr_dropout=0.1, text_dropout=0.1,
-#                 disable_cxr=False, disable_txt=False
+#                 disable_cxr=False, disable_txt=False, disable_prompt=False, dropout=0.1
 #         ):
 #         super().__init__()
 #         self.d_model = d_model                      # latent embedding dimension
@@ -455,24 +514,23 @@ def build_hard_segments(T, L):
 #         self.num_latents = args.num_latents         # Latent array query 개수
 #         self.disable_cxr = disable_cxr
 #         self.disable_txt = disable_txt
+#         self.disable_prompt = disable_prompt
 
 #         # Latent embeddings
 #         self.latent_init = nn.Parameter(torch.empty(1, self.num_latents, d_model))
 #         nn.init.uniform_(self.latent_init, -0.02, 0.02)
 
-#         # Cross-attention modules with modality-specific input dimensions
 #         self.ts_cross_attn = TemporalMultiheadAttention_v2(
-#             d_model, num_heads, key_input_dim=ts_input_dim,
+#             d_model, num_heads, key_input_dim=ts_input_dim, attn_dropout=dropout
 #         )
 #         self.img_cross_attn = TemporalMultiheadAttention_v2(
-#             d_model, num_heads, key_input_dim=img_input_dim,
+#             d_model, num_heads, key_input_dim=img_input_dim, attn_dropout=dropout
 #         )
 #         self.text_cross_attn = TemporalMultiheadAttention_v2(
-#             d_model, num_heads, key_input_dim=txt_input_dim,
+#             d_model, num_heads, key_input_dim=txt_input_dim, attn_dropout=dropout
 #         )
-
 #         self.ctx_cross_attn = TemporalMultiheadAttention_v2(
-#             d_model, num_heads, key_input_dim=768  # BioClinicalBERT dim
+#             d_model, num_heads, key_input_dim=txt_input_dim, attn_dropout=dropout
 #         )
 
 #         # latent 간 정보 교환
@@ -480,7 +538,6 @@ def build_hard_segments(T, L):
 #             d_model=d_model,
 #             max_seq_len=self.num_latents,
 #             num_layers=2,
-#             # dropout=dropout
 #         )
 
 #         # Modality-specific Time2Vec for time encoding - 이미지와 텍스트에 시간 정보를 줘서 어느 시점에 촬영했는지에 대한 정보를 부여함.
@@ -492,10 +549,10 @@ def build_hard_segments(T, L):
 #         self.ln_latent = nn.LayerNorm(d_model)
 
 #         self.debug_ts_attn = None
-#         # self.residual_dropout = nn.Dropout(dropout)
 
 #     def forward(
-#             self, ctx_embeddings, ts_embeddings, img_embeddings=None, text_embeddings=None, time_indices=None,
+#             self, ctx_embeddings, ctx_key_padding_masks, 
+#             ts_embeddings, img_embeddings=None, text_embeddings=None, time_indices=None,
 #             img_key_padding_mask=None, text_key_padding_mask=None, seq_valid_mask=None,
 #             num_iterations=2
 #         ):
@@ -504,12 +561,10 @@ def build_hard_segments(T, L):
 #         L = self.num_latents
 
 #         # ================ Time emb add to Img, Text modality after projection ================
-#         time_emb_img_raw = self.time2vec_img(time_indices.unsqueeze(-1))  # [B, T, 768]
-#         time_emb_img = self.ln_time_img(time_emb_img_raw)
+#         time_emb_img = self.ln_time_img(self.time2vec_img(time_indices.unsqueeze(-1)))
+#         time_emb_txt = self.ln_time_txt(self.time2vec_txt(time_indices.unsqueeze(-1)))
 
-#         time_emb_txt_raw = self.time2vec_txt(time_indices.unsqueeze(-1))  # [B, T, 768]
-#         time_emb_txt = self.ln_time_txt(time_emb_txt_raw)
-
+#         # Latent matrix 초기화
 #         latent = self.latent_init.expand(B, -1, -1)
 
 #         # 유효하지 않은 time step 마스킹.
@@ -531,18 +586,40 @@ def build_hard_segments(T, L):
 
 #         # ================ Iterative Fusion ================
 #         for iter in range(num_iterations):
-#             self.ts_cross_attn.save_attn = (iter == 0) # 첫 iteration만 attention 저장함. (첫 에포크 첫 배치 시각화용)
+#             self.ts_cross_attn.save_attn = (iter == 0)
 
-#             ctx_out = self.ctx_cross_attn(
-#                 query=latent,
-#                 key=ctx_embeddings,
-#                 value=ctx_embeddings
-#             )
-#             latent = latent + ctx_out
+#             # ==================== Clinical Prompt -> Latent ====================
+#             if not self.disable_prompt:
+#                 ctx_updates = []
+#                 all_ctx_attn_weights = []
+
+#                 for i in range(L):
+#                     q_i = latent[:, i:i+1, :]                # [B, 1, 256]
+#                     ctx_i = ctx_embeddings[i]                # [B, seq_len, 768]
+#                     ctx_mask_i = ctx_key_padding_masks[i]    # [B, seq_len]
+
+#                     ctx_out_i = self.ctx_cross_attn(
+#                         query=q_i,
+#                         key=ctx_i,
+#                         value=ctx_i,
+#                         key_padding_mask=ctx_mask_i
+#                     )
+#                     ctx_updates.append(ctx_out_i)
+
+#                     if iter == 0 and self.ctx_cross_attn.last_attn is not None:
+#                         all_ctx_attn_weights.append(
+#                             self.ctx_cross_attn.last_attn.squeeze(1).detach()  # [B, seq_len]
+#                         )
+
+#                 ctx_out = torch.cat(ctx_updates, dim=1)       # [B, L, 256]
+#                 latent = latent + ctx_out
+
+#                 if len(all_ctx_attn_weights) > 0:
+#                     self.debug_ctx_attn = torch.stack(all_ctx_attn_weights, dim=1)
 
 #             # ==================== TS -> Latent ====================
-#             latent_updates = []
-#             all_attention_weights = []
+#             ts_updates = []
+#             all_ts_attention_weights = []
 
 #             # 각 segment 별 독립적으로 cross-attention 수행함.
 #             for i, (s, e) in enumerate(segments):
@@ -566,16 +643,15 @@ def build_hard_segments(T, L):
 #                     attn = self.ts_cross_attn.last_attn.squeeze(1)  # [B, 1, seg] -> [B, seg]
 #                     attn_full = torch.zeros(B, T, device=attn.device)
 #                     attn_full[:, s:e] = attn
-#                     all_attention_weights.append(attn_full)
+#                     all_ts_attention_weights.append(attn_full)
 
-#                 latent_updates.append(out_i)
+#                 ts_updates.append(out_i)
 
-#             ts_out = torch.cat(latent_updates, dim=1) # [B, L, 256]
+#             ts_out = torch.cat(ts_updates, dim=1) # [B, L, 256]
 #             latent = latent + ts_out
-#             # latent = latent + self.residual_dropout(ts_out)
 
-#             if len(all_attention_weights) > 0: # For debugging
-#                 self.debug_ts_attn = torch.stack(all_attention_weights, dim=1)
+#             if len(all_ts_attention_weights) > 0: # For debugging
+#                 self.debug_ts_attn = torch.stack(all_ts_attention_weights, dim=1)
 
 #             # ==================== IMG -> Latent ====================
 #             if not self.disable_cxr and img_embeddings is not None and img_embeddings.size(1) > 0:
@@ -588,7 +664,6 @@ def build_hard_segments(T, L):
 #                     key_padding_mask=img_key_padding_mask
 #                 )
 #                 latent = latent + img_out
-#                 # latent = latent + self.residual_dropout(img_out)
 
 #             # ==================== Text -> Latent ====================
 #             if not self.disable_txt and text_embeddings is not None and text_embeddings.size(1) > 0:
@@ -601,7 +676,6 @@ def build_hard_segments(T, L):
 #                     key_padding_mask=text_key_padding_mask
 #                 )
 #                 latent = latent + text_out
-#                 # latent = latent + self.residual_dropout(text_out)
 
 #             # ==================== Temporal Mixing ====================
 #             seg_padding_mask = ~seg_valid
@@ -611,10 +685,111 @@ def build_hard_segments(T, L):
 #         return latent, seg_valid
 
 
+class TemporalMultiheadAttention_v2(nn.Module):
+    """
+    Modality-speicifc input을 받아 projection 후 MHA를 수행함.
+    Latent Query는 256차원으로 고정함.
+    """
+    def __init__(self, d_model, num_heads, key_input_dim=None, value_input_dim=None, attn_dropout=0.1):
+        super().__init__()
+        self.d_model = d_model                          # Query dim
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.attn_dropout = attn_dropout                # Attention dropout
+        self.q_proj = nn.Linear(d_model, d_model)       # Query Projection
+
+        k_in = key_input_dim if key_input_dim is not None else d_model
+        v_in = value_input_dim if value_input_dim is not None else k_in
+
+        self.k_proj = nn.Linear(k_in, d_model)          # Modality dim → 256
+        self.v_proj = nn.Linear(v_in, d_model)          # Modality dim → 256
+        self.out_proj = nn.Linear(d_model, d_model)     # 256 → 256
+
+        self.ln_query = nn.LayerNorm(d_model)
+        self.ln_key = nn.LayerNorm(k_in)
+        self.ln_value = nn.LayerNorm(v_in)
+
+        self.save_attn = False
+        self.last_attn = None
+
+    def forward(self, query, key, value, key_padding_mask=None):
+        B, T_q, D = query.shape
+        T_k = key.size(1)
+
+        # Pre-LayerNorm
+        query_norm = self.ln_query(query)
+        key_norm = self.ln_key(key)
+        value_norm = self.ln_value(value)
+
+        # Multi-head로 분할
+        Q = self.q_proj(query_norm).view(B, T_q, self.num_heads, self.d_k).transpose(1, 2)
+        K = self.k_proj(key_norm).view(B, T_k, self.num_heads, self.d_k).transpose(1, 2)
+        V = self.v_proj(value_norm).view(B, T_k, self.num_heads, self.d_k).transpose(1, 2)
+
+        # Padding mask를 수식 받아 attention mask로 변환하여 사용함.
+        attn_mask = None
+        if key_padding_mask is not None:
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_mask = attn_mask.expand(B, 1, T_q, T_k)
+            attn_mask = torch.where(attn_mask, float('-inf'), 0.0)
+
+        # ============================================================
+        # Check latent embedding attention (For visualization)
+        if self.save_attn:
+            # scores: [B, H, T_q, T_k]
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_k ** 0.5)
+
+            if attn_mask is not None:
+                scores = scores + attn_mask
+
+            attn = torch.softmax(scores, dim=-1)
+
+            self.last_attn = attn.mean(dim=1).detach()
+        # ============================================================
+        # Standard SDPA
+        out = F.scaled_dot_product_attention(
+            Q, K, V,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=False
+        )
+
+        # MHA 연산 합치기 [B, H, T_q, d_k] → [B, T_q, D]
+        out = out.transpose(1, 2).reshape(B, T_q, D)
+        out = self.out_proj(out)
+        return out
+
+
+class Time2Vec(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = d_model
+
+        self.linear = nn.Linear(1, d_model)
+
+        self.w = nn.Parameter(torch.randn(1, d_model))
+        self.b = nn.Parameter(torch.randn(1, d_model))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.linear.weight, gain=0.1)
+        nn.init.constant_(self.linear.bias, 0.0)
+
+        nn.init.uniform_(self.w, -0.1, 0.1)
+        nn.init.uniform_(self.b, -0.1, 0.1)
+
+    def forward(self, t):
+        t_lin = self.linear(t)
+        t_periodic = torch.sin(t * self.w + self.b)
+        time_emb = t_lin + t_periodic
+        return time_emb
+
+
 class TimeSeriesCentricCrossAttention_v4(nn.Module):
     def __init__(self, args, d_model=256, num_heads=8,
                 ts_input_dim=512, img_input_dim=768, txt_input_dim=768,
-                disable_cxr=False, disable_txt=False
+                disable_cxr=False, disable_txt=False, disable_prompt=False
         ):
         super().__init__()
         self.d_model = d_model                      # latent embedding dimension
@@ -760,104 +935,3 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
             latent = self.ln_latent(latent)
 
         return latent, seg_valid
-
-
-class TemporalMultiheadAttention_v2(nn.Module):
-    """
-    Modality-speicifc input을 받아 projection 후 MHA를 수행함.
-    Latent Query는 256차원으로 고정함.
-    """
-    def __init__(self, d_model, num_heads, key_input_dim=None, value_input_dim=None, attn_dropout=0.1):
-        super().__init__()
-        self.d_model = d_model                          # Query dim
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
-        self.attn_dropout = attn_dropout                # Attention dropout
-        self.q_proj = nn.Linear(d_model, d_model)       # Query Projection
-
-        k_in = key_input_dim if key_input_dim is not None else d_model
-        v_in = value_input_dim if value_input_dim is not None else k_in
-
-        self.k_proj = nn.Linear(k_in, d_model)          # Modality dim → 256
-        self.v_proj = nn.Linear(v_in, d_model)          # Modality dim → 256
-        self.out_proj = nn.Linear(d_model, d_model)     # 256 → 256
-
-        self.ln_query = nn.LayerNorm(d_model)
-        self.ln_key = nn.LayerNorm(k_in)
-        self.ln_value = nn.LayerNorm(v_in)
-
-        self.save_attn = False
-        self.last_attn = None
-
-    def forward(self, query, key, value, key_padding_mask=None):
-        B, T_q, D = query.shape
-        T_k = key.size(1)
-
-        # Pre-LayerNorm
-        query_norm = self.ln_query(query)
-        key_norm = self.ln_key(key)
-        value_norm = self.ln_value(value)
-
-        # Multi-head로 분할
-        Q = self.q_proj(query_norm).view(B, T_q, self.num_heads, self.d_k).transpose(1, 2)
-        K = self.k_proj(key_norm).view(B, T_k, self.num_heads, self.d_k).transpose(1, 2)
-        V = self.v_proj(value_norm).view(B, T_k, self.num_heads, self.d_k).transpose(1, 2)
-
-        # Padding mask를 수식 받아 attention mask로 변환하여 사용함.
-        attn_mask = None
-        if key_padding_mask is not None:
-            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
-            attn_mask = attn_mask.expand(B, 1, T_q, T_k)
-            attn_mask = torch.where(attn_mask, float('-inf'), 0.0)
-
-        # ============================================================
-        # Check latent embedding attention (For visualization)
-        if self.save_attn:
-            # scores: [B, H, T_q, T_k]
-            scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_k ** 0.5)
-
-            if attn_mask is not None:
-                scores = scores + attn_mask
-
-            attn = torch.softmax(scores, dim=-1)
-
-            self.last_attn = attn.mean(dim=1).detach()
-        # ============================================================
-        # Standard SDPA
-        out = F.scaled_dot_product_attention(
-            Q, K, V,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_dropout if self.training else 0.0,
-            is_causal=False
-        )
-
-        # MHA 연산 합치기 [B, H, T_q, d_k] → [B, T_q, D]
-        out = out.transpose(1, 2).reshape(B, T_q, D)
-        out = self.out_proj(out)
-        return out
-
-
-class Time2Vec(nn.Module):
-    def __init__(self, d_model):
-        super().__init__()
-        self.d_model = d_model
-
-        self.linear = nn.Linear(1, d_model)
-
-        self.w = nn.Parameter(torch.randn(1, d_model))
-        self.b = nn.Parameter(torch.randn(1, d_model))
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.linear.weight, gain=0.1)
-        nn.init.constant_(self.linear.bias, 0.0)
-
-        nn.init.uniform_(self.w, -0.1, 0.1)
-        nn.init.uniform_(self.b, -0.1, 0.1)
-
-    def forward(self, t):
-        t_lin = self.linear(t)
-        t_periodic = torch.sin(t * self.w + self.b)
-        time_emb = t_lin + t_periodic
-        return time_emb

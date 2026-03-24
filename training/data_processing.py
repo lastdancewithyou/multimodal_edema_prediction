@@ -17,7 +17,7 @@ from utils.utils import timer, seed_worker
 # CACHED_IMAGE_DIR = "/home/DAHS1/gangmin/my_research/CXR/pt_20260128/" # before edge cut
 # CACHED_IMAGE_DIR = "/home/DAHS1/gangmin/my_research/CXR/cached_images_20260316" # Wrong cropped_outline_image (224 by 224)
 
-CACHED_IMAGE_DIR = "/home/DAHS1/gangmin/my_research/CXR/cached_images_224_0317" # cropped_outline_image (256 by 256)
+CACHED_IMAGE_DIR = "/home/DAHS1/gangmin/my_research/CXR/cached_images_224_0317" # cropped_outline_image (224 by 224)
 # CACHED_IMAGE_DIR = "/home/DAHS1/gangmin/my_research/CXR/cached_images_256_0317" # cropped_outline_image (256 by 256)
 
 
@@ -170,7 +170,7 @@ class SCL_Multi_Dataset(Dataset):
         img_index_series = [t if t in self.image_map[stay_id] else -1 for t in hour_slots]
         text_index_series = [t if t in self.text_map[stay_id] else -1 for t in hour_slots]
         prompt_index_series = [int(pid) if pd.notna(pid) and pid != -1 and int(pid) in self.prompt_map[stay_id] else -1
-                               for pid in prompt_ids]
+                            for pid in prompt_ids]
 
         sequence_series, edema_label_series, subtype_label_series, has_cxr_series, has_text_series, valid_mask_series = [], [], [], [], [], []
         L = len(stay_data)
@@ -335,7 +335,7 @@ class SCL_Multi_Dataset(Dataset):
                         txt_key = (stay_id, txt_hour)
                         text_index_tensor[i, j, t] = txt_key_to_idx[txt_key]
 
-                    # Clinical prompt index (always has value, including -1)
+                    # Clinical prompt index
                     prompt_id = step['prompt_index']
                     prompt_key = (stay_id, prompt_id)
                     prompt_index_tensor[i, j, t] = prompt_key_to_idx[prompt_key]
@@ -486,7 +486,6 @@ def get_dataloaders(ts_df, cxr_df, text_df, clinical_prompt_df, args, accelerato
             'num_workers': num_workers,
         }
 
-        # Only use prefetch_factor and persistent_workers if num_workers > 0
         if num_workers > 0:
             dataloader_kwargs['prefetch_factor'] = 2
             dataloader_kwargs['persistent_workers'] = True
