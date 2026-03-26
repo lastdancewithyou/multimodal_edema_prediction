@@ -42,9 +42,6 @@ class MultiModalEncoder(nn.Module):
         # for name, param in self.img_encoder.named_parameters():
         #     if any(name.startswith(prefix) for prefix in _densenet_unfreeze):
         #         param.requires_grad = True
-        # _img_trainable = sum(p.numel() for p in self.img_encoder.parameters() if p.requires_grad)
-        # _img_total     = sum(p.numel() for p in self.img_encoder.parameters())
-        # print(f"[MultiModalEncoder] DenseNet121: {_img_trainable:,} / {_img_total:,} params trainable")
         ##########################################################################################
         img_model = CXformer.from_pretrained("m42-health/CXformer-base", context_dim=768)
 
@@ -57,6 +54,8 @@ class MultiModalEncoder(nn.Module):
             alpha=32,
             dropout=0.1
         )
+
+        self.spatial_pooling = AnatomicalSpatialPooling(dim=768)
         
         # Text Encoder: BioClinicalBERT
         language_model = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
@@ -84,7 +83,7 @@ class MultiModalEncoder(nn.Module):
             d_model=256,
             num_heads=8,
             ts_input_dim=512,       # TS encoder output dim
-            img_input_dim=768,     # DenseNet121 feature dim
+            img_input_dim=768,      # DenseNet121 feature dim
             txt_input_dim=768,      # BioClinicalBERT hidden size
             disable_cxr=disable_cxr,
             disable_txt=disable_txt,
@@ -96,23 +95,14 @@ class MultiModalEncoder(nn.Module):
 
     def forward(self, args, ts_series, cxr_data, text_data, prompt_data, has_cxr, has_text,
                 window_mask, seq_valid_mask, time_steps=None):
-        """
-        Forward pass through all modality encoders, fusion, and attention pooling to get embedding for contrastive learning & CLassification.
 
-        Args:
-            prompt_data: dict with 'unique_prompt_texts' and 'prompt_index_tensor'
-
-        Returns:
-            window_embeddings: [B, W, 256] - Pooled window-level embeddings
-            window_mask: [B, W] - Window validity mask
-        """
         device = ts_series.device
         B, W, T, D = ts_series.shape
 
         # ================ Clinical Prompt Encoding ================
         with timer("Clinical Prompt Encoder", None):
             unique_prompt_texts = prompt_data['unique_prompt_texts']
-            prompt_index_tensor = prompt_data['prompt_index_tensor']  # [B, W, T]
+            prompt_index_tensor = prompt_data['prompt_index_tensor']
 
             # Tokenize unique prompts
             tokenized_prompts = self.prompt_tokenizer(
@@ -143,30 +133,28 @@ class MultiModalEncoder(nn.Module):
             valid_ts_series = ts_series_flat[valid_indices]                         # 유효한 window만 선택
             valid_seq_lengths = seq_valid_lengths_flat[valid_indices]
 
-            # ===== Clinical Prompt Prefix for TS Encoder =====
+            # ===== Clinical Prompt Prefix Tuning for TS Encoder =====
             """
-            - 각 window의 마지막 valid timestep의 clinical prompt 선택
-            - Valid window에만 prompt 전달
-            - TS encoder에 clinical prompt를 전달
+            1. 각 window의 마지막 valid timestep의 clinical prompt 선택
+            2. Valid window에만 prompt 전달
+            3. TS encoder에 clinical prompt를 전달
             """
-            # Use window-level prompt (last timestep prompt for each window)
+            # Use window-level last timestep prompt for each window
             if not self.disable_prompt:
                 # Get prompt for each window's last valid timestep
-                # prompt_index_tensor: [B, W, T]
-                # For each window, use the last valid timestep's prompt
                 window_prompt_indices = torch.zeros(B, W, dtype=torch.long, device=device)
                 for b in range(B):
                     for w in range(W):
                         if window_mask[b, w]:
-                            # Find last valid timestep in this window
-                            valid_mask = seq_valid_mask[b, w, :]
+                            valid_mask = seq_valid_mask[b, w, :]  # Find last valid timestep in this window
                             if valid_mask.any():
                                 last_valid_t = valid_mask.nonzero(as_tuple=False)[-1].item()
                                 window_prompt_indices[b, w] = prompt_index_tensor[b, w, last_valid_t]
 
-                # Get prompt embeddings for valid windows [BW, 768] -> [Nwin, 768]
+                # Get prompt embeddings for valid windows
                 window_prompt_indices_flat = window_prompt_indices.view(B * W)
-                valid_window_prompts = unique_prompt_embeddings[window_prompt_indices_flat[valid_indices]]  # [Nwin, 768]
+                valid_window_prompts = unique_prompt_embeddings[window_prompt_indices_flat[valid_indices]] # [BW, 768] -> [Nwin, 768]
+
             else:
                 valid_window_prompts = None
 
@@ -177,7 +165,6 @@ class MultiModalEncoder(nn.Module):
                 clinical_prompt=valid_window_prompts  # [Nwin, 768] or None
             )
 
-            # 고정된 zero matrix를 만든 후, 유효한 window만 처리할 수 있도록 처리함.
             ts_encoded = torch.zeros(
                 B * W, T, valid_ts_encoded.shape[-1],
                 device=device, dtype=valid_ts_encoded.dtype
@@ -201,35 +188,37 @@ class MultiModalEncoder(nn.Module):
                 pos = cxr_data['positions']                     # (batch, window, timestep)
 
                 if unique_images.numel() > 0:
-                    # Map clinical prompt context to each UNIQUE image
-                    # pos는 중복 포함 모든 위치 (1183개), unique_images는 중복 제거된 이미지 (79개)
-                    # unique_indices[i]는 i번째 위치의 이미지가 몇 번째 unique image인지를 나타냄
-
+                    # 현재 referencing은 중단 상태임.
                     # Get prompts for all positions first
                     b_pos, w_pos, t_pos = pos[:, 0].long(), pos[:, 1].long(), pos[:, 2].long()
-                    all_prompt_indices = prompt_index_tensor[b_pos, w_pos, t_pos]  # [1183] - 모든 위치의 prompt index
+                    # all_prompt_indices = prompt_index_tensor[b_pos, w_pos, t_pos]  # [1183] - 모든 위치의 prompt index
 
-                    # For each unique image, get the prompt from its first occurrence
-                    # unique_indices: [1183] - 각 위치가 몇 번째 unique image인지
-                    num_unique_images = unique_images.size(0)  # 79
-                    unique_prompt_indices = torch.zeros(num_unique_images, dtype=torch.long, device=device)
+                    # # For each unique image, get the prompt from its first occurrence
+                    # # unique_indices: [1183] - 각 위치가 몇 번째 unique image인지
+                    # num_unique_images = unique_images.size(0)
+                    # unique_prompt_indices = torch.zeros(num_unique_images, dtype=torch.long, device=device)
 
-                    # For each unique image, find the first occurrence and use that prompt
-                    for i in range(num_unique_images):
-                        first_occurrence_mask = (unique_indices == i)
-                        first_occurrence_idx = first_occurrence_mask.nonzero(as_tuple=False)[0].item()
-                        unique_prompt_indices[i] = all_prompt_indices[first_occurrence_idx]
+                    # for i in range(num_unique_images):
+                    #     first_occurrence_mask = (unique_indices == i)
+                    #     first_occurrence_idx = first_occurrence_mask.nonzero(as_tuple=False)[0].item()
+                    #     unique_prompt_indices[i] = all_prompt_indices[first_occurrence_idx]
 
-                    # Now get context embeddings for unique images only
-                    image_context_embeddings = unique_prompt_embeddings[unique_prompt_indices]  # [79, 768]
-                    image_context_embeddings = image_context_embeddings.unsqueeze(1)  # [79, 1, 768]
+                    # image_context_embeddings = unique_prompt_embeddings[unique_prompt_indices]  # [79, 768]
+                    # image_context_embeddings = image_context_embeddings.unsqueeze(1)  # [79, 1, 768]
 
                     # Encode images with clinical prompt as context
-                    outputs = self.img_encoder(unique_images, context=image_context_embeddings)
-                    unique_features = outputs["x_norm_clstoken"]
-                    scattered = unique_features[unique_indices]
-                    scattered = scattered.to(dtype=ts_embeddings.dtype)
+                    outputs = self.img_encoder(unique_images, context=None)
+                    # unique_features = outputs["x_norm_clstoken"]
+                    
+                    #############################################
+                    # Spatiality 부여
+                    cls_token = outputs['x_norm_clstoken']
+                    patch_tokens = outputs['x_norm_patchtokens']
 
+                    unique_features = self.spatial_pooling(cls_token, patch_tokens)
+                    #############################################
+
+                    scattered = unique_features[unique_indices].to(dtype=ts_embeddings.dtype)
                     img_tensor[b_pos, w_pos, t_pos] = scattered     # 원래 위치 (b, w, t)에 이미지 임베딩 넣기
                     has_img[b_pos, w_pos, t_pos] = True             # 이미지 존재 여부 마스킹
 
@@ -359,12 +348,18 @@ class MultiModalMultiTaskModel(nn.Module):
         super().__init__()
 
         self.encoder = encoder
-    
+
         # Binary classifier head for edema detection
         self.edema_classifier = nn.Linear(256, 1)  # [B, W, 256] → [B, W, 1]
 
         # Hierarchical classifier for subtype classification
-        self.subtype_classifier = nn.Linear(256, 2)  # [B, W, 256] → [B, W, num_subtypes]
+        self.subtype_classifier = nn.Sequential(
+            nn.Dropout(p=0.3),
+            nn.Linear(256, 2)
+        )
+
+        # Regression head for score_diff prediction (only for Edema==1)
+        self.regression_head = RegressionHead(input_dim=256)
 
     def forward(self, args, ts_series, cxr_data, text_data, prompt_data, has_cxr, has_text,
             window_mask, seq_valid_mask, time_steps=None,
@@ -383,6 +378,9 @@ class MultiModalMultiTaskModel(nn.Module):
 
         # Subtype logits for valid windows
         subtype_logits = self.subtype_classifier(window_embeddings)
+
+        # Regression predictions for raw score_diff (-7~11 range)
+        regression_preds = self.regression_head(window_embeddings)
 
         # Extract valid windows
         """
@@ -403,6 +401,7 @@ class MultiModalMultiTaskModel(nn.Module):
         return {
             'edema_logits': edema_logits,                     # [B, W, 1]
             'subtype_logits': subtype_logits,                   # [B, W, 2]
+            'regression_preds': regression_preds,               # [B, W, 1] - raw score_diff predictions (-7~11)
             'window_embeddings': window_embeddings,             # [B, W, 256]
             'valid_embeddings': valid_windows,                  # for contrastive
             'window_time_indices': window_time_indices_flat,    # [Nwin]
@@ -410,6 +409,7 @@ class MultiModalMultiTaskModel(nn.Module):
         }
 
 
+# Multi-layer AttentionPooling
 class AttentionPooling(nn.Module):
     """
     L개의 latent를 하나의 window embedding으로 압축함.
@@ -435,6 +435,7 @@ class AttentionPooling(nn.Module):
         return weighted_emb
 
 
+# Single-layer AttentionPooling
 # class AttentionPooling(nn.Module):
 #     """
 #     L개의 latent를 하나의 window embedding으로 압축함.
@@ -475,19 +476,17 @@ class ProjectionHead(nn.Module):
         return x
 
 
-class SingleClassifier(nn.Module):
+class RegressionHead(nn.Module):
     """
-    Simple Linear classifier
+    Regression head for predicting raw score_diff (-7~11 range)
+    Only applied to windows with Edema==1
     """
-    def __init__(self, input_dim, num_classes, 
-        ):
+    def __init__(self, input_dim=256):
         super().__init__()
-        self.linear = nn.Sequential(
-            nn.Linear(input_dim, num_classes)
-        )
+        self.regressor = nn.Linear(input_dim, 1)
 
     def forward(self, x):
-        return self.linear(x)
+        return self.regressor(x)
 
 
 def build_hard_segments(T, L):
@@ -821,9 +820,11 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
         )
 
         # Modality-specific Time2Vec for time encoding
-        self.time2vec_img = Time2Vec(img_input_dim) 
-        self.time2vec_txt = Time2Vec(txt_input_dim) 
+        self.time2vec_ts = Time2Vec(ts_input_dim) # time2vec도 다시 추가해줌.
+        self.time2vec_img = Time2Vec(img_input_dim)
+        self.time2vec_txt = Time2Vec(txt_input_dim)
 
+        self.ln_time_ts = nn.LayerNorm(ts_input_dim)
         self.ln_time_img = nn.LayerNorm(img_input_dim)
         self.ln_time_txt = nn.LayerNorm(txt_input_dim)
         self.ln_latent = nn.LayerNorm(d_model)
@@ -839,7 +840,10 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
         B, T, _ = ts_embeddings.shape
         L = self.num_latents
 
-        # ================ Time emb add to Img, Text modality after projection ================
+        # ================ Time emb add to TS, Img, Text modality after projection ================
+        time_emb_ts_raw = self.time2vec_ts(time_indices.unsqueeze(-1))  # [B, T, 768]
+        time_emb_ts = self.ln_time_ts(time_emb_ts_raw)
+
         time_emb_img_raw = self.time2vec_img(time_indices.unsqueeze(-1))  # [B, T, 768]
         time_emb_img = self.ln_time_img(time_emb_img_raw)
 
@@ -872,11 +876,12 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
             # ==================== TS -> Latent ====================
             latent_updates = []
             all_attention_weights = []
+            ts_with_time = ts_embeddings + time_emb_ts
 
             # 각 segment 별 독립적으로 cross-attention 수행함.
             for i, (s, e) in enumerate(segments):
                 q_i = latent[:, i:i+1, :] # [B, 1, D] - i번째 latent query
-                k_i = ts_embeddings[:, s:e, :] # [B, seg, D] - i번째 구간의 TS
+                k_i = ts_with_time[:, s:e, :] # [B, seg, D] - i번째 구간의 TS
                 v_i = k_i
 
                 kp_i = None
@@ -935,3 +940,34 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
             latent = self.ln_latent(latent)
 
         return latent, seg_valid
+
+
+class AnatomicalSpatialPooling(nn.Module):
+    """
+    CXR patch tokens → CLS + 5개 해부학적 regional 임베딩
+    폐부종 진단에 중요한 중심부(심장/종격)에 초기 bias 부여
+    """
+    def __init__(self, dim=768):
+        super().__init__()
+        init = torch.tensor([1.0, 2.0, 1.0, 1.0, 1.0, 1.0])    # [cls, center(Perihilar region), Upper Left, Upper Right, Lower Left, Lower Right] / 중심부에 높은 초기값
+        self.region_logits = nn.Parameter(init.log())          # softmax 전 logit
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, cls_token, patch_tokens):
+        N = patch_tokens.size(0)
+        sp = patch_tokens.reshape(N, 16, 16, 768)
+
+        regions = [
+            cls_token,                             # global
+            sp[:, 4:12, 4:12, :].mean(dim=(1,2)),  # center  (심장/종격/내측폐)
+            sp[:, 0:6,  0:8,  :].mean(dim=(1,2)),  # upper_left
+            sp[:, 0:6,  8:16, :].mean(dim=(1,2)),  # upper_right
+            sp[:, 10:,  0:8,  :].mean(dim=(1,2)),  # lower_left
+            sp[:, 10:,  8:16, :].mean(dim=(1,2)),  # lower_right
+        ]
+        stacked = torch.stack(regions, dim=1)
+
+        # learnable weighted sum
+        w = self.region_logits.softmax(dim=0)               # [6]
+        fused = (stacked * w[None, :, None]).sum(dim=1)     # [N, 768]
+        return self.proj(fused)

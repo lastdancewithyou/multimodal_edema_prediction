@@ -569,27 +569,6 @@ class CXformer(nn.Module):
 
     @staticmethod
     def _remap_checkpoint(sd: dict) -> dict:
-        """
-        HuggingFace transformers 형식(Dinov2WithRegisters)의 state_dict를
-        CXformer 키 구조로 변환합니다.
-
-        주요 변환:
-          embeddings.cls_token                          → cls_token
-          embeddings.mask_token                         → (제거, 사용 안 함)
-          embeddings.position_embeddings                → pos_embed
-          embeddings.register_tokens                    → register_tokens
-          embeddings.patch_embeddings.projection.*      → patch_embed.proj.*
-          encoder.layer.{i}.norm1.*                     → blocks.{i}.norm1.*
-          encoder.layer.{i}.norm2.*                     → blocks.{i}.norm2.*
-          encoder.layer.{i}.layer_scale1.lambda1        → blocks.{i}.ls1.gamma
-          encoder.layer.{i}.layer_scale2.lambda1        → blocks.{i}.ls2.gamma
-          encoder.layer.{i}.mlp.*                       → blocks.{i}.mlp.*
-          encoder.layer.{i}.attention.output.dense.*    → blocks.{i}.attn.proj.*
-          encoder.layer.{i}.attention.attention.query.* }
-          encoder.layer.{i}.attention.attention.key.*   } → blocks.{i}.attn.qkv.*  (Q,K,V cat)
-          encoder.layer.{i}.attention.attention.value.* }
-          layernorm.*                                   → norm.*
-        """
         new_sd = {}
         # Q, K, V 를 블록별로 모아서 나중에 cat
         qkv_buf: dict = {}  # {i: {"query": {"weight": t, "bias": t}, ...}}
@@ -813,26 +792,34 @@ def apply_lora_to_cxformer(
         replaced.add(name)
 
     # Step 4: Cross-attention layers는 full fine-tuning (unfreeze)
-    # v5: Cross-attention 사용 안함 (context=None) - freeze 유지
-    # cross_attn_params = 0
-    # cross_attn_layers = []
+    cross_attn_params = 0
+    cross_attn_layers = []
+    for name, param in model.named_parameters():
+        if "cross_attn" in name:
+            param.requires_grad_(True)
+            cross_attn_params += param.numel()
+            cross_attn_layers.append(name)
+
+    ####################################################################################
+    # # Step 5: Unfreeze last 2 layers' FFN and LayerNorms for task-specific adaptation
+    # last2_params = 0
+    # last2_layers = []
     # for name, param in model.named_parameters():
-    #     if "cross_attn" in name:
-    #         param.requires_grad_(True)
-    #         cross_attn_params += param.numel()
-    #         cross_attn_layers.append(name)
+    #     # Check if parameter belongs to blocks.10 or blocks.11 (last 2 of 12 layers)
+    #     if any(f"blocks.{i}." in name for i in [10, 11]):
+    #         # Unfreeze FFN components (MLP layers and norm2)
+    #         if any(key in name for key in ["mlp", "norm2"]):
+    #             param.requires_grad_(True)
+    #             last2_params += param.numel()
+    #             last2_layers.append(name)
+    #         # Also unfreeze cross-attention layer norms (even though unused with context=None)
+    #         if "norm_cross" in name:
+    #             param.requires_grad_(True)
+    #             last2_params += param.numel()
+    #             last2_layers.append(name)
 
-    # lora_params = 0
-    # for name, module in model.named_modules():
-    #     if isinstance(module, LoRALinear):
-    #         lora_params += module.lora_A.numel() + module.lora_B.numel()
-
-    # total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    # total_params = sum(p.numel() for p in model.parameters())
-
-    # print(f"[LoRA] Applied to {len(replaced)} self-attention layers ({lora_params:,} params)")
-    # print(f"[Full Fine-tuning] Unfroze {len(cross_attn_layers)} cross-attention layers ({cross_attn_params:,} params)")
-    # print(f"[Total] Trainable params: {total_trainable:,} / {total_params:,} "
-    #       f"({100 * total_trainable / total_params:.2f}%)")
+    # print(f"  Last 2 layers FFN/LayerNorm unfrozen: {last2_params:,} parameters")
+    # print(f"    - Blocks 10-11 FFN and LayerNorms will be fully fine-tuned")
+    ####################################################################################
 
     return model

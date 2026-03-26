@@ -187,7 +187,7 @@ class Earlystopping:
         else:
             self.save_path = save_path
 
-    def __call__(self, args, auroc, model, epoch):
+    def __call__(self, args, auroc, model, epoch, accelerator=None):
         early_stop = False
 
         # early stopping 시작 시점은 warm up 종료 시점
@@ -200,7 +200,22 @@ class Earlystopping:
 
             if self.save_path is not None:
                 os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-                torch.save(model.state_dict(), self.save_path)
+
+                # Unwrap model to remove DDP/Accelerate wrapper before saving
+                if accelerator is not None:
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    model_state = unwrapped_model.state_dict()
+                else:
+                    model_state = model.state_dict()
+
+                # Save model state_dict along with args and metadata
+                checkpoint = {
+                    'model_state_dict': model_state,
+                    'args': args,
+                    'epoch': epoch,
+                    'val_level1_auroc': auroc,
+                }
+                torch.save(checkpoint, self.save_path)
                 print(f"[Epoch {epoch+1}] 🔥 성능 향상! Best AUROC: {self.best_auroc:.4f} ([공통 경로에 덮어씌웁니다.]: {self.save_path})")
         else:
             self.counter += 1
@@ -213,84 +228,6 @@ class Earlystopping:
     def get_best_model_path(self):
         """학습 종료 후 best model 경로 반환"""
         return self.save_path
-
-class stage2_Earlystopping:
-    def __init__(self, patience, start_epoch=0, save_path=None, experiment_id=None):
-        self.patience = patience
-        self.start_epoch = start_epoch
-        self.best_auroc = float('-inf')
-        self.counter = 0
-        self.experiment_id = experiment_id
-
-        # experiment_id가 제공되면 실험별 폴더 생성
-        if save_path is not None and experiment_id is not None:
-            base_dir = os.path.dirname(save_path)
-            filename = os.path.basename(save_path)
-            self.save_path = os.path.join(base_dir, f"experiment_{experiment_id}", filename)
-        else:
-            self.save_path = save_path
-
-    def __call__(self, args, auroc, model, epoch):
-        early_stop = False
-
-        # early stopping 시작 시점은 warm up 종료 시점
-        if epoch < self.start_epoch:
-            return False
-
-        if auroc > self.best_auroc:
-            self.best_auroc = auroc
-            self.counter = 0
-
-            # 실험별 폴더에 저장
-            if self.save_path is not None:
-                os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
-                torch.save(model.state_dict(), self.save_path)
-                print(f"[Epoch {epoch+1}] 🔥 성능 향상! Best AUROC: {self.best_auroc:.4f} (저장 완료: {self.save_path})")
-        else:
-            self.counter += 1
-            print(f"📉 성능 개선 없음. patience 추가 {self.counter}")
-
-            if self.counter >= self.patience:
-                early_stop = True
-        return early_stop
-
-    def get_best_model_path(self):
-        """학습 종료 후 best model 경로 반환"""
-        return self.save_path
-
-
-class stage1_earlystopping:
-    """
-    Stage 1용 Early Stopping: Loss 기반 (낮을수록 좋음)
-    """
-    def __init__(self, patience, start_epoch=0):
-        self.patience = patience
-        self.start_epoch = start_epoch
-        self.best_loss = float('inf')  # 낮을수록 좋으므로 inf로 초기화
-        self.counter = 0
-
-    def __call__(self, args, loss, model, epoch):
-        """
-        Args:
-            loss: 실제 loss 값 (낮을수록 좋음)
-        """
-        early_stop = False
-
-        # early stopping 시작 시점은 warm up 종료 시점
-        if epoch < self.start_epoch:
-            return False
-
-        if loss < self.best_loss:  # Loss가 감소하면 개선
-            self.best_loss = loss
-            self.counter = 0
-            print(f"[Epoch {epoch+1}] 🔥 Loss 개선! (Best Loss: {self.best_loss:.4f})")
-        else:
-            self.counter += 1
-            print(f"📉 Loss 개선 없음. patience 추가 {self.counter} (Current: {loss:.4f}, Best: {self.best_loss:.4f})")
-
-            if self.counter >= self.patience:
-                early_stop = True
-        return early_stop
 
 
 def compute_class_weights(label_tensor, num_classes):

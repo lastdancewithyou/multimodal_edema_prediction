@@ -28,6 +28,8 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
     bce_count = torch.zeros(1, device=device, dtype=torch.float32)
     ce_sum = torch.zeros(1, device=device, dtype=torch.float32)
     ce_count = torch.zeros(1, device=device, dtype=torch.float32)
+    mse_sum = torch.zeros(1, device=device, dtype=torch.float32)
+    mse_count = torch.zeros(1, device=device, dtype=torch.float32)
 
     val_edema_preds_list = []
     val_edema_labels_list = []
@@ -36,7 +38,7 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
 
     with torch.no_grad():
         for batch in tqdm(dataloader, total=len(dataloader), desc="🤖 <Multi-Task Validation>"):
-            _, batch_bce, batch_ce, batch_outputs, batch_counts = train_batch(
+            _, batch_bce, batch_ce, batch_mse, batch_outputs, batch_counts = train_batch(
                 args=args,
                 model=model,
                 batch=batch,
@@ -49,15 +51,19 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
                 disable_txt=disable_txt,
                 bce_weight=args.bce_weight,
                 ce_weight=args.ce_weight,
+                mse_weight=args.mse_weight,
             )
 
             bce_ct_local = torch.as_tensor(batch_counts['bce_count'], device=device, dtype=torch.float32)
             ce_ct_local = torch.as_tensor(batch_counts['ce_count'], device=device, dtype=torch.float32)
+            mse_ct_local = torch.as_tensor(batch_counts['mse_count'], device=device, dtype=torch.float32)
 
             bce_sum += torch.as_tensor(batch_bce, device=device, dtype=torch.float32) * bce_ct_local
             bce_count += bce_ct_local
             ce_sum += torch.as_tensor(batch_ce, device=device, dtype=torch.float32) * ce_ct_local
             ce_count += ce_ct_local
+            mse_sum += torch.as_tensor(batch_mse, device=device, dtype=torch.float32) * mse_ct_local
+            mse_count += mse_ct_local
 
             edema_logits = batch_outputs['edema_logits'].squeeze(-1)  # [B, W]
             subtype_logits = batch_outputs['subtype_logits']           # [B, W, 2]
@@ -87,18 +93,24 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
         total_bce_count = accelerator.gather_for_metrics(bce_count).sum()
         total_ce_sum = accelerator.gather_for_metrics(ce_sum).sum()
         total_ce_count = accelerator.gather_for_metrics(ce_count).sum()
+        total_mse_sum = accelerator.gather_for_metrics(mse_sum).sum()
+        total_mse_count = accelerator.gather_for_metrics(mse_count).sum()
     else:
         total_bce_sum = bce_sum
         total_bce_count = bce_count
         total_ce_sum = ce_sum
         total_ce_count = ce_count
+        total_mse_sum = mse_sum
+        total_mse_count = mse_count
 
     bce_avg = (total_bce_sum / (total_bce_count + 1e-8)).item()
     ce_avg = (total_ce_sum / (total_ce_count + 1e-8)).item()
+    mse_avg = (total_mse_sum / (total_mse_count + 1e-8)).item()
 
-    bce_contrib = args.bce_weight * bce_avg 
+    bce_contrib = args.bce_weight * bce_avg
     ce_contrib = args.ce_weight * ce_avg
-    total_loss = bce_contrib + ce_contrib
+    mse_contrib = args.mse_weight * mse_avg
+    total_loss = bce_contrib + ce_contrib + mse_contrib
 
     # Gather predictions from all GPUs
     if accelerator.num_processes > 1:
@@ -293,12 +305,12 @@ def validate_multitask(args, model, dataloader, loss_module, device, accelerator
                     print(f"  └─ {class_name} ECE={val_metrics[ece_key]:.4f}")
             print()
 
-    return total_loss, bce_avg, ce_avg, val_metrics
+    return total_loss, bce_avg, ce_avg, mse_avg, val_metrics
 
 
 # Test 함수
 def test(args, model, dataloader, loss_module, device, accelerator, dataset):
-    test_loss, test_bce_avg, test_ce_avg, test_metrics = validate_multitask(
+    test_loss, test_bce_avg, test_ce_avg, test_mse_avg, test_metrics = validate_multitask(
         args, model, dataloader, loss_module, device, accelerator, dataset, epoch="final"
     )
 
@@ -333,4 +345,4 @@ def test(args, model, dataloader, loss_module, device, accelerator, dataset):
             f"AUPRC={test_metrics['level3_auprc']:.4f}")
         print("="*80 + "\n")
 
-    return test_loss, test_bce_avg, test_ce_avg, test_metrics, wandb_test_metrics
+    return test_loss, test_bce_avg, test_ce_avg, test_mse_avg, test_metrics, wandb_test_metrics

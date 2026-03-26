@@ -35,7 +35,7 @@ class SCL_Multi_Dataset(Dataset):
         # Exclude clinical_prompt and prompt_id from time-series features
         exclude_cols = ['hadm_id', 'stay_id', 'hour_slot', 'Edema', 'subtype_label',
                         'cxr_flag', 'hash_path', 'text_flag', 'tokenized_text',
-                        'clinical_prompt', 'prompt_id']
+                        'clinical_prompt', 'prompt_id', 'score_diff', 'score_diff_normalized']
         all_feature_cols = [col for col in self.merged_df.columns if col not in exclude_cols]
 
         self.ts_features = all_feature_cols  # Includes both features and observed_mask
@@ -160,6 +160,7 @@ class SCL_Multi_Dataset(Dataset):
         hour_slots = stay_data['hour_slot'].to_numpy()
         edema_labels = stay_data['Edema'].to_numpy()  # Binary edema label (0, 1, or -1)
         subtype_labels = stay_data['subtype_label'].to_numpy()  # Subtype label (1, 2, or -1) - will be converted to (0, 1, or -1)
+        score_diff_targets = stay_data['score_diff'].to_numpy() if 'score_diff' in stay_data.columns else np.full(len(stay_data), np.nan)  # Regression target (raw score_diff: -7~11)
         # Time-series features 추출 (observed_mask 포함)
         ts_feature_values = torch.tensor(stay_data[self.ts_features].astype(np.float32).to_numpy(), dtype=torch.float32)
 
@@ -172,7 +173,7 @@ class SCL_Multi_Dataset(Dataset):
         prompt_index_series = [int(pid) if pd.notna(pid) and pid != -1 and int(pid) in self.prompt_map[stay_id] else -1
                             for pid in prompt_ids]
 
-        sequence_series, edema_label_series, subtype_label_series, has_cxr_series, has_text_series, valid_mask_series = [], [], [], [], [], []
+        sequence_series, edema_label_series, subtype_label_series, score_diff_series, has_cxr_series, has_text_series, valid_mask_series = [] , [], [], [], [], [], []
         L = len(stay_data)
 
         # ========== Sliding Window 생성 ==========
@@ -204,11 +205,12 @@ class SCL_Multi_Dataset(Dataset):
                 has_text_series.append([int(x != -1) for x in window_text])     # 1 if text exists
                 valid_mask_series.append([1] * self.window_size)
 
-                # 라벨 할당 (both edema and subtype)
+                # 라벨 할당 (edema, subtype, score_diff)
                 label_idx = i + self.window_size + self.prediction_horizon - 1
                 if label_idx < len(edema_labels):
                     future_edema = edema_labels[label_idx]
                     future_subtype = subtype_labels[label_idx]
+                    future_score_diff = score_diff_targets[label_idx]
                     if np.isnan(future_edema):
                         future_edema = -1
                     if np.isnan(future_subtype):
@@ -216,11 +218,14 @@ class SCL_Multi_Dataset(Dataset):
                     # Convert subtype labels from {1, 2} to {0, 1} for CE loss
                     elif future_subtype in [1, 2]:
                         future_subtype = future_subtype - 1
+                    # score_diff는 NaN 그대로 유지 (loss에서 필터링)
                 else:
                     future_edema = -1
                     future_subtype = -1
+                    future_score_diff = np.nan
                 edema_label_series.append(future_edema)
                 subtype_label_series.append(future_subtype)
+                score_diff_series.append(future_score_diff)
 
         # 생성된 모든 window는 유효함 (window_mask=1) - 이후 collate_fn에서 배치 간 length를 맞춰줄 때 window_mask에 0을 할당함.
         window_mask = [1] * len(sequence_series)
@@ -232,6 +237,7 @@ class SCL_Multi_Dataset(Dataset):
             'has_text': has_text_series,
             'edema_label_series': edema_label_series,
             'subtype_label_series': subtype_label_series,
+            'score_diff_series': score_diff_series,
             'window_mask': window_mask,
             'valid_mask_series': valid_mask_series
         }
@@ -247,6 +253,7 @@ class SCL_Multi_Dataset(Dataset):
         modality_series_list = [item['modality_series'] for item in batch]
         edema_label_series_list = [item['edema_label_series'] for item in batch]
         subtype_label_series_list = [item['subtype_label_series'] for item in batch]
+        score_diff_series_list = [item['score_diff_series'] for item in batch]
         window_mask_list = [item['window_mask'] for item in batch]
         valid_seq_mask_list = [item['valid_mask_series'] for item in batch]
 
@@ -313,6 +320,7 @@ class SCL_Multi_Dataset(Dataset):
         # 각 window의 라벨 (-1은 패딩이거나 유효하지 않은 경우)
         edema_label_tensor = torch.full((len(batch), max_windows), fill_value=-1, dtype=torch.long)
         subtype_label_tensor = torch.full((len(batch), max_windows), fill_value=-1, dtype=torch.long)
+        score_diff_tensor = torch.full((len(batch), max_windows), fill_value=float('nan'), dtype=torch.float32)
 
         # ==================== 실제 값 채우기 ====================
         for i, item in enumerate(batch):
@@ -343,6 +351,7 @@ class SCL_Multi_Dataset(Dataset):
             window_mask_tensor[i, :num_windows] = torch.tensor(window_mask_list[i][:num_windows], dtype=torch.bool)
             edema_label_tensor[i, :num_windows] = torch.tensor(edema_label_series_list[i], dtype=torch.long)
             subtype_label_tensor[i, :num_windows] = torch.tensor(subtype_label_series_list[i], dtype=torch.long)
+            score_diff_tensor[i, :num_windows] = torch.tensor(score_diff_series_list[i], dtype=torch.float32)
 
         # ==================== Clinical Prompt Extraction ====================
         # Extract unique prompt texts (raw text for tokenization in model forward)
@@ -364,6 +373,7 @@ class SCL_Multi_Dataset(Dataset):
             'valid_seq_mask': valid_seq_mask_tensor,     # [B, W, T]
             'edema_labels': edema_label_tensor,          # [B, W] - Binary edema labels
             'subtype_labels': subtype_label_tensor,      # [B, W] - Subtype labels (0, 1, 2, or -1)
+            'score_diff_targets': score_diff_tensor,     # [B, W] - Score diff regression targets (0~1, NaN for invalid)
         }
 
     def _extract_label_metadata(self):

@@ -11,17 +11,18 @@ from utils.utils import timer
 
 # 단일 배치 학습 함수
 def train_batch(args, model, batch, loss_module, device, accelerator, dataset, disable_cxr=False, disable_txt=False, max_length=256,
-                bce_weight=None, ce_weight=None
+                bce_weight=None, ce_weight=None, mse_weight=None
     ):
     model.train()
 
     # ==================== 1. 배치 데이터 GPU 전송 ====================
     with timer("Batch Data preparation", accelerator):
         # New multi-task format
-        for k in ['edema_labels', 'subtype_labels', 'window_mask', 'valid_seq_mask']:
+        for k in ['edema_labels', 'subtype_labels', 'score_diff_targets', 'window_mask', 'valid_seq_mask']:
             batch[k] = batch[k].to(device, non_blocking=True)
         edema_labels = batch['edema_labels']
         subtype_labels = batch['subtype_labels']
+        score_diff_targets = batch['score_diff_targets']
 
 
 
@@ -61,22 +62,26 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
 
             edema_logits = model_outputs['edema_logits']                # [B, W, 1]
             subtype_logits = model_outputs['subtype_logits']            # [B, W, 2]
+            regression_preds = model_outputs['regression_preds']         # [B, W, 1]
             valid_embeddings = model_outputs['valid_embeddings']        # [Nwin, 256]
             window_time_indices = model_outputs['window_time_indices']  # [Nwin]
             batch_indices = model_outputs['batch_indices']              # [Nwin]
 
             with timer("Main loss 연산", accelerator):
-                total_batch_loss, bce_loss_t, ce_loss_t, loss_counts = loss_module(
+                total_batch_loss, bce_loss_t, ce_loss_t, mse_loss_t, loss_counts = loss_module(
                     edema_logits = edema_logits,
                     subtype_logits = subtype_logits,
                     valid_embeddings = valid_embeddings,
                     window_time_indices = window_time_indices,
                     batch_indices = batch_indices,
+                    regression_preds = regression_preds,
                     edema_labels=edema_labels,
                     subtype_labels=subtype_labels,
                     window_mask=window_mask,
+                    score_diff_targets=score_diff_targets,
                     bce_weight=bce_weight,
                     ce_weight=ce_weight,
+                    mse_weight=mse_weight,
                     device=device,
                     accelerator=accelerator
                 )
@@ -85,6 +90,7 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
     window_count = window_mask.sum().item()
     batch_bce = float(bce_loss_t.detach().item())
     batch_ce = float(ce_loss_t.detach().item())
+    batch_mse = float(mse_loss_t.detach().item())
 
     batch_outputs = {
         'edema_labels': edema_labels,
@@ -97,9 +103,10 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
         'window_count': window_count,
         'bce_count': loss_counts['bce_count'],
         'ce_count': loss_counts['ce_count'],
+        'mse_count': loss_counts['mse_count'],
     }
 
-    return total_batch_loss, batch_bce, batch_ce, batch_outputs, batch_counts
+    return total_batch_loss, batch_bce, batch_ce, batch_mse, batch_outputs, batch_counts
 
 
 def prepare_multiview_inputs_v2(batch, device, has_cxr, has_text, dataset, disable_cxr=False, disable_txt=False, max_length=256):

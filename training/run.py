@@ -8,7 +8,7 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="Model Novelty development", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="14", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="23", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--wandb_on', type=bool, default=True, help='Enable Weights & Biases logging')
 
@@ -48,7 +48,10 @@ def parse_arguments():
 
     # Cross-Entropy Loss
     parser.add_argument('--use_ce', type=bool, default=True, help='Enable cross-entropy loss for classification')
-    parser.add_argument('--ce_weight', type=float, default=1.0, help='Cross-entropy loss weight')
+    parser.add_argument('--ce_weight', type=float, default=0.4, help='Cross-entropy loss weight')
+
+    # Regression Loss
+    parser.add_argument('--mse_weight', type=float, default=0.1, help='MSE Loss weight')
 
     # Temporal InfoNCE Loss
     parser.add_argument('--use_temporal_ucl', type=bool, default=False)
@@ -68,9 +71,9 @@ def parse_arguments():
     ###############################################################################################
 
     # Single-Stage Training
-    parser.add_argument('--single_stage_epochs', type=int, default=30, help='Number of epochs for single-stage training')
+    parser.add_argument('--single_stage_epochs', type=int, default=50, help='Number of epochs for single-stage training')
     parser.add_argument('--single_learning_rate', type=float, default=1e-4, help='Learning rate at single training stage')
-    parser.add_argument('--single_patience', type=int, default=5, help='Early stopping patience') # Stage 1 early stopping patience
+    parser.add_argument('--single_patience', type=int, default=7, help='Early stopping patience') # Stage 1 early stopping patience
 
     # model
     ## time-series modal
@@ -108,7 +111,7 @@ def parse_arguments():
     args = parser.parse_args([])
 
     # Single-stage training configuration
-    args.wandb_run_name = f"{args.experiment_id}: MLP_Attnpooling/Clinical Prompt Prefix(Yes gradient)"
+    args.wandb_run_name = f"{args.experiment_id}: w/o_CXR_FFN+LN_Tuning/time2vec_ts/NoContextEmbed/Full_modal/Main_performance_to_Level1_AUROC/SpatialModeling/NoTxt"
 
     # ===================================================================================================
 

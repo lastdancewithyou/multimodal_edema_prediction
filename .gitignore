@@ -39,3 +39,4 @@ logs/
 /data/
 training/model_backup_0321.py
 models/LoRA_test.ipynb
+tester.ipynb

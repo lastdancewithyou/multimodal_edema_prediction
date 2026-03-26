@@ -146,12 +146,15 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
     print(f"   Subtype Classifier (Cardiogenic/Non-cardiogenic):")
     print(f"      Total: {subtype_total:>12,} | Trainable: {subtype_trainable:>12,} ({100*subtype_trainable/subtype_total:.1f}%)")
 
-    # 5. Overall Summary
+    regression_total, regression_trainable = count_params(model.regression_head)
+    print(f"   Regression Head:")
+    print(f"      Total: {regression_total:>12,} | Trainable: {regression_trainable:>12,} ({100*regression_trainable/regression_total:.1f}%)")
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     print(f"\n{'─'*80}")
-    print(f"🏆 OVERALL MODEL STATISTICS")
+    print(f"OVERALL MODEL STATISTICS")
     print(f"{'─'*80}")
     print(f"   Total Parameters:       {total_params:>15,}")
     print(f"   Trainable Parameters:   {trainable_params:>15,}")
@@ -173,12 +176,15 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
     # Subtype classifier
     subtype_params = list(model.subtype_classifier.parameters())
 
+    # Regression head
+    regression_params = list(model.regression_head.parameters())
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
-        # Skip classifiers
-        if 'subtype_classifier' in name or 'edema_classifier' in name:
+        # Skip heads
+        if 'subtype_classifier' in name or 'edema_classifier' in name or 'regression_head' in name:
             continue
 
         # Cross-Attention parameters
@@ -194,34 +200,34 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
             core_params.append(param)
 
     param_groups = [
-        # LoRA (Fine-tuning pretrained)
+        # LoRA
         {
             'params': lora_params,
-            'lr': base_lr * 0.5,  # 0.1 → 0.5 (증가)
+            'lr': base_lr * 0.5,
             'weight_decay': 1e-4
         },
-        # # Cross-Attention
-        # {
-        #     'params': cross_attn_params,
-        #     'lr': base_lr * 2.0,  # 2배로 빠르게 학습
-        #     'weight_decay': 1e-4
-        # },
-        # Core Trainable Components (Fusion, TS Encoder, Pooling)
+        # Core Trainable Components
         {
             'params': core_params,
             'lr': base_lr * 1.0,
             'weight_decay': 1e-4
         },
-        # Edema Classifier (간단한 linear, 기본 lr)
+        # Edema Classifier 
         {
             'params': edema_params,
             'lr': base_lr * 1.0,
-            'weight_decay': 1e-3
+            'weight_decay': 1e-4
         },
-        # Subtype Classifier (간단한 linear, 기본 lr)
+        # Subtype Classifier
         {
             'params': subtype_params,
-            'lr': base_lr * 1.0,
+            'lr': base_lr * 0.7,
+            'weight_decay': 1e-3
+        },
+        # Regression
+        {
+            'params': regression_params,
+            'lr': base_lr * 0.8,
             'weight_decay': 1e-3
         }
     ]
@@ -245,7 +251,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
         mode='min',           # Minimize validation loss
         factor=0.5,           # lr을 절반으로 감소
         patience=5,           # 5 epoch 동안 개선 없으면 lr 감소
-        min_lr=1e-6           # 최소 lr 제한
+        min_lr=5e-6           # 최소 lr 제한
     )
 
     print(f"\n📅 [Scheduler Configuration]")
@@ -280,6 +286,8 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
         bce_count = torch.zeros(1, device=device, dtype=torch.float32)
         ce_sum = torch.zeros(1, device=device, dtype=torch.float32)
         ce_count = torch.zeros(1, device=device, dtype=torch.float32)
+        mse_sum = torch.zeros(1, device=device, dtype=torch.float32)
+        mse_count = torch.zeros(1, device=device, dtype=torch.float32)
 
         train_edema_preds_list = []
         train_edema_labels_list = []
@@ -293,12 +301,52 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
             current_lr = optimizer.param_groups[0]['lr']
             print(f"\n[Epoch {epoch+1}] Learning Rate: {current_lr:.2e}")
 
+        ####################################################################################
+        # Dynamic loss weight adjustment to prevent Level 2 task's overfitting
+        if epoch < 8:
+            dynamic_bce_weight = args.bce_weight
+            dynamic_ce_weight = args.ce_weight
+            dynamic_mse_weight = args.mse_weight
+        else:
+            dynamic_bce_weight = args.bce_weight * 1.5  # Increase Level 1 focus (Edema detection)
+            dynamic_ce_weight = args.ce_weight * 0.3    # Reduce Level 2 (prevent overfitting)
+            dynamic_mse_weight = args.mse_weight
+        ####################################################################################
+
+        if accelerator.is_main_process and epoch in [0, 10]:
+            print(f"   📊 Loss Weights - BCE: {dynamic_bce_weight:.2f}, CE: {dynamic_ce_weight:.2f}, MSE: {dynamic_mse_weight:.2f}")
+
         # Training
         for batch_idx, batch in enumerate(tqdm(train_loader, total=len(train_loader),
                                                 desc=f"[Rank {local_rank}] Epoch {epoch+1}/{args.single_stage_epochs}",
                                                 position=local_rank, leave=True, dynamic_ncols=True)):
+
+            # ===== Spatial Region Weights 로깅 (100번째 배치마다) =====
+            if batch_idx % 100 == 0 and accelerator.is_main_process:
+                try:
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    if hasattr(unwrapped_model, 'encoder') and hasattr(unwrapped_model.encoder, 'spatial_pooling') and hasattr(unwrapped_model.encoder.spatial_pooling, 'region_logits'):
+
+                        # Region weights 계산
+                        w = unwrapped_model.encoder.spatial_pooling.region_logits.softmax(dim=0)
+                        labels = ["cls", "center", "UL", "UR", "LL", "LR"]
+
+                        if wandb.run is not None:
+                            region_weights = {
+                                f"spatial_weights/{label}": val.item()
+                                for label, val in zip(labels, w)
+                            }
+                            global_step = epoch * len(train_loader) + batch_idx
+                            wandb.log(region_weights, step=global_step)
+
+                        weights_str = ", ".join([f"{l}={v.item():.3f}" for l, v in zip(labels, w)])
+                        print(f"\n[Epoch {epoch+1}, Batch {batch_idx}] Spatial Weights: {weights_str}\n")
+
+                except Exception:
+                    pass
+
             with accelerator.accumulate(model):
-                total_batch_loss, batch_bce, batch_ce, batch_outputs, batch_counts = train_batch(
+                total_batch_loss, batch_bce, batch_ce, batch_mse, batch_outputs, batch_counts = train_batch(
                     args=args,
                     model=model,
                     batch=batch,
@@ -309,8 +357,9 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
                     max_length=args.token_max_length,
                     disable_cxr=args.disable_cxr,
                     disable_txt=args.disable_txt,
-                    bce_weight=args.bce_weight,
-                    ce_weight=args.ce_weight,
+                    bce_weight=dynamic_bce_weight,
+                    ce_weight=dynamic_ce_weight,
+                    mse_weight=dynamic_mse_weight,
                 )
 
                 accelerator.backward(total_batch_loss)
@@ -321,28 +370,28 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
             # Get loss-specific sample counts
             bce_ct_local = torch.as_tensor(batch_counts['bce_count'], device=device, dtype=torch.float32)
             ce_ct_local = torch.as_tensor(batch_counts['ce_count'], device=device, dtype=torch.float32)
+            mse_ct_local = torch.as_tensor(batch_counts['mse_count'], device=device, dtype=torch.float32)
 
             # Accumulate losses weighted by their actual sample counts
             bce_sum += torch.as_tensor(batch_bce, device=device, dtype=torch.float32) * bce_ct_local
             bce_count += bce_ct_local
             ce_sum += torch.as_tensor(batch_ce, device=device, dtype=torch.float32) * ce_ct_local
             ce_count += ce_ct_local
+            mse_sum += torch.as_tensor(batch_mse, device=device, dtype=torch.float32) * mse_ct_local
+            mse_count += mse_ct_local
 
             with torch.no_grad():
-                edema_logits = batch_outputs['edema_logits'].squeeze(-1)  # [B, W]
+                edema_logits = batch_outputs['edema_logits'].squeeze(-1)   # [B, W]
                 subtype_logits = batch_outputs['subtype_logits']           # [B, W, 2]
                 edema_labels = batch_outputs['edema_labels']               # [B, W]
                 subtype_labels = batch_outputs['subtype_labels']           # [B, W]
                 window_mask = batch['window_mask']                         # [B, W]
 
-                # Valid windows only (padding excluded)
-                valid_mask = window_mask.bool()  # [B, W]
+                valid_mask = window_mask.bool()                            # [B, W]
 
-                # Probabilities
-                p_pos = torch.sigmoid(edema_logits)                       # [B, W] P(edema=1)
+                p_pos = torch.sigmoid(edema_logits)                        # [B, W] P(edema=1)
                 p_sub = torch.softmax(subtype_logits, dim=-1)              # [B, W, 2] P(NCPE|pos), P(CPE|pos)
 
-                # Flatten + mask (collect all valid windows in consistent order)
                 p_pos_valid = p_pos[valid_mask]                            # [Nwin]
                 p_sub_valid = p_sub[valid_mask]                            # [Nwin, 2]
                 edema_valid = edema_labels[valid_mask]                     # [Nwin]
@@ -353,23 +402,23 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
                 train_edema_labels_list.append(edema_valid.detach().cpu())
                 train_subtype_labels_list.append(subtype_valid.detach().cpu())
         
-        # Aggregate across GPUs
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(bce_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(bce_count, op=dist.ReduceOp.SUM)
             dist.all_reduce(ce_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(ce_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(mse_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(mse_count, op=dist.ReduceOp.SUM)
 
-        # Calculate average losses
         bce_avg = (bce_sum / (bce_count + 1e-8)).item()
         ce_avg = (ce_sum / (ce_count + 1e-8)).item()
+        mse_avg = (mse_sum / (mse_count + 1e-8)).item()
 
-        # Weighted contributions
         bce_contrib = args.bce_weight * bce_avg
         ce_contrib = args.ce_weight * ce_avg
-        avg_total_loss = bce_contrib + ce_contrib
+        mse_contrib = args.mse_weight * mse_avg
+        avg_total_loss = bce_contrib + ce_contrib + mse_contrib
 
-        # Warmup scheduler step (first 5 epochs)
         if epoch < warmup_epochs:
             warmup_scheduler.step()
 
@@ -399,7 +448,6 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
                     all_edema.extend(gpu_preds['edema'])
                     all_subtype.extend(gpu_preds['subtype'])
 
-                # Concatenate and convert to numpy
                 p_pos_all = torch.cat(all_p_pos, dim=0).numpy() if all_p_pos else np.array([])
                 p_sub_all = torch.cat(all_p_sub, dim=0).numpy() if all_p_sub else np.array([])
                 edema_all = torch.cat(all_edema, dim=0).numpy() if all_edema else np.array([])
@@ -456,10 +504,12 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
                 train_metrics['level2_auprc'] = float('nan')
 
             # ==================== Level 3: Final 3-Class (Neg, NCPE, CPE) ====================
-            # 3-class GT is determined for samples:
-            #   - edema==0 -> Neg(0)
-            #   - edema==1 & subtype==0 -> NCPE(1)
-            #   - edema==1 & subtype==1 -> CPE(2)
+            """
+            3-class GT is determined for samples:
+            - edema==0 -> Neg(0)
+            - edema==1 & subtype==0 -> NCPE(1)
+            - edema==1 & subtype==1 -> CPE(2)
+            """
             mask_l3 = (edema_all == 0) | ((edema_all == 1) & ((subtype_all == 0) | (subtype_all == 1)))
 
             if mask_l3.sum() >= 3:
@@ -507,6 +557,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
             print(f"   [Loss Components]")
             print(f"      BCE (Edema): {bce_avg:.4f} → Weighted: {bce_contrib:.4f} (λ={args.bce_weight})")
             print(f"      CE (Subtype): {ce_avg:.4f} → Weighted: {ce_contrib:.4f} (λ={args.ce_weight})")
+            print(f"      MSE (Subtype): {mse_avg:.4f} → Weighted: {mse_contrib:.4f} (λ={args.mse_weight})")
 
             print(f"\n   [Hierarchical Performance Metrics]")
             print(f"[Edema Detection]   AUROC={train_metrics['level1_auroc']:.4f}  "
@@ -523,7 +574,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
         torch.cuda.empty_cache()
 
         # ==================== Validation ====================
-        val_loss, val_bce_avg, val_ce_avg, val_metrics = validate_multitask(
+        val_loss, val_bce_avg, val_ce_avg, val_mse_avg, val_metrics = validate_multitask(
             args=args,
             model=model,
             dataloader=val_loader,
@@ -536,20 +587,20 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
             disable_txt=args.disable_txt,
         )
 
-        # ReduceLROnPlateau scheduler step (after warmup, based on validation loss)
+        # ReduceLROnPlateau scheduler step
         if epoch >= warmup_epochs:
             main_scheduler.step(val_loss)
             if accelerator.is_main_process:
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"   📉 ReduceLROnPlateau - Current LR: {current_lr:.2e}, Val Loss: {val_loss:.4f}")
 
-        # Early stopping based on Level 3 AUROC (only on main process)
+        # Early stopping based on Level 1 AUROC (Edema Detection)
         if accelerator.is_main_process and val_metrics:
-            if val_metrics['level3_auroc'] > best_val_auroc:
-                best_val_auroc = val_metrics['level3_auroc']
+            if val_metrics['level1_auroc'] > best_val_auroc:
+                best_val_auroc = val_metrics['level1_auroc']
 
-            if val_metrics['level3_auprc'] > best_val_auprc:
-                best_val_auprc = val_metrics['level3_auprc']
+            if val_metrics['level1_auprc'] > best_val_auprc:
+                best_val_auprc = val_metrics['level1_auprc']
 
         # ==================== Multi-Task UMAP Visualization ====================
         # if accelerator.is_main_process and ((epoch + 1) == 1 or (epoch + 1) % 5 == 0 or (epoch + 1) == args.single_stage_epochs):
@@ -593,10 +644,12 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
                 "train/total_loss": avg_total_loss,
                 "train/bce_loss": bce_avg,
                 "train/ce_loss": ce_avg,
+                "train/mse_loss": mse_avg,
 
                 "val/total_loss": val_loss,
                 "val/bce_loss": val_bce_avg,
                 "val/ce_loss": val_ce_avg,
+                "val/mse_loss": val_mse_avg,
 
                 #################### Hierarchical Metrics ####################
                 "val/level1_auroc": val_metrics['level1_auroc'],
@@ -621,7 +674,7 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
 
             # Early stopping
             print(f"DEBUG [Rank 0]: Before early_stopper")
-            if early_stopper(args, best_val_auroc, model, epoch):
+            if early_stopper(args, best_val_auroc, model, epoch, accelerator):
                 stop_flag.fill_(1)
                 print(f"⛔ Early stopping triggered at epoch {epoch+1}")
 
@@ -640,12 +693,24 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
     actual_best_model_path = early_stopper.get_best_model_path()
     if actual_best_model_path and os.path.exists(actual_best_model_path):
         accelerator.print(f"✅ Loading best model from: {actual_best_model_path}")
-        model.load_state_dict(torch.load(actual_best_model_path, map_location=accelerator.device))
+        checkpoint = torch.load(actual_best_model_path, map_location=accelerator.device, weights_only=False)
+        state_dict = checkpoint['model_state_dict']
+
+        # DDP/Accelerate wrapper의 "module." 접두사 처리
+        if any(k.startswith('module.') for k in state_dict.keys()):
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                new_key = k.replace('module.', '', 1)
+                new_state_dict[new_key] = v
+            state_dict = new_state_dict
+            accelerator.print("✓ 체크포인트 키에서 'module.' 접두사 제거됨")
+
+        model.load_state_dict(state_dict)
     else:
         accelerator.print(f"⚠️ Best model not found, using current model state")
 
     # ==================== Test ====================
-    test_loss, _, _, _, wandb_test_metrics = test(
+    test_loss, _, _, _, _, wandb_test_metrics = test(
         args=args,
         model=model,
         dataloader=test_loader,
@@ -689,8 +754,8 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
     if accelerator.is_main_process:
         print("\n" + "="*80)
         print("✅ MULTI-TASK TRAINING COMPLETED!")
-        print(f"   Best Val Level 3 AUROC: {best_val_auroc:.4f}")
-        print(f"   Best Val Level 3 AUPRC: {best_val_auprc:.4f}\n")
+        print(f"   Best Val Level 1 AUROC (Edema Detection): {best_val_auroc:.4f}")
+        print(f"   Best Val Level 1 AUPRC (Edema Detection): {best_val_auprc:.4f}\n")
 
         if wandb_test_metrics:
             print("   [Test Results - Hierarchical Metrics]")
@@ -699,12 +764,11 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
             print(f"   Level 3 (3-class Combined):       AUROC={wandb_test_metrics['test/level3_auroc']:.4f}  AUPRC={wandb_test_metrics['test/level3_auprc']:.4f}")
         print("="*80 + "\n")
 
-    # Prepare results (both GPUs need this for return)
     results = {}
     if accelerator.is_main_process and wandb_test_metrics:
         results = {
-            'val_level3_auroc': best_val_auroc,
-            'val_level3_auprc': best_val_auprc,
+            'val_level1_auroc': best_val_auroc,
+            'val_level1_auprc': best_val_auprc,
             'test_level1_auroc': wandb_test_metrics['test/level1_auroc'],
             'test_level1_auprc': wandb_test_metrics['test/level1_auprc'],
             'test_level2_auroc': wandb_test_metrics['test/level2_auroc'],
