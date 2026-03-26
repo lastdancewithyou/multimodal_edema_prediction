@@ -703,7 +703,6 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
                 new_key = k.replace('module.', '', 1)
                 new_state_dict[new_key] = v
             state_dict = new_state_dict
-            accelerator.print("✓ 체크포인트 키에서 'module.' 접두사 제거됨")
 
         model.load_state_dict(state_dict)
     else:
