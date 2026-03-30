@@ -82,8 +82,9 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
     with timer("Dataset Loading"):
         train_loader, val_loader, test_loader, train_sampler = get_dataloaders(ts_df, img_df, text_df, clinical_prompt_df, args, accelerator)
 
-    encoder = MultiModalEncoder(args, disable_cxr=args.disable_cxr, disable_txt=args.disable_txt, disable_prompt=args.disable_prompt).to(device)
-    model = MultiModalMultiTaskModel(encoder).to(device)
+    # Create model on CPU - Accelerator will handle device placement
+    encoder = MultiModalEncoder(args, disable_cxr=args.disable_cxr, disable_txt=args.disable_txt, disable_prompt=args.disable_prompt)
+    model = MultiModalMultiTaskModel(encoder)
     accelerator.print(f"[모달리티 상태] CXR 사용: {not model.encoder.disable_cxr}, TEXT 사용: {not model.encoder.disable_txt}, PROMPT 사용: {not model.encoder.disable_prompt}")
 
     def count_params(module):
@@ -233,7 +234,11 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
     ]
 
     optimizer = torch.optim.AdamW(param_groups)
-    model, optimizer, loss_module = accelerator.prepare(model, optimizer, loss_module)
+
+    # Prepare model, optimizer, loss_module, AND dataloaders with Accelerator
+    model, optimizer, loss_module, train_loader, val_loader, test_loader = accelerator.prepare(
+        model, optimizer, loss_module, train_loader, val_loader, test_loader
+    )
 
     # ==================== Scheduler Configuration ====================
     warmup_epochs = 3
@@ -695,16 +700,8 @@ def train_single_stage_multimodal_model(ts_df, img_df, text_df, clinical_prompt_
         accelerator.print(f"✅ Loading best model from: {actual_best_model_path}")
         checkpoint = torch.load(actual_best_model_path, map_location=accelerator.device, weights_only=False)
         state_dict = checkpoint['model_state_dict']
-
-        # DDP/Accelerate wrapper의 "module." 접두사 처리
-        if any(k.startswith('module.') for k in state_dict.keys()):
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                new_key = k.replace('module.', '', 1)
-                new_state_dict[new_key] = v
-            state_dict = new_state_dict
-
-        model.load_state_dict(state_dict)
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.load_state_dict(state_dict)
     else:
         accelerator.print(f"⚠️ Best model not found, using current model state")
 

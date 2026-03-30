@@ -8,9 +8,9 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="Model Novelty development", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="23", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="27", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
-    parser.add_argument('--wandb_on', type=bool, default=True, help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb_on', type=bool, default=False, help='Enable Weights & Biases logging')
 
     # Modality Selection (True가 해당 모달리티 사용 중지)
     parser.add_argument("--disable_prompt", type=bool, default=False, help="prompt 활성화 여부")
@@ -111,7 +111,7 @@ def parse_arguments():
     args = parser.parse_args([])
 
     # Single-stage training configuration
-    args.wandb_run_name = f"{args.experiment_id}: w/o_CXR_FFN+LN_Tuning/time2vec_ts/NoContextEmbed/Full_modal/Main_performance_to_Level1_AUROC/SpatialModeling/NoTxt"
+    args.wandb_run_name = f"{args.experiment_id}: ts->text->cxr"
 
     # ===================================================================================================
 

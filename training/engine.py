@@ -15,21 +15,17 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
     ):
     model.train()
 
-    # ==================== 1. 배치 데이터 GPU 전송 ====================
+    # ==================== 1. 배치 데이터 준비 (Accelerator가 자동으로 device 배치) ====================
     with timer("Batch Data preparation", accelerator):
-        # New multi-task format
-        for k in ['edema_labels', 'subtype_labels', 'score_diff_targets', 'window_mask', 'valid_seq_mask']:
-            batch[k] = batch[k].to(device, non_blocking=True)
+        # Accelerator DataLoader already moved tensors to correct device
         edema_labels = batch['edema_labels']
         subtype_labels = batch['subtype_labels']
         score_diff_targets = batch['score_diff_targets']
 
-
-
         img_index_tensor = batch['img_index_tensor']
         txt_index_tensor = batch['text_index_tensor']
-        has_cxr = (img_index_tensor != -1).long().to(device, non_blocking=True)   # [B, W, T]
-        has_text = (txt_index_tensor != -1).long().to(device, non_blocking=True)  # [B, W, T]
+        has_cxr = (img_index_tensor != -1).long()   # [B, W, T]
+        has_text = (txt_index_tensor != -1).long()  # [B, W, T]
 
         window_mask = batch['window_mask']
         seq_valid_mask = batch['valid_seq_mask']
@@ -47,12 +43,12 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
     # ==================== 3. Forward Pass 및 Loss 계산 ====================
     with timer("Batch별 Embedding 추출 및 Loss 연산 총", accelerator):
         with accelerator.autocast():
-            time_steps = batch.get('time_steps').to(device, non_blocking=True)
+            time_steps = batch.get('time_steps')
 
             # Prepare prompt data
             prompt_data = {
                 'unique_prompt_texts': batch['unique_prompt_texts'],
-                'prompt_index_tensor': batch['prompt_index_tensor'].to(device, non_blocking=True)
+                'prompt_index_tensor': batch['prompt_index_tensor']
             }
 
             model_outputs = model(
@@ -110,7 +106,10 @@ def train_batch(args, model, batch, loss_module, device, accelerator, dataset, d
 
 
 def prepare_multiview_inputs_v2(batch, device, has_cxr, has_text, dataset, disable_cxr=False, disable_txt=False, max_length=256):
-
+    """
+    Prepare multimodal inputs.
+    Note: device parameter kept for compatibility but not used - Accelerator handles device placement.
+    """
     ts = batch['ts_tensor']
     img_index_tensor = batch['img_index_tensor']
     txt_index_tensor = batch['text_index_tensor']
@@ -138,14 +137,14 @@ def prepare_multiview_inputs_v2(batch, device, has_cxr, has_text, dataset, disab
             text_masks_list.append(mask)
 
         if len(unique_txt_keys) > 0:
-            unique_text_ids = torch.stack(text_ids_list, dim=0).to(device, non_blocking=True)
-            unique_text_masks = torch.stack(text_masks_list, dim=0).to(device, non_blocking=True)
+            unique_text_ids = torch.stack(text_ids_list, dim=0)
+            unique_text_masks = torch.stack(text_masks_list, dim=0)
         else:
-            unique_text_ids = torch.empty(0, max_length, dtype=torch.long, device=device)
-            unique_text_masks = torch.empty(0, max_length, dtype=torch.long, device=device)
+            unique_text_ids = torch.empty(0, max_length, dtype=torch.long)
+            unique_text_masks = torch.empty(0, max_length, dtype=torch.long)
     else:
-        unique_text_ids = torch.empty(0, max_length, dtype=torch.long, device=device)
-        unique_text_masks = torch.empty(0, max_length, dtype=torch.long, device=device)
+        unique_text_ids = torch.empty(0, max_length, dtype=torch.long)
+        unique_text_masks = torch.empty(0, max_length, dtype=torch.long)
 
     # ==================== IMG PREPARATION ====================
     if not disable_cxr:
@@ -153,15 +152,15 @@ def prepare_multiview_inputs_v2(batch, device, has_cxr, has_text, dataset, disab
             unique_imgs = torch.stack(
                 [dataset.load_image_cached(path) for path in unique_img_paths],
                 dim=0
-            ).to(device, non_blocking=True)
+            )
         else:
             num_channels = 3 if dataset.to_3ch else 1
-            unique_imgs = torch.empty(0, num_channels, 224, 224, device=device)
+            unique_imgs = torch.empty(0, num_channels, 224, 224)
     else:
         num_channels = 3 if dataset.to_3ch else 1
-        unique_imgs = torch.empty(0, num_channels, 224, 224, device=device)
+        unique_imgs = torch.empty(0, num_channels, 224, 224)
 
-    ts_series = ts.to(device, non_blocking=True)  # [B, W, T, D]
+    ts_series = ts  # Already on correct device from DataLoader
 
     # Text data structure
     if not disable_txt:
@@ -176,17 +175,17 @@ def prepare_multiview_inputs_v2(batch, device, has_cxr, has_text, dataset, disab
             }
         else:
             text_data = {
-                'unique_input_ids': torch.empty(0, max_length, dtype=torch.long, device=device),
-                'unique_attention_mask': torch.empty(0, max_length, dtype=torch.long, device=device),
-                'unique_indices': torch.empty(0, dtype=torch.long, device=device),
-                'positions': torch.empty(0, 3, dtype=torch.long, device=device)
+                'unique_input_ids': torch.empty(0, max_length, dtype=torch.long),
+                'unique_attention_mask': torch.empty(0, max_length, dtype=torch.long),
+                'unique_indices': torch.empty(0, dtype=torch.long),
+                'positions': torch.empty(0, 3, dtype=torch.long)
             }
     else:
         text_data = {
-            'unique_input_ids': torch.empty(0, max_length, dtype=torch.long, device=device),
-            'unique_attention_mask': torch.empty(0, max_length, dtype=torch.long, device=device),
-            'unique_indices': torch.empty(0, dtype=torch.long, device=device),
-            'positions': torch.empty(0, 3, dtype=torch.long, device=device)
+            'unique_input_ids': torch.empty(0, max_length, dtype=torch.long),
+            'unique_attention_mask': torch.empty(0, max_length, dtype=torch.long),
+            'unique_indices': torch.empty(0, dtype=torch.long),
+            'positions': torch.empty(0, 3, dtype=torch.long)
         }
 
     # CXR data structure
@@ -202,16 +201,16 @@ def prepare_multiview_inputs_v2(batch, device, has_cxr, has_text, dataset, disab
         else:
             num_channels = 3 if dataset.to_3ch else 1
             cxr_data = {
-                'unique_images': torch.empty(0, num_channels, 224, 224, device=device),
-                'unique_indices': torch.empty(0, dtype=torch.long, device=device),
-                'positions': torch.empty(0, 3, dtype=torch.long, device=device)
+                'unique_images': torch.empty(0, num_channels, 224, 224),
+                'unique_indices': torch.empty(0, dtype=torch.long),
+                'positions': torch.empty(0, 3, dtype=torch.long)
             }
     else:
         num_channels = 3 if dataset.to_3ch else 1
         cxr_data = {
-            'unique_images': torch.empty(0, num_channels, 224, 224, device=device),
-            'unique_indices': torch.empty(0, dtype=torch.long, device=device),
-            'positions': torch.empty(0, 3, dtype=torch.long, device=device)
+            'unique_images': torch.empty(0, num_channels, 224, 224),
+            'unique_indices': torch.empty(0, dtype=torch.long),
+            'positions': torch.empty(0, 3, dtype=torch.long)
         }
 
     return ts_series, cxr_data, text_data, has_cxr, has_text

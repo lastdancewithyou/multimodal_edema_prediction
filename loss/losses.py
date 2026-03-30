@@ -156,7 +156,9 @@ class MultiModalLoss(nn.Module):
             with timer("BCE Loss", accelerator):
                 bce_loss, bce_count = self.binary_cross_entropy(edema_logits, edema_labels, window_mask)
         else:
-            bce_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            # Use same device as edema_logits if available, else window_mask
+            ref_device = edema_logits.device if edema_logits is not None else window_mask.device
+            bce_loss = torch.tensor(0.0, device=ref_device, requires_grad=False)
             bce_count = 0
 
         # -------------------- (1) CE Loss (Subtype Classification) --------------------
@@ -164,7 +166,9 @@ class MultiModalLoss(nn.Module):
             with timer("CE Loss", accelerator):
                 ce_loss, ce_count = self.cross_entropy(subtype_logits, subtype_labels, edema_labels, window_mask)
         else:
-            ce_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            # Use same device as subtype_logits if available, else window_mask
+            ref_device = subtype_logits.device if subtype_logits is not None else window_mask.device
+            ce_loss = torch.tensor(0.0, device=ref_device, requires_grad=False)
             ce_count = 0
 
         # -------------------- (2) MSE Loss (Score Diff Regression) --------------------
@@ -172,7 +176,9 @@ class MultiModalLoss(nn.Module):
             with timer("MSE Loss", accelerator):
                 mse_loss, mse_count = self.regression_mse(regression_preds, score_diff_targets, edema_labels, window_mask)
         else:
-            mse_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            # Use same device as regression_preds if available, else window_mask
+            ref_device = regression_preds.device if regression_preds is not None else window_mask.device
+            mse_loss = torch.tensor(0.0, device=ref_device, requires_grad=False)
             mse_count = 0
 
         # -------------------- NaN Detection --------------------

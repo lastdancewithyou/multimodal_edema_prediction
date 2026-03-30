@@ -522,40 +522,6 @@ def get_dataloaders(ts_df, cxr_df, text_df, clinical_prompt_df, args, accelerato
             **dataloader_kwargs
         )
 
-    # # 윈도우 레벨 라벨 비율 비교
-    # print("\n" + "="*60)
-    # print("Window-level Label Ratio Comparison")
-    # print("="*60)
-    # print(f"{'Dataset':<12} {'Cardio':>10} {'Non-cardio':>12} {'Negative':>10} {'Unlabeled':>10}")
-    # print("-"*60)
-
-    # for name, dist in [("Train", train_dist), ("Validation", val_dist), ("Test", test_dist)]:
-    #     total = dist['total']
-    #     cardio_pct = dist['cardio'] / total * 100
-    #     noncardio_pct = dist['noncardio'] / total * 100
-    #     negative_pct = dist['negative'] / total * 100
-    #     unlabeled_pct = dist['unlabeled'] / total * 100
-    #     print(f"{name:<12} {cardio_pct:>9.2f}% {noncardio_pct:>11.2f}% {negative_pct:>9.2f}% {unlabeled_pct:>9.2f}%")
-
-    # print("="*60 + "\n")
-
-    # # 윈도우 레벨 모달리티 조합 비율 비교
-    # print("\n" + "="*70)
-    # print("Window-level Modality Combination Ratio Comparison")
-    # print("="*70)
-    # print(f"{'Dataset':<12} {'TS only':>12} {'TS+Image':>12} {'TS+Text':>12} {'TS+Img+Text':>14}")
-    # print("-"*70)
-
-    # for name, dist in [("Train", train_modality_dist), ("Validation", val_modality_dist), ("Test", test_modality_dist)]:
-    #     total = dist['total']
-    #     ts_only_pct = dist['ts_only'] / total * 100
-    #     ts_img_pct = dist['ts_img'] / total * 100
-    #     ts_text_pct = dist['ts_text'] / total * 100
-    #     ts_img_text_pct = dist['ts_img_text'] / total * 100
-    #     print(f"{name:<12} {ts_only_pct:>11.2f}% {ts_img_pct:>11.2f}% {ts_text_pct:>11.2f}% {ts_img_text_pct:>13.2f}%")
-
-    # print("="*70 + "\n")
-
     return train_dataloader, val_dataloader, test_dataloader, train_sampler
 
 
@@ -567,8 +533,7 @@ def merged_dataframes(ts_df, img_df, text_df, clinical_prompt_df):
     merged_df = (ts_df
             .merge(img_df, on=['stay_id', 'hour_slot'], how='outer')
             .merge(text_df, on=['stay_id','hour_slot'], how='outer')
-            .merge(clinical_prompt_df[['hadm_id', 'stay_id', 'hour_slot', 'clinical_prompt', 'prompt_id']],
-                   on=['hadm_id', 'stay_id', 'hour_slot'], how='left')
+            .merge(clinical_prompt_df[['hadm_id', 'stay_id', 'hour_slot', 'clinical_prompt', 'prompt_id']], on=['hadm_id', 'stay_id', 'hour_slot'], how='left')
     )
 
     ########################################################################
