@@ -7,7 +7,6 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-# from training.run import parse_arguments
 from utils.utils import timer
 
 
@@ -15,171 +14,97 @@ OUTPUT_DIR = "/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/outpu
 
 
 class MultiModalLoss(nn.Module):
-    def __init__(self, args, class_weights=None):
+    def __init__(self, args):
         super().__init__()
 
-        self.num_classes = args.num_classes
         self.use_label_smooth = args.use_label_smooth
         self.label_smoothing = args.label_smoothing
-        amp_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
-        # ==================== CE Loss ====================
-        if class_weights is not None:
-            print("[Loss] Using class weights for CE Loss")
-            self.class_weights = class_weights.to(dtype=amp_dtype)
-
-            # label smoothing
-            if self.use_label_smooth:
-                self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights.float(), ignore_index=-1, label_smoothing=self.label_smoothing)
-                print(f"[Loss] CE Loss with label smoothing (factor={self.label_smoothing})")
-            else:
-                self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights.float(), ignore_index=-1)
-                print(f"[Loss] Standard CE Loss with class weights")
-        
-        # CE loss without class weights
-        else:
-            print("[Loss] CE Loss without class weights")
-            if self.use_label_smooth:
-                self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=self.label_smoothing)
-                print(f"[Loss] CE Loss with label smoothing (factor={self.label_smoothing})")
-            else:
-                self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
-                print(f"[Loss] Standard CE Loss")
 
         # ==================== Binary Cross-Entropy Loss (Edema Detection) ====================
-        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')  # reduction='none' for manual filtering
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+
+        # ==================== CE Loss ====================
+        if self.use_label_smooth:
+            self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=self.label_smoothing)
+        else:
+            self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
+
         print(f"[Loss] BCE Loss initialized for edema detection")
+        if self.use_label_smooth:
+            print(f"[Loss] CE Loss initialized for subtype classification with label smoothing (factor={self.label_smoothing})")
+        else:
+            print(f"[Loss] CE Loss initialized for subtype classification without label smoothing")
 
-        # ==================== MSE Loss (Score Diff Regression) ====================
-        self.mse_loss = nn.MSELoss(reduction='mean')
-        print(f"[Loss] MSE Loss initialized for raw score_diff regression (range: -7~11)")
+    # Edema Detection Head
+    def binary_cross_entropy(self, edema_logits, edema_labels):
+        edema_logits_squeezed = edema_logits.squeeze(-1).float()
+        edema_labels_flat = edema_labels.float()
 
-    ###########################################################################
-    def cross_entropy(self, subtype_logits, subtype_labels, edema_labels, window_mask):
-        """
-        Subtype classification loss (Cross-Entropy)
-        Only applies to windows where:
-        - window_mask == 1 (valid, non-padded)
-        - edema_labels == 1 (edema-positive)
-        - subtype_labels in {0, 1} (valid subtype labels)
-
-        Args:
-            subtype_logits: [B, W, 2] - subtype classifier output
-            subtype_labels: [B, W] - subtype labels {0: non-cardiogenic, 1: cardiogenic, -1: unlabeled}
-            edema_labels: [B, W] - edema labels {0, 1}
-            window_mask: [B, W] - valid window mask
-        """
-        # Flatten tensors
-        logits_flat = subtype_logits.view(-1, 2).float()      # [B*W, C=2]
-        subtype_labels_flat = subtype_labels.view(-1).long()  # [B*W]
-        edema_labels_flat = edema_labels.view(-1).long()      # [B*W]
-        window_mask_flat = window_mask.view(-1).bool()        # [B*W]
-
-        # Filter (Valid window + Edema-positive + Valid subtype label)
-        valid_mask = (window_mask_flat &                                            # Valid windows
-                    (edema_labels_flat == 1) &                                      # Edema-positive samples only
-                    ((subtype_labels_flat == 0) | (subtype_labels_flat == 1)))      # For subtype classification
-
-        num_samples = valid_mask.sum().item()
-
-        # 보호장치
-        if num_samples == 0:
-            return torch.tensor(0.0, device=subtype_logits.device, requires_grad=False), 0
-
-        # Extract valid samples
-        logits_valid = logits_flat[valid_mask]           # [N_valid, 2]
-        labels_valid = subtype_labels_flat[valid_mask]   # [N_valid] in {0, 1}
-
-        ce_loss = self.ce_loss(logits_valid, labels_valid)
-        return ce_loss, num_samples
-
-    def binary_cross_entropy(self, edema_logits, edema_labels, window_mask):
-        edema_logits_flat = edema_logits.view(-1).float()   # [B*W]
-        edema_labels_flat = edema_labels.view(-1).float()     # [B*W]
-        window_mask_flat = window_mask.view(-1).bool()        # [B*W]
-
-        valid_mask = window_mask_flat & (edema_labels_flat != -1)
+        valid_mask = (edema_labels_flat != -1)
         num_samples = valid_mask.sum().item()
 
         if num_samples == 0:
-            return torch.tensor(0.0, device=edema_logits.device, requires_grad=False), 0
+            # return torch.tensor(0.0, device=edema_logits.device, requires_grad=False), 0
+            return 0.0 * edema_logits.sum(), 0
 
-        logits_valid = edema_logits_flat[valid_mask]
+        logits_valid = edema_logits_squeezed[valid_mask]
         labels_valid = edema_labels_flat[valid_mask]
 
+        # Compute per-sample loss [N]
         loss_per_sample = self.bce_loss(logits_valid, labels_valid)
         bce_loss = loss_per_sample.mean()
 
         return bce_loss, num_samples
 
-    def regression_mse(self, regression_preds, score_diff_targets, edema_labels, window_mask):
-        """
-        MSE loss for score_diff prediction
-        Only applies to windows where:
-        - window_mask == 1 (valid, non-padded)
-        - edema_labels == 1 (edema-positive only)
-        - score_diff_targets is not NaN
-        """
-        preds_flat = regression_preds.view(-1).float()    
-        targets_flat = score_diff_targets.view(-1).float()
-        edema_flat = edema_labels.view(-1).long()         
-        window_mask_flat = window_mask.view(-1).bool()    
 
-        # Filter: valid window + edema-positive + non-NaN target
-        valid_mask = (window_mask_flat & (edema_flat == 1) & ~torch.isnan(targets_flat))
+    # Subtype Classification Head
+    def cross_entropy(self, subtype_logits, subtype_labels, edema_labels):
+        logits = subtype_logits.float()
+        edema_labels_long = edema_labels.long()
+        subtype_labels_long = subtype_labels.long()
 
+        # Edema-positive + Valid subtype label only (Intermediate, Non-cardiogenic, Cardiogenic))
+        valid_mask = ((edema_labels_long == 1) & ((subtype_labels_long == 0) | (subtype_labels_long == 1) | (subtype_labels_long == 2)))
         num_samples = valid_mask.sum().item()
 
         if num_samples == 0:
-            return torch.tensor(0.0, device=regression_preds.device, requires_grad=False), 0
+            # return torch.tensor(0.0, device=subtype_logits.device, requires_grad=False), 0
+            return 0.0 * subtype_logits.sum(), 0
 
-        preds_valid = preds_flat[valid_mask]      
-        targets_valid = targets_flat[valid_mask]  
+        # Extract valid samples
+        logits_valid = logits[valid_mask]                 # [N_valid, 3]
+        labels_valid = subtype_labels_long[valid_mask]    # [N_valid] in {0, 1, 2}
 
-        mse_loss = self.mse_loss(preds_valid, targets_valid)
+        ce_loss = self.ce_loss(logits_valid, labels_valid)
 
-        return mse_loss, num_samples
+        return ce_loss, num_samples
 
-    def forward(self,
-                # Model outputs
-                edema_logits, subtype_logits, valid_embeddings, window_time_indices, batch_indices, regression_preds,
-                # Labels
-                edema_labels, subtype_labels, window_mask, score_diff_targets=None,
-                # Loss weights
-                bce_weight=0.0, ce_weight=0.0, mse_weight=0.0, device=None, accelerator=None
+    def forward(
+            self,
+            edema_logits, subtype_logits,
+            edema_labels, subtype_labels, 
+            bce_weight=0.0, ce_weight=0.0, 
+            device=None, accelerator=None
         ):
-        if device is None:
-            device = edema_logits.device
-
         # -------------------- (0) Binary CE Loss (Edema Detection) --------------------
         if bce_weight > 0.0 and edema_logits is not None and edema_labels is not None:
             with timer("BCE Loss", accelerator):
-                bce_loss, bce_count = self.binary_cross_entropy(edema_logits, edema_labels, window_mask)
+                bce_loss, bce_count = self.binary_cross_entropy(
+                    edema_logits,
+                    edema_labels,
+                )
         else:
-            # Use same device as edema_logits if available, else window_mask
-            ref_device = edema_logits.device if edema_logits is not None else window_mask.device
-            bce_loss = torch.tensor(0.0, device=ref_device, requires_grad=False)
+            bce_loss = torch.tensor(0.0, device=device, requires_grad=False)
             bce_count = 0
 
         # -------------------- (1) CE Loss (Subtype Classification) --------------------
         if ce_weight > 0.0:
             with timer("CE Loss", accelerator):
-                ce_loss, ce_count = self.cross_entropy(subtype_logits, subtype_labels, edema_labels, window_mask)
+                ce_loss, ce_count = self.cross_entropy(subtype_logits, subtype_labels, edema_labels)
         else:
-            # Use same device as subtype_logits if available, else window_mask
-            ref_device = subtype_logits.device if subtype_logits is not None else window_mask.device
-            ce_loss = torch.tensor(0.0, device=ref_device, requires_grad=False)
+            ce_loss = torch.tensor(0.0, device=device, requires_grad=False)
             ce_count = 0
 
-        # -------------------- (2) MSE Loss (Score Diff Regression) --------------------
-        if mse_weight > 0.0:
-            with timer("MSE Loss", accelerator):
-                mse_loss, mse_count = self.regression_mse(regression_preds, score_diff_targets, edema_labels, window_mask)
-        else:
-            # Use same device as regression_preds if available, else window_mask
-            ref_device = regression_preds.device if regression_preds is not None else window_mask.device
-            mse_loss = torch.tensor(0.0, device=ref_device, requires_grad=False)
-            mse_count = 0
 
         # -------------------- NaN Detection --------------------
         if torch.isnan(bce_loss) or torch.isinf(bce_loss):
@@ -188,31 +113,25 @@ class MultiModalLoss(nn.Module):
         if torch.isnan(ce_loss) or torch.isinf(ce_loss):
             print(f"[WARNING] CE Loss is NaN/Inf: {ce_loss.item()}")
 
-        if torch.isnan(mse_loss) or torch.isinf(mse_loss):
-            print(f"[WARNING] MSE Loss is NaN/Inf: {mse_loss.item()}")
-
         # -------------------- Total Loss --------------------
         total_loss = (
             bce_weight * bce_loss +
-            ce_weight * ce_loss +
-            mse_weight * mse_loss
+            ce_weight * ce_loss
         )
 
         # -------------------- Sample Counts --------------------
         loss_counts = {
             'bce_count': bce_count,
             'ce_count': ce_count,
-            'mse_count': mse_count
         }
 
-        return total_loss, bce_loss, ce_loss, mse_loss, loss_counts
-    
+        return total_loss, bce_loss, ce_loss, loss_counts
+
     # validation & test
-    def inference(self, classification_input, logits, labels, window_mask):
+    def inference(self, classification_input, logits, labels):
         return {
             'logits': logits,
             'labels': labels,
-            'window_mask': window_mask,
             'window_embeddings': classification_input
         }
 

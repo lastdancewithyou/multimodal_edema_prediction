@@ -40,3 +40,13 @@ logs/
 training/model_backup_0321.py
 models/LoRA_test.ipynb
 tester.ipynb
+models/cxrformer_model.py
+analysis/embedding_alignment_monitor.py
+multimodal_preprocessing_groundwork.ipynb
+(old)multimodal_preprocessing_groundwork.ipynb
+cxr_unimodal.ipynb
+preprocess/\[All_label]multimodal_preprocessing_groundwork.ipynb
+.gitignore
+preprocess/split_functions.py
+preprocess/scaling_functions.py
+models/cxrformer_model.py

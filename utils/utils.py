@@ -14,6 +14,12 @@ from training.run import parse_arguments
 # TIMER 전역 제어
 TIME_ENABLED = False # True: 작동 / False: 미작동
 
+def count_params(module):
+        total = sum(p.numel() for p in module.parameters())
+        trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        return total, trainable
+
+
 def plot_latent_time_attention(attn, save_path=None):
     B, L, T = attn.shape
 
@@ -172,10 +178,25 @@ def debug_tensor(name, tensor, print_stats=False):
 
 
 class Earlystopping:
-    def __init__(self, patience, start_epoch=0, save_path=None, experiment_id=None):
+    def __init__(self, patience, start_epoch=0, save_path=None, experiment_id=None, mode='max'):
+        """
+        Args:
+            patience: Early stopping patience
+            start_epoch: Epoch to start monitoring
+            save_path: Path to save best model
+            experiment_id: Experiment ID for organizing checkpoints
+            mode: 'max' for metrics to maximize (AUROC), 'min' for metrics to minimize (loss)
+        """
         self.patience = patience
         self.start_epoch = start_epoch
-        self.best_auroc = float('-inf')
+        self.mode = mode
+
+        # Initialize best metric based on mode
+        if mode == 'max':
+            self.best_metric = float('-inf')
+        else:  # mode == 'min'
+            self.best_metric = float('inf')
+
         self.counter = 0
         self.experiment_id = experiment_id
 
@@ -187,15 +208,26 @@ class Earlystopping:
         else:
             self.save_path = save_path
 
-    def __call__(self, args, auroc, model, epoch, accelerator=None):
+    def __call__(self, args, metric, model, epoch, accelerator=None):
+        """
+        Args:
+            metric: Metric value to monitor (AUROC for Stage 2, loss for Stage 1)
+        """
         early_stop = False
 
         # early stopping 시작 시점은 warm up 종료 시점
         if epoch < self.start_epoch:
             return False
 
-        if auroc > self.best_auroc:
-            self.best_auroc = auroc
+        # Check if metric improved
+        improved = False
+        if self.mode == 'max':
+            improved = metric > self.best_metric
+        else:  # mode == 'min'
+            improved = metric < self.best_metric
+
+        if improved:
+            self.best_metric = metric
             self.counter = 0
 
             if self.save_path is not None:
@@ -204,22 +236,40 @@ class Earlystopping:
                 # Unwrap model to remove DDP/Accelerate wrapper before saving
                 if accelerator is not None:
                     unwrapped_model = accelerator.unwrap_model(model)
-                    model_state = unwrapped_model.state_dict()
-                else:
-                    model_state = model.state_dict()
 
-                # Save model state_dict along with args and metadata
+                    # Save encoder separately for Stage 1
+                    if hasattr(unwrapped_model, 'encoder'):
+                        encoder_state = unwrapped_model.encoder.state_dict()
+                        model_state = unwrapped_model.state_dict()
+                    else:
+                        encoder_state = None
+                        model_state = unwrapped_model.state_dict()
+                else:
+                    if hasattr(model, 'encoder'):
+                        encoder_state = model.encoder.state_dict()
+                        model_state = model.state_dict()
+                    else:
+                        encoder_state = None
+                        model_state = model.state_dict()
+
+                # Save checkpoint
                 checkpoint = {
                     'model_state_dict': model_state,
+                    'encoder_state_dict': encoder_state,
                     'args': args,
                     'epoch': epoch,
-                    'val_level1_auroc': auroc,
+                    'best_metric': self.best_metric,
                 }
                 torch.save(checkpoint, self.save_path)
-                print(f"[Epoch {epoch+1}] 🔥 성능 향상! Best AUROC: {self.best_auroc:.4f} ([공통 경로에 덮어씌웁니다.]: {self.save_path})")
+
+                # Print message based on mode
+                if self.mode == 'max':
+                    print(f"[Epoch {epoch+1}] 🔥 성능 향상! Best AUROC: {self.best_metric:.4f} (저장 경로: {self.save_path})")
+                else:
+                    print(f"[Epoch {epoch+1}] 🔥 성능 향상! Best Loss: {self.best_metric:.4f} (저장 경로: {self.save_path})")
         else:
             self.counter += 1
-            print(f"📉 성능 개선 없음. patience 추가 {self.counter}")
+            print(f"📉 성능 개선 없음. patience 카운터: {self.counter}/{self.patience}")
 
             if self.counter >= self.patience:
                 early_stop = True

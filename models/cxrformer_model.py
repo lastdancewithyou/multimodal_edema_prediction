@@ -541,8 +541,11 @@ class CXformer(nn.Module):
 
         if context is None:
             # context가 None이면 self-attention만 수행
-            for blk in self.blocks:
-                if self.gradient_checkpointing and self.training:
+            for i, blk in enumerate(self.blocks):
+                # Skip checkpointing for blocks 10-11 (full fine-tuning needs gradients)
+                use_checkpoint = self.gradient_checkpointing and self.training and i < 10
+
+                if use_checkpoint:
                     x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
                 else:
                     x = blk(x)
@@ -791,35 +794,48 @@ def apply_lora_to_cxformer(
         setattr(parent, last, LoRALinear(module, r, alpha, dropout))
         replaced.add(name)
 
-    # Step 4: Cross-attention layers는 full fine-tuning (unfreeze)
-    cross_attn_params = 0
-    cross_attn_layers = []
+    # Step 4: Unfreeze last 2 blocks (10-11) for full fine-tuning
+    # Hybrid approach: LoRA + full fine-tuning on base weights
+    # Cross-attention remains FROZEN (not used with context=None)
+
+    last2_params = 0
+    last2_layers = []
+
     for name, param in model.named_parameters():
-        if "cross_attn" in name:
-            param.requires_grad_(True)
-            cross_attn_params += param.numel()
-            cross_attn_layers.append(name)
+        # Only target blocks 10 and 11
+        if any(f"blocks.{i}." in name for i in [10, 11]):
 
-    ####################################################################################
-    # # Step 5: Unfreeze last 2 layers' FFN and LayerNorms for task-specific adaptation
-    # last2_params = 0
-    # last2_layers = []
-    # for name, param in model.named_parameters():
-    #     # Check if parameter belongs to blocks.10 or blocks.11 (last 2 of 12 layers)
-    #     if any(f"blocks.{i}." in name for i in [10, 11]):
-    #         # Unfreeze FFN components (MLP layers and norm2)
-    #         if any(key in name for key in ["mlp", "norm2"]):
-    #             param.requires_grad_(True)
-    #             last2_params += param.numel()
-    #             last2_layers.append(name)
-    #         # Also unfreeze cross-attention layer norms (even though unused with context=None)
-    #         if "norm_cross" in name:
-    #             param.requires_grad_(True)
-    #             last2_params += param.numel()
-    #             last2_layers.append(name)
+            # EXCLUDE cross-attention (keep frozen)
+            if any(key in name for key in ["cross_attn", "norm_cross", "ls_cross"]):
+                continue  # Keep frozen
 
-    # print(f"  Last 2 layers FFN/LayerNorm unfrozen: {last2_params:,} parameters")
-    # print(f"    - Blocks 10-11 FFN and LayerNorms will be fully fine-tuned")
-    ####################################################################################
+            # Unfreeze self-attention base weights (hybrid with LoRA)
+            if "attn" in name and "cross_attn" not in name:
+                param.requires_grad_(True)
+                last2_params += param.numel()
+                last2_layers.append(name)
+
+            # Unfreeze MLP (feed-forward) layers
+            if "mlp" in name:
+                param.requires_grad_(True)
+                last2_params += param.numel()
+                last2_layers.append(name)
+
+            # Unfreeze LayerNorms (norm1, norm2 only - NOT norm_cross)
+            if "norm1" in name or "norm2" in name:
+                param.requires_grad_(True)
+                last2_params += param.numel()
+                last2_layers.append(name)
+
+            # Unfreeze LayerScale (ls1, ls2 only - NOT ls_cross)
+            if ("ls1" in name or "ls2" in name) and "ls_cross" not in name:
+                param.requires_grad_(True)
+                last2_params += param.numel()
+                last2_layers.append(name)
+
+    print(f"  Blocks 10-11 unfrozen: {last2_params:,} parameters")
+    print(f"    - Self-attention, MLP, LayerNorms: full fine-tuning")
+    print(f"    - LoRA adapters: enabled (hybrid training)")
+    print(f"    - Cross-attention: FROZEN (not used)")
 
     return model
