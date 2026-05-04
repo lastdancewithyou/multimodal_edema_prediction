@@ -21,9 +21,9 @@ def load_preprocessed_data():
     전처리 완료된 데이터 로드
     """
     data_dir = '/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/data/2rd_preprocessed_data/processed/'
-    train_df = pd.read_feather(data_dir + 'train_multimodal_20260428_alllabel.ftr')
-    val_df = pd.read_feather(data_dir + 'val_multimodal_20260428_alllabel.ftr')
-    test_df = pd.read_feather(data_dir + 'test_multimodal_20260428_alllabel.ftr')
+    train_df = pd.read_feather(data_dir + 'train_multimodal_20260427.ftr')
+    val_df = pd.read_feather(data_dir + 'val_multimodal_20260427.ftr')
+    test_df = pd.read_feather(data_dir + 'test_multimodal_20260427.ftr')
 
     print(f"\n[Data Loading] Train: {len(train_df):,} rows, Val: {len(val_df):,} rows, Test: {len(test_df):,} rows")
 

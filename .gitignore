@@ -21,6 +21,7 @@ wandb/
 *.ftr
 *.npy
 *.npz
+*.gz
 
 # Logs
 *.log
@@ -50,3 +51,6 @@ preprocess/\[All_label]multimodal_preprocessing_groundwork.ipynb
 preprocess/split_functions.py
 preprocess/scaling_functions.py
 models/cxrformer_model.py
+icu_cxr
+
+IMAGE_FILENAMES.txt

@@ -10,7 +10,7 @@ def parse_arguments():
     parser.add_argument('--project_name', type=str, default="Deciding on Learning Methods", help="Wandb project name")
     parser.add_argument('--experiment_id', type=str, default="10", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
-    parser.add_argument('--wandb_on', type=bool, default=True, help='Enable Weights & Biases logging')
+    parser.add_argument('--wandb_on', type=bool, default=False, help='Enable Weights & Biases logging')
 
     # Modality Selection (True가 해당 모달리티 사용 중지)
     parser.add_argument("--disable_prompt", type=bool, default=True, help="prompt 활성화 여부")
