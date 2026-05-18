@@ -18,12 +18,12 @@ from utils.utils import set_seed
 
 def load_preprocessed_data():
     """
-    전처리 완료된 데이터 로드
+    스플릿까지 완료된 데이터 로드
     """
-    data_dir = '/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/data/2rd_preprocessed_data/processed/'
-    train_df = pd.read_feather(data_dir + 'train_multimodal_20260427.ftr')
-    val_df = pd.read_feather(data_dir + 'val_multimodal_20260427.ftr')
-    test_df = pd.read_feather(data_dir + 'test_multimodal_20260427.ftr')
+    data_dir = '/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/data/4th_preprocessed_data/'
+    train_df = pd.read_feather(data_dir + 'train_multimodal_20260513.ftr')
+    val_df = pd.read_feather(data_dir + 'val_multimodal_20260513.ftr')
+    test_df = pd.read_feather(data_dir + 'test_multimodal_20260513.ftr')
 
     print(f"\n[Data Loading] Train: {len(train_df):,} rows, Val: {len(val_df):,} rows, Test: {len(test_df):,} rows")
 

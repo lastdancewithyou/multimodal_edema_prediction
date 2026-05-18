@@ -9,78 +9,125 @@ from tqdm.auto import tqdm
 import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, Sampler
-import torchvision.transforms as T
+
 
 from utils.utils import timer, seed_worker
 
-# IMAGE_DIR
-# CACHED_IMAGE_DIR = "/home/DAHS1/gangmin/my_research/CXR/cached_images_224_0317" # cropped_outline_image (224 by 224)
-CACHED_IMAGE_DIR = "/home/DAHS1/gangmin/my_research/CXR/cached_images_256_0317" # cropped_outline_image (256 by 256)
-
 
 class SCL_Multi_Dataset(Dataset):
-    def __init__(self, args, merged_df):
+    def __init__(self, args, merged_df, include_nan_labels=False, stride=None):
         self.args = args
         self.window_size = args.window_size
-        self.stride = args.stride
+        self.stride = stride
         self.prediction_horizon = args.prediction_horizon
+        self.include_nan_labels = include_nan_labels
 
         self.merged_df = merged_df
         self.stay_groups = self.merged_df.groupby('stay_id') # stay_id 식별자를 기준으로 grouping
         self.stay_ids = list(self.stay_groups.groups.keys())
 
         exclude_cols = [
-            'subject_id', 'hadm_id', 'stay_id', 'hour_slot', 
+            'subject_id', 'hadm_id', 'stay_id', 'hour_slot',
             # New Label
-            'Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Enlarged Cardiomediastinum', 'Fracture', 'Lung Lesion', 'Lung Opacity', 'No Finding', 'Pleural Effusion', 'Pleural Other', 'Pneumonia', 'Pneumothorax', 'Support Devices',
-            'cxr_flag', 'hash_path', 'text_flag', 'tokenized_text', 'clinical_prompt', 'prompt_id']
+            'Cardiomegaly', 'Consolidation', 'Edema', 'Pneumonia', 'Edema_soft',
+            # Img
+            'cxr_flag', 'raddino_emb_path', 'hybrid_emb_path',
+            # Text
+            'text_flag', 'text_embed_path'
+        ]
+
         all_feature_cols = [col for col in self.merged_df.columns if col not in exclude_cols]
 
         self.ts_features = all_feature_cols
         print(f"[Dataset] Total features (including variable flags): {len(self.ts_features)}")
 
+        ts_features_set = set(self.ts_features)
+        value_cols = [
+            c for c in self.ts_features
+            if not c.endswith('_flag') and f"{c}_flag" in ts_features_set
+        ]
+        flag_cols = [f"{c}_flag" for c in value_cols]
+        flagless_cols = [
+            c for c in self.ts_features
+            if not c.endswith('_flag') and f"{c}_flag" not in ts_features_set
+        ]
+
+        col_to_idx = {c: i for i, c in enumerate(self.ts_features)}
+        self.value_col_idx = torch.tensor([col_to_idx[c] for c in value_cols], dtype=torch.long)
+        self.flag_col_idx = torch.tensor([col_to_idx[c] for c in flag_cols], dtype=torch.long)
+        print(f"[Dataset] Maskable value/flag pairs: {len(value_cols)}")
+        if flagless_cols:
+            print(f"[Dataset] Flag-less cols (excluded from masking, {len(flagless_cols)}): {flagless_cols}")
+
         # ========== image / text / clinical_prompt mapping 사전 구축 ==========
         # collate_fn에서 배치를 구성할 때, 중복 이미지/텍스트/프롬프트를 제거하고 unique한 것만 인코딩하기 위함
         self.image_map = {}
+        self.segment_map = {}
         self.text_map = {}
-        self.prompt_map = {}
 
         for stay_id in self.stay_ids:
-            stay_data = self.stay_groups.get_group(stay_id)  # 데이터는 이미 정렬되어 있음
+            stay_data = self.stay_groups.get_group(stay_id)
 
             # cxr_flag == 1인 hour_slot만 매핑에 추가함.
-            img_dict = {t: path for t, path, flag in zip(stay_data['hour_slot'], stay_data['hash_path'], stay_data['cxr_flag']) if flag == 1}
+            img_dict = {t: p for t, p, flag in zip(stay_data['hour_slot'], stay_data['raddino_emb_path'], stay_data['cxr_flag']) if flag == 1}
+            segment_dict = {t: p for t, p, flag in zip(stay_data['hour_slot'], stay_data['hybrid_emb_path'], stay_data['cxr_flag']) if flag == 1}
+            # 향후 lesion dict 추가
 
-            # text_flag == 1인 hour_slot만 매핑에 추가함 (radiology report)
-            text_dict = {t: token for t, token, flag in zip(stay_data['hour_slot'], stay_data['tokenized_text'], stay_data['text_flag']) if flag == 1}
-
-            # prompt_id를 키로 clinical_prompt 매핑 (환자별 고유 ID 기반, -1 포함)
-            prompt_dict = {}
-            for _, row in stay_data.iterrows():
-                pid = int(row['prompt_id'])  # -1 포함하여 모든 prompt_id 저장
-                if pid not in prompt_dict:  # 중복 방지
-                    prompt_dict[pid] = row['clinical_prompt']
+            # text_flag == 1인 hour_slot만 매핑에 추가함
+            text_dict = {t: p for t, p, flag in zip(stay_data['hour_slot'], stay_data['text_embed_path'], stay_data['text_flag']) if flag == 1}
 
             self.image_map[stay_id] = img_dict
+            self.segment_map[stay_id] = segment_dict
             self.text_map[stay_id] = text_dict
-            self.prompt_map[stay_id] = prompt_dict
 
-        # ========== Image caching ==========
-        self.image_cache = {}
-
-        self.to_3ch = args.img_to_3ch # 기본 전처리는 1채널로 되어 있음.
-        print(f"\n[Dataset] Image preprocessing config: to_3ch={self.to_3ch}")
+        self.image_emb_cache = {}
+        self.segment_emb_cache = {}
+        self.text_emb_cache = {}
 
         # ========== Window-level Indexing ==========
         self._build_window_index()
         print(f"[Dataset] Window-level indexing complete: {len(self.window_index):,} total windows")
 
+    ################################################################################################
+    def _load_emb(self, path, cache):
+        if not isinstance(path, str) or path.strip() == "":
+            raise RuntimeError(f"[ERROR] Invalid embedding path: {path!r}")
+        if path in cache:
+            return cache[path]
+        if not os.path.exists(path):
+            raise RuntimeError(f"[ERROR] Embedding file does not exist: {path}")
+        try:
+            emb = torch.load(path, map_location='cpu')
+        except Exception:
+            raise RuntimeError(f"[ERROR] Failed to load embedding: {path}")
+        cache[path] = emb
+        return emb
+
+    def load_raddino_emb(self, path):
+        payload = self._load_emb(path, self.image_emb_cache)
+        return payload['global_emb']
+
+    def load_segment_emb(self, path):
+        payload = self._load_emb(path, self.segment_emb_cache)
+        seg_emb = torch.stack([payload['lung'], payload['heart']], dim=0) # 폐와 심장 임베딩 분리 (shape: [2, 32])
+        return seg_emb
+
+    def load_ctr(self, path):
+        # payload['geometry'] = [CTR, heart_width, thoracic_width] — CTR(Cardiothoracic Ratio)만 사용
+        payload = self._load_emb(path, self.segment_emb_cache)
+        return payload['geometry'][0].float()  # scalar
+
+    def load_text_emb(self, path):
+        return self._load_emb(path, self.text_emb_cache)
+    ################################################################################################
+
+
     def _build_window_index(self):
         """
         전체 windows를 flat list로 구성, 각 window를 독립적인 샘플로 취급하여 window-level batching 지원
         """
-        self.window_index = []   # [(stay_id, window_start_idx), ...]
-        self.window_labels = {}  # {window_id: {edema, subtype}}
+        self.window_index = []
+        self.window_labels = {}
 
         # Valid patient filtering
         valid_patients = []
@@ -94,28 +141,40 @@ class SCL_Multi_Dataset(Dataset):
                 valid_patients.append(stay_id)
                 max_start = L - self.window_size - self.prediction_horizon
 
-                edema_labels = stay_data['Edema'].to_numpy()
-                subtype_labels = stay_data['subtype_label'].to_numpy()
+                edema_soft_labels = stay_data['Edema_soft'].to_numpy()
+                edema_hard_labels = stay_data['Edema'].to_numpy()      # Track A
+                cxr_flags = stay_data['cxr_flag'].to_numpy()           # Track A anchor
+                cardio_labels = stay_data['Cardiomegaly'].to_numpy()   # Sub-task
+                pneumo_labels = stay_data['Pneumonia'].to_numpy()      # Sub-task
 
                 for i in range(0, max_start + 1, self.stride):
-                    # 라벨 인덱스 계산
                     label_idx = i + self.window_size + self.prediction_horizon - 1
+                    edema_soft_label = edema_soft_labels[label_idx]
 
-                    # 벡터화된 배열에서 직접 추출
-                    edema_label = edema_labels[label_idx]
-                    subtype_label = subtype_labels[label_idx]
-
-                    # edema 라벨이 없는 윈도우는 학습에 기여하지 않으므로 제외
-                    if pd.isna(edema_label):
+                    # NaN 윈도우 처리: include_nan_labels=False면 스킵, True면 contrastive 학습용으로 포함
+                    if pd.isna(edema_soft_label) and not self.include_nan_labels:
                         continue
+
+                    edema_hard_label = edema_hard_labels[label_idx]
+                    
+                    # cxr_anchor = int(cxr_flags[label_idx])
+                    cxr_flag_val = cxr_flags[label_idx]
+                    cxr_anchor = int(cxr_flag_val) if pd.notna(cxr_flag_val) else 0
+
+                    cardio_label = cardio_labels[label_idx]
+                    pneumo_label = pneumo_labels[label_idx]
 
                     window_id = len(self.window_index)
                     self.window_index.append((stay_id, i))
 
-                    # 라벨 저장
                     self.window_labels[window_id] = {
-                        'edema': int(edema_label),
-                        'subtype': int(subtype_label) if pd.notna(subtype_label) else -1,
+                        'edema_soft': float(edema_soft_label),
+                        'edema_hard': int(edema_hard_label) if pd.notna(edema_hard_label) else -1,
+                        'cxr_anchor': cxr_anchor,
+                        # NaN은 float('nan') 그대로 보존 → loss에서 마스킹
+                        'cardiomegaly': float(cardio_label) if pd.notna(cardio_label) else float('nan'),
+                        'pneumonia': float(pneumo_label) if pd.notna(pneumo_label) else float('nan'),
+                        # 'subtype': int(subtype_label) if pd.notna(subtype_label) else -1,
                     }
             else:
                 skipped_patients += 1
@@ -126,42 +185,6 @@ class SCL_Multi_Dataset(Dataset):
             print(f"[Dataset] Skipped {skipped_patients} patients with insufficient data (< {self.window_size + self.prediction_horizon}h)")
         print(f"[Dataset] Built window index: {len(self.window_index):,} windows from {len(self.stay_ids):,} patients")
 
-    def load_image_cached(self, hash_filename):
-        if not hash_filename or not isinstance(hash_filename, str) or hash_filename.strip() == "":
-            raise RuntimeError(
-                f"[ERROR] Invalid image filename: {hash_filename}\n"
-            )
-
-        if hash_filename in self.image_cache:
-            return self.image_cache[hash_filename]
-
-        file_path = os.path.join(CACHED_IMAGE_DIR, hash_filename)
-        if not os.path.exists(file_path):
-            raise RuntimeError(
-                f"[ERROR] Image file does not exist: {file_path}\n"
-            )
-
-        try:
-            # Load preprocessed tensor: [1, 224, 224] or [1, 256, 256]
-            img_tensor = torch.load(file_path)
-
-        except Exception as e:
-            raise RuntimeError(
-                f"[ERROR] Failed to load image tensor from: {file_path}\n"
-            )
-
-        if img_tensor.ndim != 3:
-            raise RuntimeError(
-                f"[ERROR] Invalid image tensor shape: {img_tensor.shape}\n"
-            )
-
-        # RGB 인코더 사용 시 1채널 → 3채널 변환
-        if self.to_3ch and img_tensor.shape[0] == 1:
-            img_tensor = img_tensor.repeat(3, 1, 1)
-
-        # Cache 저장 후 반환
-        self.image_cache[hash_filename] = img_tensor
-        return img_tensor
 
     def __getitem__(self, idx):
         """
@@ -169,7 +192,7 @@ class SCL_Multi_Dataset(Dataset):
         """
         # Window index에서 (stay_id, start_idx) 조회
         stay_id, start_idx = self.window_index[idx]
-        stay_data = self.stay_groups.get_group(stay_id)  # 데이터는 이미 정렬되어 있음
+        stay_data = self.stay_groups.get_group(stay_id)
 
         # Window 데이터 추출 (start_idx부터 window_size만큼)
         window_data = stay_data.iloc[start_idx:start_idx + self.window_size]
@@ -177,23 +200,16 @@ class SCL_Multi_Dataset(Dataset):
         # Hour slots 및 시계열 features
         hour_slots = window_data['hour_slot'].to_numpy()
         ts_features = torch.tensor(window_data[self.ts_features].astype(np.float32).to_numpy(), dtype=torch.float32)  # [24, D]
-
-        # Clinical prompt_id 시리즈
-        prompt_ids = window_data['prompt_id'].to_numpy()
-
-        # 각 hour_slot에 이미지/텍스트/프롬프트가 있으면 해당 인덱스, 없으면 -1
         img_indices = [t if t in self.image_map[stay_id] else -1 for t in hour_slots]
         text_indices = [t if t in self.text_map[stay_id] else -1 for t in hour_slots]
-        prompt_indices = [int(pid) if pd.notna(pid) and pid != -1 and int(pid) in self.prompt_map[stay_id] else -1 for pid in prompt_ids]
 
-        # Window sequence 생성 (24개 timestep)
+        # Window sequence 생성
         window_sequence = [
             {
                 'time_step': int(hour_slots[j]),
                 'ts_features': ts_features[j],
                 'img_index': img_indices[j],
                 'txt_index': text_indices[j],
-                'prompt_index': prompt_indices[j]
             }
             for j in range(self.window_size)
         ]
@@ -203,16 +219,19 @@ class SCL_Multi_Dataset(Dataset):
         return {
             'stay_id': stay_id,
             'window_idx': idx,
-            'time_steps': hour_slots,  # [24]
-            'ts_features': ts_features,  # [24, D]
-            'window_sequence': window_sequence,  # List[Dict], len=24
-            'img_indices': img_indices,  # [24]
-            'text_indices': text_indices,  # [24]
-            'prompt_indices': prompt_indices,  # [24]
-            'has_cxr': [int(x != -1) for x in img_indices],  # [24]
-            'has_text': [int(x != -1) for x in text_indices],  # [24]
-            'edema_label': labels['edema'],  # scalar
-            'subtype_label': labels['subtype'],  # scalar (0/1/2 그대로)
+            'time_steps': hour_slots,
+            'ts_features': ts_features,
+            'window_sequence': window_sequence,
+            'img_indices': img_indices,
+            'text_indices': text_indices,
+            'has_cxr': [int(x != -1) for x in img_indices],
+            'has_text': [int(x != -1) for x in text_indices],
+            'edema_soft': labels['edema_soft'],
+            'edema_hard': labels['edema_hard'],
+            'cxr_anchor': labels['cxr_anchor'],
+            'cardiomegaly': labels['cardiomegaly'],
+            'pneumonia': labels['pneumonia'],
+            # 'subtype_label': labels['subtype'],  # scalar
         }
     
     def collate_fn(self, batch):
@@ -226,16 +245,16 @@ class SCL_Multi_Dataset(Dataset):
 
         # ==================== 배치 내 고유 항목 추출 + 인덱스 매핑 ====================
         unique_img_paths = []
-        unique_txt_keys = []
-        unique_prompt_keys = []
+        unique_segment_paths = []
+        unique_text_paths = []
 
         img_path_to_idx = {}
-        txt_key_to_idx = {}
-        prompt_key_to_idx = {}
+        segment_path_to_idx = {}
+        text_path_to_idx = {}
 
         img_index_tensor = torch.full((B, args.window_size), fill_value=-1, dtype=torch.long)
+        segment_index_tensor = torch.full((B, args.window_size), fill_value=-1, dtype=torch.long)
         text_index_tensor = torch.full((B, args.window_size), fill_value=-1, dtype=torch.long)
-        prompt_index_tensor = torch.full((B, args.window_size), fill_value=-1, dtype=torch.long)
 
         # 고유 항목 수집 + 인덱스 매핑 동시 수행
         for i, item in enumerate(batch):
@@ -250,31 +269,46 @@ class SCL_Multi_Dataset(Dataset):
                         unique_img_paths.append(img_path)
                     img_index_tensor[i, t] = img_path_to_idx[img_path]
 
+                    # Lung, heart segment embed
+                    segment_path = self.segment_map[stay_id][img_hour]
+                    if segment_path not in segment_path_to_idx:
+                        segment_path_to_idx[segment_path] = len(unique_segment_paths)
+                        unique_segment_paths.append(segment_path)
+                    segment_index_tensor[i, t] = segment_path_to_idx[segment_path]
+
                 # 텍스트 처리
                 txt_hour = step['txt_index']
                 if txt_hour != -1:
-                    txt_key = (stay_id, txt_hour)
-                    if txt_key not in txt_key_to_idx:
-                        txt_key_to_idx[txt_key] = len(unique_txt_keys)
-                        unique_txt_keys.append(txt_key)
-                    text_index_tensor[i, t] = txt_key_to_idx[txt_key]
+                    txt_path = self.text_map[stay_id][txt_hour]
+                    if txt_path not in text_path_to_idx:
+                        text_path_to_idx[txt_path] = len(unique_text_paths)
+                        unique_text_paths.append(txt_path)
+                    text_index_tensor[i, t] = text_path_to_idx[txt_path]
 
-                # Clinical prompt 처리
-                prompt_id = step['prompt_index']
-                prompt_key = (stay_id, prompt_id)
-                if prompt_key not in prompt_key_to_idx:
-                    prompt_key_to_idx[prompt_key] = len(unique_prompt_keys)
-                    unique_prompt_keys.append(prompt_key)
-                prompt_index_tensor[i, t] = prompt_key_to_idx[prompt_key]
+        unique_img_embs = (
+            torch.stack([self.load_raddino_emb(p) for p in unique_img_paths])
+            if unique_img_paths else torch.empty(0)
+        )
+        unique_segment_embs = (
+            torch.stack([self.load_segment_emb(p) for p in unique_segment_paths])
+            if unique_segment_paths else torch.empty(0)
+        )
+        unique_ctr = (
+            torch.stack([self.load_ctr(p) for p in unique_segment_paths])
+            if unique_segment_paths else torch.empty(0)
+        )  # [N_seg], CTR scalar
+        unique_text_embs = (
+            torch.stack([self.load_text_emb(p) for p in unique_text_paths])
+            if unique_text_paths else torch.empty(0)
+        )
 
         # ==================== 라벨 텐서 ====================
-        edema_labels = torch.tensor([item['edema_label'] for item in batch], dtype=torch.long)  # [B]
-        subtype_labels = torch.tensor([item['subtype_label'] for item in batch], dtype=torch.long)  # [B]
-
-        # ==================== Clinical Prompt 텍스트 추출 ====================
-        unique_prompt_texts = []
-        for stay_id, prompt_id in unique_prompt_keys:
-            unique_prompt_texts.append(self.prompt_map[stay_id][prompt_id])
+        edema_soft_labels = torch.tensor([item['edema_soft'] for item in batch], dtype=torch.float32)
+        edema_hard_labels = torch.tensor([item['edema_hard'] for item in batch], dtype=torch.long)
+        cxr_anchor_mask = torch.tensor([item['cxr_anchor'] for item in batch], dtype=torch.long)
+        cardiomegaly_labels = torch.tensor([item['cardiomegaly'] for item in batch], dtype=torch.float32)
+        pneumonia_labels = torch.tensor([item['pneumonia'] for item in batch], dtype=torch.float32)
+        # subtype_labels = torch.tensor([item['subtype_label'] for item in batch], dtype=torch.long)
 
         # Window-level batching: 각 배치 아이템이 하나의 window
         ts_tensor = torch.stack([item['ts_features'] for item in batch])  # [B, 24, D]
@@ -282,16 +316,23 @@ class SCL_Multi_Dataset(Dataset):
 
         return {
             'stay_ids': [item['stay_id'] for item in batch],
-            'ts_tensor': ts_tensor,                      # [B, 24, D]
-            'time_steps': time_steps_tensor,             # [B, 24]
-            'img_index_tensor': img_index_tensor,        # [B, 24]
-            'text_index_tensor': text_index_tensor,      # [B, 24]
-            'prompt_index_tensor': prompt_index_tensor,  # [B, 24]
-            'unique_img_paths': unique_img_paths,        # List[str]
-            'unique_txt_keys': unique_txt_keys,          # List[(stay_id, hour_slot)]
-            'unique_prompt_texts': unique_prompt_texts,  # List[str]
-            'edema_labels': edema_labels,                # [B]
-            'subtype_labels': subtype_labels,            # [B]
+            'ts_tensor': ts_tensor,
+            'time_steps': time_steps_tensor,
+            'img_index_tensor': img_index_tensor,
+            'segment_index_tensor': segment_index_tensor,
+            'text_index_tensor': text_index_tensor,
+            'unique_img_embs': unique_img_embs,
+            'unique_segment_embs': unique_segment_embs,
+            'unique_ctr': unique_ctr,
+            'unique_text_embs': unique_text_embs,
+            'edema_soft_labels': edema_soft_labels,
+            'edema_hard_labels': edema_hard_labels,
+            'cxr_anchor_mask': cxr_anchor_mask,
+            'cardiomegaly_labels': cardiomegaly_labels,
+            'pneumonia_labels': pneumonia_labels,
+            'value_col_idx': self.value_col_idx,
+            'flag_col_idx': self.flag_col_idx,
+            # 'subtype_labels': subtype_labels,
         }
     
     def __len__(self):
@@ -302,7 +343,7 @@ class SCL_Multi_Dataset(Dataset):
 #######################################################################
 # Window-level Sampler
 #######################################################################
-class StratifiedWindowSampler(Sampler):
+class DDPWindowSampler(Sampler):
     """
     Window-level stratified sampling
     - 각 window를 독립적인 샘플로 취급
@@ -358,7 +399,7 @@ class StratifiedWindowSampler(Sampler):
 
         if self.rank == 0:
             split_tag = f"[{self.split.upper()}]" if self.split else ""
-            print(f"\n[StratifiedWindowSampler]{split_tag} Epoch {epoch}")
+            print(f"\n[DDPWindowSampler]{split_tag} Epoch {epoch}")
             print(f"Total windows: {len(indices):,}")
             print(f"Batch size: {self.batch_size}")
             print(f"Total batches: {len(self.batches)}")
@@ -378,20 +419,23 @@ class StratifiedWindowSampler(Sampler):
 #######################################################################
 # 데이터셋 정의
 #######################################################################
-def get_dataloaders(train_df, val_df, test_df, args, accelerator=None, num_workers=8):
+def get_dataloaders(train_df, val_df, test_df, args, accelerator=None, num_workers=4):
     """
     Window-level batching을 위한 DataLoader 생성
     - train_df, val_df, test_df: time_series_cxr_preprocess.ipynb에서 이미 split & scaling & join 완료된 데이터
     """
     # Dataset 생성 (이미 split & scaling 완료된 데이터 사용)
     with timer("Dataset 생성"):
-        train_dataset = SCL_Multi_Dataset(args, train_df)
-        val_dataset = SCL_Multi_Dataset(args, val_df)
-        test_dataset = SCL_Multi_Dataset(args, test_df)
+        train_stride = args.train_stride
+        eval_stride = args.eval_stride
+        
+        train_dataset = SCL_Multi_Dataset(args, train_df, include_nan_labels=(args.unsupervised_weight > 0), stride=train_stride) # 일단 이렇게 결측 라벨을 제어함.
+        val_dataset = SCL_Multi_Dataset(args, val_df, include_nan_labels=False, stride=eval_stride)
+        test_dataset = SCL_Multi_Dataset(args, test_df, include_nan_labels=False, stride=eval_stride)
 
     # Window-level sampler 생성
     with timer("샘플러 가동"):
-        train_sampler = StratifiedWindowSampler(
+        train_sampler = DDPWindowSampler(
             dataset=train_dataset,
             batch_size=args.train_batch_size,
             accelerator=accelerator,
@@ -401,7 +445,7 @@ def get_dataloaders(train_df, val_df, test_df, args, accelerator=None, num_worke
             split="Train"
         )
 
-        val_sampler = StratifiedWindowSampler(
+        val_sampler = DDPWindowSampler(
             dataset=val_dataset,
             batch_size=args.val_batch_size,
             accelerator=accelerator,
@@ -411,7 +455,7 @@ def get_dataloaders(train_df, val_df, test_df, args, accelerator=None, num_worke
             split="Validation"
         )
 
-        test_sampler = StratifiedWindowSampler(
+        test_sampler = DDPWindowSampler(
             dataset=test_dataset,
             batch_size=args.test_batch_size,
             accelerator=accelerator,

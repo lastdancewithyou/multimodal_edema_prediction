@@ -5,318 +5,264 @@ import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 import warnings
 warnings.filterwarnings('ignore', message='Spectral initialisation failed')
-from umap import UMAP
 
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, average_precision_score, brier_score_loss, confusion_matrix
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import label_binarize
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 
 from utils.utils import timer
 from training.engine import train_batch
-from analysis.calibration import ExpectedCalibrationError, analyze_calibration
 
 
-def validate_multitask(args, model, dataloader, loss_module, device, accelerator, dataset, epoch=None, disable_cxr=False, disable_txt=True, max_length=256):
+def _threshold_free_metrics(p_all, lab_all, cxr_anchor_all):
+    out = {'auroc': float('nan'), 'auprc': float('nan')}
+    if p_all is None or lab_all is None or len(p_all) == 0:
+        return out
+
+    valid = (cxr_anchor_all == 1) & (~np.isnan(lab_all))
+    if valid.sum() < 2:
+        return out
+
+    y = lab_all[valid].astype(int)
+    p = p_all[valid]
+    if len(np.unique(y)) < 2:
+        return out
+
+    out['auroc'] = roc_auc_score(y, p)
+    out['auprc'] = average_precision_score(y, p)
+    return out
+
+
+def validate_multitask(args, model, dataloader, loss_module, device, accelerator, epoch=None, disable_cxr=False, disable_txt=True):
     print("=====Running Multi-Task Validation=====")
     model.eval()
 
     bce_sum = torch.zeros(1, device=device, dtype=torch.float32)
     bce_count = torch.zeros(1, device=device, dtype=torch.float32)
-    ce_sum = torch.zeros(1, device=device, dtype=torch.float32)
-    ce_count = torch.zeros(1, device=device, dtype=torch.float32)
+    cardio_sum = torch.zeros(1, device=device, dtype=torch.float32)
+    cardio_count = torch.zeros(1, device=device, dtype=torch.float32)
+    pneumo_sum = torch.zeros(1, device=device, dtype=torch.float32)
+    pneumo_count = torch.zeros(1, device=device, dtype=torch.float32)
 
-    val_edema_preds_list = []
-    val_edema_labels_list = []
-    val_subtype_preds_list = []
-    val_subtype_labels_list = []
+    val_p_pos_list = []
+    val_edema_hard_list = []
+    val_cxr_anchor_list = []
+    val_cardio_p_list = []
+    val_cardio_lab_list = []
+    val_pneumo_p_list = []
+    val_pneumo_lab_list = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, total=len(dataloader), desc="🤖 <Multi-Task Validation>"):
-            _, batch_bce, batch_ce, batch_outputs, batch_counts = train_batch(
+            _, batch_bce, _, batch_cardio, batch_pneumo, _, batch_outputs, batch_counts = train_batch(
                 args=args,
                 model=model,
                 batch=batch,
                 loss_module=loss_module,
                 device=device,
                 accelerator=accelerator,
-                dataset=dataset,
-                max_length=max_length,
                 disable_cxr=disable_cxr,
-                # disable_txt=disable_txt,
-                disable_txt=False,
+                disable_txt=disable_txt,
                 bce_weight=args.bce_weight,
-                ce_weight=args.ce_weight,
+                cardio_weight=args.cardio_weight,
+                pneumo_weight=args.pneumo_weight,
+                info_weight=0.0,  # validation/test에서는 InfoNCE alignment 비활성
                 is_training=False,
             )
 
             bce_ct_local = torch.as_tensor(batch_counts['bce_count'], device=device, dtype=torch.float32)
-            ce_ct_local = torch.as_tensor(batch_counts['ce_count'], device=device, dtype=torch.float32)
-
             bce_sum += torch.as_tensor(batch_bce, device=device, dtype=torch.float32) * bce_ct_local
             bce_count += bce_ct_local
-            ce_sum += torch.as_tensor(batch_ce, device=device, dtype=torch.float32) * ce_ct_local
-            ce_count += ce_ct_local
 
-            edema_logits = batch_outputs['edema_logits'].squeeze(-1)  # [B]
-            subtype_logits = batch_outputs['subtype_logits']           # [B, 3]
-            edema_labels = batch_outputs['edema_labels']               # [B]
-            subtype_labels = batch_outputs['subtype_labels']           # [B]
+            cardio_ct_local = torch.as_tensor(batch_counts['cardio_count'], device=device, dtype=torch.float32)
+            cardio_sum += torch.as_tensor(batch_cardio, device=device, dtype=torch.float32) * cardio_ct_local
+            cardio_count += cardio_ct_local
 
-            p_pos = torch.sigmoid(edema_logits)                        # [B] P(edema=1)
-            p_sub = torch.softmax(subtype_logits, dim=-1)              # [B, 3] P(Intermediate|pos), P(NCPE|pos), P(CPE|pos)
+            pneumo_ct_local = torch.as_tensor(batch_counts['pneumo_count'], device=device, dtype=torch.float32)
+            pneumo_sum += torch.as_tensor(batch_pneumo, device=device, dtype=torch.float32) * pneumo_ct_local
+            pneumo_count += pneumo_ct_local
 
-            val_edema_preds_list.append(p_pos.detach().cpu())
-            val_subtype_preds_list.append(p_sub.detach().cpu())
+            edema_logits = batch_outputs['edema_logits'].squeeze(-1)
+            edema_hard = batch_outputs['edema_hard_labels']
+            cxr_anchor = batch_outputs['cxr_anchor_mask']
 
-            val_edema_labels_list.append(edema_labels.detach().cpu())
-            val_subtype_labels_list.append(subtype_labels.detach().cpu())
+            p_pos = torch.sigmoid(edema_logits)
 
-    # GPU aggregation
-    if accelerator.num_processes > 1:
-        total_bce_sum = accelerator.gather_for_metrics(bce_sum).sum()
-        total_bce_count = accelerator.gather_for_metrics(bce_count).sum()
-        total_ce_sum = accelerator.gather_for_metrics(ce_sum).sum()
-        total_ce_count = accelerator.gather_for_metrics(ce_count).sum()
-    else:
-        total_bce_sum = bce_sum
-        total_bce_count = bce_count
-        total_ce_sum = ce_sum
-        total_ce_count = ce_count
+            val_p_pos_list.append(p_pos.detach().cpu())
+            val_edema_hard_list.append(edema_hard.detach().cpu())
+            val_cxr_anchor_list.append(cxr_anchor.detach().cpu())
 
-    bce_avg = (total_bce_sum / (total_bce_count + 1e-8)).item()
-    ce_avg = (total_ce_sum / (total_ce_count + 1e-8)).item()
+            cardio_p = torch.sigmoid(batch_outputs['cardiomegaly_logits'].squeeze(-1))
+            pneumo_p = torch.sigmoid(batch_outputs['pneumonia_logits'].squeeze(-1))
+            val_cardio_p_list.append(cardio_p.detach().cpu())
+            val_cardio_lab_list.append(batch_outputs['cardiomegaly_labels'].detach().cpu())
+            val_pneumo_p_list.append(pneumo_p.detach().cpu())
+            val_pneumo_lab_list.append(batch_outputs['pneumonia_labels'].detach().cpu())
 
-    bce_contrib = args.bce_weight * bce_avg
-    ce_contrib = args.ce_weight * ce_avg
-    total_loss = bce_contrib + ce_contrib
+    # Loss aggregation across GPUs
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(bce_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(bce_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(cardio_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(cardio_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(pneumo_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(pneumo_count, op=dist.ReduceOp.SUM)
+
+    bce_avg = (bce_sum / (bce_count + 1e-8)).item()
+    cardio_avg = (cardio_sum / (cardio_count + 1e-8)).item()
+    pneumo_avg = (pneumo_sum / (pneumo_count + 1e-8)).item()
+    total_loss = (
+        args.bce_weight * bce_avg
+        + args.cardio_weight * cardio_avg
+        + args.pneumo_weight * pneumo_avg
+    )
 
     # Gather predictions from all GPUs
     if accelerator.num_processes > 1:
         local_preds = {
-            'p_pos': [p.cpu() for p in val_edema_preds_list],
-            'p_sub': [p.cpu() for p in val_subtype_preds_list],
-            'edema': [e.cpu() for e in val_edema_labels_list],
-            'subtype': [s.cpu() for s in val_subtype_labels_list]
+            'p_pos': [p.cpu() for p in val_p_pos_list],
+            'edema_hard': [e.cpu() for e in val_edema_hard_list],
+            'cxr_anchor': [c.cpu() for c in val_cxr_anchor_list],
+            'cardio_p': [p.cpu() for p in val_cardio_p_list],
+            'cardio_lab': [l.cpu() for l in val_cardio_lab_list],
+            'pneumo_p': [p.cpu() for p in val_pneumo_p_list],
+            'pneumo_lab': [l.cpu() for l in val_pneumo_lab_list],
         }
 
-        # Gather to rank 0 only
         if accelerator.is_main_process:
             gathered_preds = [None] * accelerator.num_processes
             dist.gather_object(local_preds, gathered_preds, dst=0)
 
-            all_p_pos = []
-            all_p_sub = []
-            all_edema = []
-            all_subtype = []
-
+            all_p_pos, all_edema_hard, all_cxr_anchor = [], [], []
+            all_cardio_p, all_cardio_lab = [], []
+            all_pneumo_p, all_pneumo_lab = [], []
             for gpu_preds in gathered_preds:
                 all_p_pos.extend(gpu_preds['p_pos'])
-                all_p_sub.extend(gpu_preds['p_sub'])
-                all_edema.extend(gpu_preds['edema'])
-                all_subtype.extend(gpu_preds['subtype'])
+                all_edema_hard.extend(gpu_preds['edema_hard'])
+                all_cxr_anchor.extend(gpu_preds['cxr_anchor'])
+                all_cardio_p.extend(gpu_preds['cardio_p'])
+                all_cardio_lab.extend(gpu_preds['cardio_lab'])
+                all_pneumo_p.extend(gpu_preds['pneumo_p'])
+                all_pneumo_lab.extend(gpu_preds['pneumo_lab'])
 
             p_pos_all = torch.cat(all_p_pos, dim=0).numpy() if all_p_pos else np.array([])
-            p_sub_all = torch.cat(all_p_sub, dim=0).numpy() if all_p_sub else np.array([])
-            edema_all = torch.cat(all_edema, dim=0).numpy() if all_edema else np.array([])
-            subtype_all = torch.cat(all_subtype, dim=0).numpy() if all_subtype else np.array([])
+            edema_hard_all = torch.cat(all_edema_hard, dim=0).numpy() if all_edema_hard else np.array([])
+            cxr_anchor_all = torch.cat(all_cxr_anchor, dim=0).numpy() if all_cxr_anchor else np.array([])
+            cardio_p_all = torch.cat(all_cardio_p, dim=0).numpy() if all_cardio_p else np.array([])
+            cardio_lab_all = torch.cat(all_cardio_lab, dim=0).numpy() if all_cardio_lab else np.array([])
+            pneumo_p_all = torch.cat(all_pneumo_p, dim=0).numpy() if all_pneumo_p else np.array([])
+            pneumo_lab_all = torch.cat(all_pneumo_lab, dim=0).numpy() if all_pneumo_lab else np.array([])
         else:
             dist.gather_object(local_preds, dst=0)
             p_pos_all = None
-            p_sub_all = None
-            edema_all = None
-            subtype_all = None
+            edema_hard_all = None
+            cxr_anchor_all = None
+            cardio_p_all = cardio_lab_all = None
+            pneumo_p_all = pneumo_lab_all = None
 
         accelerator.wait_for_everyone()
     else:
-        # Single GPU
-        if len(val_edema_preds_list) > 0:
-            p_pos_all = torch.cat(val_edema_preds_list, dim=0).numpy()
-            p_sub_all = torch.cat(val_subtype_preds_list, dim=0).numpy()
-            edema_all = torch.cat(val_edema_labels_list, dim=0).numpy()
-            subtype_all = torch.cat(val_subtype_labels_list, dim=0).numpy()
+        if len(val_p_pos_list) > 0:
+            p_pos_all = torch.cat(val_p_pos_list, dim=0).numpy()
+            edema_hard_all = torch.cat(val_edema_hard_list, dim=0).numpy()
+            cxr_anchor_all = torch.cat(val_cxr_anchor_list, dim=0).numpy()
+            cardio_p_all = torch.cat(val_cardio_p_list, dim=0).numpy()
+            cardio_lab_all = torch.cat(val_cardio_lab_list, dim=0).numpy()
+            pneumo_p_all = torch.cat(val_pneumo_p_list, dim=0).numpy()
+            pneumo_lab_all = torch.cat(val_pneumo_lab_list, dim=0).numpy()
         else:
             p_pos_all = None
+            cardio_p_all = cardio_lab_all = None
+            pneumo_p_all = pneumo_lab_all = None
 
-    # Validation metrics - Multi-task learning
+    # Validation metrics — cxr_flag==1 & edema_hard ∈ {0, 1}
     val_metrics = {}
     if accelerator.is_main_process and p_pos_all is not None and len(p_pos_all) > 0:
-
-        # ==================== Level 1: Binary Edema Detection (0 vs 1) ====================
-        mask_l1 = (edema_all == 0) | (edema_all == 1)
-        y_l1 = edema_all[mask_l1].astype(int)       # {0, 1}
-        p_l1 = p_pos_all[mask_l1]                   # P(pos)
-
-        if mask_l1.sum() >= 2 and len(np.unique(y_l1)) >= 2:
-            val_metrics['level1_auroc'] = roc_auc_score(y_l1, p_l1)
-            val_metrics['level1_auprc'] = average_precision_score(y_l1, p_l1)
+        mask = (cxr_anchor_all == 1) & ((edema_hard_all == 0) | (edema_hard_all == 1))
+        if mask.sum() >= 2 and len(np.unique(edema_hard_all[mask])) >= 2:
+            y = edema_hard_all[mask].astype(int)
+            p = p_pos_all[mask]
+            val_metrics['auroc'] = roc_auc_score(y, p)
+            val_metrics['auprc'] = average_precision_score(y, p)
         else:
-            val_metrics['level1_auroc'] = float('nan')
-            val_metrics['level1_auprc'] = float('nan')
+            val_metrics['auroc'] = float('nan')
+            val_metrics['auprc'] = float('nan')
 
-        # ==================== Level 2: Subtype Classification (Intermediate vs NCPE vs CPE | edema=1) ====================
-        # 3-way classification: Intermediate (0) vs NCPE (1) vs CPE (2)
-        mask_l2 = (edema_all == 1) & ((subtype_all == 0) | (subtype_all == 1) | (subtype_all == 2))
+        # Sub-task metrics: threshold-free (AUROC/AUPRC) only — F1처럼 0.5 cut-off 의존 지표는 제외
+        for prefix, p_all, lab_all in [
+            ('cardio', cardio_p_all, cardio_lab_all),
+            ('pneumo', pneumo_p_all, pneumo_lab_all),
+        ]:
+            metrics = _threshold_free_metrics(p_all, lab_all, cxr_anchor_all)
+            val_metrics[f'{prefix}_auroc'] = metrics['auroc']
+            val_metrics[f'{prefix}_auprc'] = metrics['auprc']
 
-        if mask_l2.sum() >= 2 and len(np.unique(subtype_all[mask_l2])) >= 2:
-            y_l2 = subtype_all[mask_l2].astype(int)  # {0, 1, 2}
-            y_l2_bin = label_binarize(y_l2, classes=[0, 1, 2])
-            p_l2_probs = p_sub_all[mask_l2, :]  # [N, 3]
-
-            val_metrics['level2_auroc'] = roc_auc_score(y_l2_bin, p_l2_probs, average='macro', multi_class='ovr')
-            val_metrics['level2_auprc'] = average_precision_score(y_l2_bin, p_l2_probs, average='macro')
-        else:
-            val_metrics['level2_auroc'] = float('nan')
-            val_metrics['level2_auprc'] = float('nan')
-
-        # # ==================== Level 3: Final 4-Class (Neg, Intermediate, NCPE, CPE) ====================
-        # # 4-class GT is determined for samples:
-        # #   - edema==0 -> Negative(0)
-        # #   - edema==1 & subtype==0 -> Intermediate(1)
-        # #   - edema==1 & subtype==1 -> NCPE(2)
-        # #   - edema==1 & subtype==2 -> CPE(3)
-        # mask_l3 = (edema_all == 0) | ((edema_all == 1) & ((subtype_all == 0) | (subtype_all == 1) | (subtype_all == 2)))
-
-        # if mask_l3.sum() >= 3:
-        #     edema_m = edema_all[mask_l3]
-        #     subtype_m = subtype_all[mask_l3]
-        #     p_pos_m = p_pos_all[mask_l3]
-        #     p_sub_m = p_sub_all[mask_l3]
-
-        #     # Ground truth mapping: 4 classes
-        #     y4 = np.zeros(mask_l3.sum(), dtype=int)  # Default: Negative (0)
-        #     y4[(edema_m == 1) & (subtype_m == 0)] = 1  # Intermediate
-        #     y4[(edema_m == 1) & (subtype_m == 1)] = 2  # NCPE
-        #     y4[(edema_m == 1) & (subtype_m == 2)] = 3  # CPE
-
-        #     # Predicted probabilities: 4 classes
-        #     p_neg = 1.0 - p_pos_m
-        #     p_intermediate = p_pos_m * p_sub_m[:, 0]
-        #     p_ncpe = p_pos_m * p_sub_m[:, 1]
-        #     p_cpe = p_pos_m * p_sub_m[:, 2]
-        #     probs_4 = np.stack([p_neg, p_intermediate, p_ncpe, p_cpe], axis=1)
-
-        #     y4_bin = label_binarize(y4, classes=[0, 1, 2, 3])
-
-        #     valid_classes = [k for k in range(4) if 0 < y4_bin[:, k].sum() < len(y4)]
-
-        #     if len(valid_classes) >= 2:
-        #         val_metrics['level3_auroc'] = roc_auc_score(y4_bin, probs_4, average='macro', multi_class='ovr')
-        #         val_metrics['level3_auprc'] = average_precision_score(y4_bin, probs_4, average='macro')
-        #     else:
-        #         val_metrics['level3_auroc'] = float('nan')
-        #         val_metrics['level3_auprc'] = float('nan')
-        # else:
-        #     val_metrics['level3_auroc'] = float('nan')
-        #     val_metrics['level3_auprc'] = float('nan')
-
-    # # ==================== Calibration Analysis ====================
-    # if accelerator.is_main_process and val_metrics:
-    #     # Prepare calibration data
-    #     y_true_dict = {}
-    #     y_prob_dict = {}
-
-    #     # Level 1: Binary Edema Detection
-    #     if mask_l1.sum() >= 2 and len(np.unique(y_l1)) >= 2:
-    #         y_true_dict['Edema Detection'] = y_l1
-    #         y_prob_dict['Edema Detection'] = p_l1
-
-    #     # Level 2: Subtype Classification
-    #     if mask_l2.sum() >= 2 and len(np.unique(y_l2)) >= 2:
-    #         y_true_dict['Subtype Classification'] = y_l2
-    #         y_prob_dict['Subtype Classification'] = p_l2
-
-    #     # Level 3: 3-class (per-class calibration)
-    #     if mask_l3.sum() >= 3 and len(valid_classes) >= 2:
-    #         # For each class, compute binary calibration (one-vs-rest)
-    #         for class_idx, class_name in enumerate(['Negative', 'NCPE', 'CPE']):
-    #             if class_idx in valid_classes:
-    #                 y_binary = (y3 == class_idx).astype(int)
-    #                 p_binary = probs_3[:, class_idx]
-    #                 y_true_dict[f'3-class: {class_name}'] = y_binary
-    #                 y_prob_dict[f'3-class: {class_name}'] = p_binary
-
-    #     # Compute calibration metrics
-    #     if len(y_true_dict) > 0:
-    #         ece_calc = ExpectedCalibrationError(n_bins=15)
-
-    #         for task_name in y_true_dict.keys():
-    #             ece, _ = ece_calc.compute(y_true_dict[task_name], y_prob_dict[task_name])
-    #             val_metrics[f'{task_name}_ece'] = ece
-
-    #         if epoch == "final" or (epoch is not None and epoch % 10 == 0):
-    #             save_dir = f'./output/calibration/{args.run_name}'
-    #             prefix = f'epoch_{epoch}' if epoch != "final" else 'final'
-
-    #             try:
-    #                 calibration_results = analyze_calibration(
-    #                     y_true_dict, y_prob_dict,
-    #                     save_dir=save_dir,
-    #                     prefix=prefix
-    #                 )
-    #                 # Store calibration results in metrics
-    #                 for task_name, result in calibration_results.items():
-    #                     val_metrics[f'{task_name}_calibration_quality'] = result['quality']
-    #             except Exception as e:
-    #                 print(f"⚠️  Calibration analysis failed: {e}")
+        # Loss components도 dict에 함께 노출 (trainer/wandb에서 사용)
+        val_metrics['bce_loss'] = bce_avg
+        val_metrics['cardio_loss'] = cardio_avg
+        val_metrics['pneumo_loss'] = pneumo_avg
 
     if accelerator.is_main_process:
         print("\n[Multi-Task Validation Summary]")
         print(f"Total Val Loss: {total_loss:.4f}")
+        print(f"   [Loss Components]")
+        print(f"      BCE (Edema soft): {bce_avg:.4f} (λ={args.bce_weight})")
+        print(f"      Cardio BCE:       {cardio_avg:.4f} (λ={args.cardio_weight})")
+        print(f"      Pneumo BCE:       {pneumo_avg:.4f} (λ={args.pneumo_weight})")
 
         if val_metrics:
-            print(f"\n[Hierarchical Performance Metrics]")
-            print(f"[Level 1: Edema Detection]    AUROC={val_metrics['level1_auroc']:.4f}  "
-                f"AUPRC={val_metrics['level1_auprc']:.4f}  "
-                # f"Brier={val_metrics['level1_brier']:.4f}"
-                )
-
-            print(f"[Level 2: Subtype (3-way)]    AUROC={val_metrics['level2_auroc']:.4f}  "
-                f"AUPRC={val_metrics['level2_auprc']:.4f}")
-
-            # print(f"[Level 3: Combined (4-class)] AUROC={val_metrics['level3_auroc']:.4f}  "
-            #     f"AUPRC={val_metrics['level3_auprc']:.4f}")
+            print("\n   [Edema (cxr_flag==1)]")
+            print(f"   AUROC={val_metrics['auroc']:.4f}  "
+                  f"AUPRC={val_metrics['auprc']:.4f}")
+            print("\n   [Cardiomegaly (cxr_flag==1 & label observed)]")
+            print(f"   Loss={val_metrics['cardio_loss']:.4f}  "
+                  f"AUROC={val_metrics['cardio_auroc']:.4f}  "
+                  f"AUPRC={val_metrics['cardio_auprc']:.4f}")
+            print("\n   [Pneumonia (cxr_flag==1 & label observed)]")
+            print(f"   Loss={val_metrics['pneumo_loss']:.4f}  "
+                  f"AUROC={val_metrics['pneumo_auroc']:.4f}  "
+                  f"AUPRC={val_metrics['pneumo_auprc']:.4f}")
             print()
 
-    # return total_loss, bce_avg, ce_avg, mse_avg, val_metrics
-    return total_loss, bce_avg, ce_avg, val_metrics
+    return total_loss, bce_avg, val_metrics
 
 
-# Test 함수
-def test(args, model, dataloader, loss_module, device, accelerator, dataset):
-    test_loss, test_bce_avg, test_ce_avg, test_metrics = validate_multitask(
-        args, model, dataloader, loss_module, device, accelerator, dataset,
+def test(args, model, dataloader, loss_module, device, accelerator):
+    test_loss, test_bce_avg, test_metrics = validate_multitask(
+        args, model, dataloader, loss_module, device, accelerator,
         epoch="final",
         disable_cxr=args.disable_cxr,
         disable_txt=args.disable_txt,
-        max_length=args.token_max_length,
     )
 
     wandb_test_metrics = {}
     if accelerator.is_main_process and test_metrics:
         wandb_test_metrics = {
-            # Level 1: Binary Edema Detection
-            'test/level1_auroc': test_metrics['level1_auroc'],
-            'test/level1_auprc': test_metrics['level1_auprc'],
-            # Level 2: Subtype Classification
-            'test/level2_auroc': test_metrics['level2_auroc'],
-            'test/level2_auprc': test_metrics['level2_auprc'],
+            'test/auroc': test_metrics['auroc'],
+            'test/auprc': test_metrics['auprc'],
+            'test/cardio_loss': test_metrics.get('cardio_loss', float('nan')),
+            'test/cardio_auroc': test_metrics.get('cardio_auroc', float('nan')),
+            'test/cardio_auprc': test_metrics.get('cardio_auprc', float('nan')),
+            'test/pneumo_loss': test_metrics.get('pneumo_loss', float('nan')),
+            'test/pneumo_auroc': test_metrics.get('pneumo_auroc', float('nan')),
+            'test/pneumo_auprc': test_metrics.get('pneumo_auprc', float('nan')),
         }
 
         print("\n" + "="*80)
         print("📊 [Final Test Results]")
         print("="*80)
-
-        print(f"\n   [Hierarchical Performance Metrics]")
-        print(f"[Level 1: Edema Detection]    AUROC={test_metrics['level1_auroc']:.4f}  "
-            f"AUPRC={test_metrics['level1_auprc']:.4f}")
-
-        print(f"[Level 2: Subtype (3-way)]    AUROC={test_metrics['level2_auroc']:.4f}  "
-            f"AUPRC={test_metrics['level2_auprc']:.4f}")
-
+        print("\n   [Edema (cxr_flag==1)]")
+        print(f"   AUROC={test_metrics['auroc']:.4f}  "
+              f"AUPRC={test_metrics['auprc']:.4f}")
+        print("\n   [Cardiomegaly (cxr_flag==1 & label observed)]")
+        print(f"   Loss={test_metrics.get('cardio_loss', float('nan')):.4f}  "
+              f"AUROC={test_metrics.get('cardio_auroc', float('nan')):.4f}  "
+              f"AUPRC={test_metrics.get('cardio_auprc', float('nan')):.4f}")
+        print("\n   [Pneumonia (cxr_flag==1 & label observed)]")
+        print(f"   Loss={test_metrics.get('pneumo_loss', float('nan')):.4f}  "
+              f"AUROC={test_metrics.get('pneumo_auroc', float('nan')):.4f}  "
+              f"AUPRC={test_metrics.get('pneumo_auprc', float('nan')):.4f}")
         print("="*80 + "\n")
 
-    return test_loss, test_bce_avg, test_ce_avg, test_metrics, wandb_test_metrics
+    return test_loss, test_bce_avg, test_metrics, wandb_test_metrics

@@ -3,21 +3,31 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchxrayvision as xrv
-from transformers import AutoModel, AutoTokenizer
-from peft import LoraConfig, get_peft_model, TaskType
 
 from models.encoder import TransformerTSEncoder, TSMixerEncoder
 from utils.utils import timer
 
 
 class MultiModalEncoder(nn.Module):
+    """
+    - CXR/Text는 raw 입력이 아닌 사전 계산된 임베딩을 받아 projection만 학습.
+    - Segment 임베딩을 K/V로 사용한 cross-attention으로 CXR 표현을 강화.
+        - lung, heart를 사용한 별도의 태스크 설계도 작성하자.
+    - (Future) lesion_emb를 K/V에 추가 가능
+    """
     def __init__(self, args, disable_cxr=False, disable_txt=False, disable_prompt=False):
         super().__init__()
 
         self.disable_cxr = disable_cxr
         self.disable_txt = disable_txt
         self.disable_prompt = disable_prompt
+
+        # 사전 임베딩 차원
+        self.img_emb_dim = args.img_emb_dim
+        self.seg_emb_dim = args.seg_emb_dim
+        self.text_emb_dim = args.text_emb_dim
+        self.img_shared_dim = args.img_shared_dim
+        self.ts_hidden_size = args.ts_encoder_hidden_size
 
         # ==================== Modality-Specific Encoders ====================
         self.ts_encoder = TransformerTSEncoder(
@@ -29,242 +39,248 @@ class MultiModalEncoder(nn.Module):
             dropout=0.1
         )
 
-        self.img_encoder = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch")
-        for param in self.img_encoder.parameters():
-            param.requires_grad = False
+        # CXR(raddino) → shared dim
+        self.img_proj = nn.Linear(self.img_emb_dim, self.img_shared_dim)
 
-        _densenet_unfreeze = [
-            "features.denseblock4",
-            "features.norm5",
-        ]
-        for name, param in self.img_encoder.named_parameters():
-            if any(name.startswith(prefix) for prefix in _densenet_unfreeze):
-                param.requires_grad = True
+        # Segment(hybridgnet) → shared dim
+        self.seg_proj = nn.Linear(self.seg_emb_dim, self.img_shared_dim)
 
-        # Text Encoder: BioClinicalBERT
-        language_model = AutoModel.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
-
-        for param in language_model.parameters():
-            param.requires_grad = False
-
-        language_lora_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,
-            r=16,
-            lora_alpha=32,
-            lora_dropout=0.1,
-            target_modules=["query", "key", "value"],
-            bias="none",
+        # self.lesion_proj = nn.Linear(args.lesion_emb_dim, self.img_shared_dim) # Future
+        
+        self.img_info_combine_attn = ImageSegmentCrossAttention(
+            d_model=self.img_shared_dim, num_heads=8, dropout=0.1
         )
-
-        self.text_encoder = get_peft_model(language_model, language_lora_config)
-
-        # Clinical Prompt Tokenizer (shares same BioClinicalBERT tokenizer)
-        # self.prompt_tokenizer = AutoTokenizer.from_pretrained("emilyalsentzer/Bio_ClinicalBERT")
 
         # TS-Centric Fusion Module
         self.ts_centric_fusion = TimeSeriesCentricCrossAttention_v4(
             args=args,
             d_model=256,
             num_heads=8,
-            ts_input_dim=512,         # TS encoder output dim
-            img_input_dim=1024,       # DenseNet121 feature dim
-            txt_input_dim=768,        # BioClinicalBERT hidden size
+            ts_input_dim=self.ts_hidden_size,
+            img_input_dim=self.img_shared_dim,
+            txt_input_dim=self.text_emb_dim,
             disable_cxr=disable_cxr,
             disable_txt=disable_txt,
-            disable_prompt=disable_prompt
         )
 
-        self.num_virtual_prompts = 4  # 가상 프롬프트 토큰 개수
-        self.ts_dim = 512             
-        self.img_dim = 1024           
-        self.text_dim = 768           
-
-        self.prompt_generator = nn.Sequential(
-            nn.Linear(self.ts_dim + self.img_dim, 512),
-            nn.LayerNorm(512),
-            nn.GELU(),
-            nn.Linear(512, self.num_virtual_prompts * self.text_dim)
-        )
-
-    def forward(self, args, ts_series, cxr_data, text_data, _, has_cxr, has_text, time_steps=None, current_epoch=0, total_epochs=50):
+    def forward(self, args, ts_series, cxr_data, text_data, has_cxr, has_text, time_steps=None):
         device = ts_series.device
         B, T, _ = ts_series.shape
 
         # ================ Time-series Encoding ================
         with timer("TS Encoder", None):
-            ts_embeddings = self.ts_encoder(ts_series)
+            ts_embeddings = self.ts_encoder(ts_series)  # [B, T, ts_hidden_size]
 
-        # ================ Image Encoding ================
+        # ================ CXR (RadDino) + Segment (HybridGNet) ================
+        # 인코더는 freeze 상태이므로 사전 임베딩 lookup만 수행하고, projection + image-segment cross-attention 구조만 학습(🔥)
         if not self.disable_cxr:
-            with timer("IMG Encoder", None):
-                img_tensor = torch.zeros(B, T, 1024, device=device, dtype=ts_embeddings.dtype)
+            with timer("IMG-internal Fusion", None):
+                unique_img_embs = cxr_data['unique_embs']           # [N_img, img_emb_dim]
+                unique_seg_embs = cxr_data['unique_segment_embs']   # [N_seg, seg_emb_dim]
+                unique_ctr = cxr_data['unique_ctr']                 # [N_seg], CTR scalar
+                unique_indices = cxr_data['unique_indices']         # [num_positions]
+                pos = cxr_data['positions']                         # [num_positions, 2]
+                seg_index_tensor = cxr_data['segment_index_tensor'] # [B, T] long, -1 = no seg
+                # (Future) unique_lesion_embs = cxr_data['unique_lesion_embs']
+                # (Future) lesion_index_tensor = cxr_data['lesion_index_tensor']
+
+                img_tensor = torch.zeros(B, T, self.img_emb_dim, device=device, dtype=ts_embeddings.dtype)
+                seg_tensor = torch.zeros(B, T, 2, self.seg_emb_dim, device=device, dtype=ts_embeddings.dtype)
+                ctr_tensor = torch.zeros(B, T, device=device, dtype=ts_embeddings.dtype)
                 has_img = torch.zeros(B, T, device=device, dtype=torch.bool)
 
-                unique_images = cxr_data['unique_images']
-                unique_indices = cxr_data['unique_indices']
-                pos = cxr_data['positions']
-                is_training = cxr_data.get('is_training', False)
-
-                if unique_images.numel() > 0:
+                if unique_img_embs.numel() > 0 and pos.numel() > 0:
                     b_pos, t_pos = pos[:, 0].long(), pos[:, 1].long()
 
-                    # Apply GPU augmentation during training
-                    if is_training:
-                        from training.engine import cxr_train_transform_gpu
-                        unique_images = cxr_train_transform_gpu(unique_images)
-
-                    # Feature Map 추출 및 Global Average Pooling
-                    features = self.img_encoder.features(unique_images)
-                    unique_features = F.adaptive_avg_pool2d(features, (1, 1)).flatten(1)  # [N, 1024]
-                    scattered = unique_features[unique_indices].to(dtype=ts_embeddings.dtype)  # [num_positions, 1024]
-
-                    img_tensor[b_pos, t_pos] = scattered
+                    # RadDino 임베딩 scatter
+                    scattered_img = unique_img_embs[unique_indices].to(dtype=ts_embeddings.dtype)
+                    img_tensor[b_pos, t_pos] = scattered_img
                     has_img[b_pos, t_pos] = True
 
-                img_embeddings = img_tensor  # [B, T, 1024]
+                    # Segment 임베딩 scatter — segment_index_tensor를 그대로 사용 (cxr_flag==1일 때만 채워짐)
+                    # unique_seg_embs: [N_seg, 2, seg_emb_dim] (lung, heart)
+                    seg_local_idx = seg_index_tensor[b_pos, t_pos]  # [num_positions]
+                    valid_seg = seg_local_idx >= 0
+                    if valid_seg.any() and unique_seg_embs.numel() > 0:
+                        scattered_seg = unique_seg_embs[seg_local_idx[valid_seg]].to(dtype=ts_embeddings.dtype)
+                        seg_tensor[b_pos[valid_seg], t_pos[valid_seg]] = scattered_seg
 
-        # Turn off Image modality (For ablation study)
+                    # CTR scatter — segment와 동일 인덱스 공간
+                    if valid_seg.any() and unique_ctr.numel() > 0:
+                        scattered_ctr = unique_ctr[seg_local_idx[valid_seg]].to(dtype=ts_embeddings.dtype)
+                        ctr_tensor[b_pos[valid_seg], t_pos[valid_seg]] = scattered_ctr
+
+                # Projection: shared latent space
+                img_proj = self.img_proj(img_tensor)   # [B, T, img_shared_dim]
+                seg_proj = self.seg_proj(seg_tensor)   # [B, T, 2, img_shared_dim]
+                # (Future) lesion_proj = self.lesion_proj(lesion_tensor)
+                # (Future) K/V = torch.cat([seg_proj, lesion_proj], dim=2) 형태로 확장
+
+                # Q=CXR, K/V=Segment(lung, heart) cross-attention
+                img_embeddings = self.img_info_combine_attn(
+                    img_q=img_proj, seg_kv=seg_proj, has_img=has_img
+                )  # [B, T, img_shared_dim]
+
         else:
-            img_embeddings = torch.zeros(B, T, 1024, device=device, dtype=ts_embeddings.dtype)
+            img_embeddings = torch.zeros(B, T, self.img_shared_dim, device=device, dtype=ts_embeddings.dtype)
+            seg_proj = torch.zeros(B, T, 2, self.img_shared_dim, device=device, dtype=ts_embeddings.dtype)
+            ctr_tensor = torch.zeros(B, T, device=device, dtype=ts_embeddings.dtype)
             has_img = torch.zeros(B, T, device=device, dtype=torch.bool)
             has_cxr = torch.zeros_like(has_cxr)
 
-        # ================ Dynamic Prompt Generation (Instance-Specific) ================
-        # # 시계열 요약 + 이미지 요약 (존재하는 이미지만 평균)
-        ts_summary = ts_embeddings.mean(dim=1)
-        img_summary = torch.zeros(B, self.img_dim, device=device, dtype=ts_embeddings.dtype)
-        for b in range(B):
-            if has_img[b].any():
-                img_summary[b] = img_embeddings[b][has_img[b]].mean(dim=0)
-        
-        multimodal_summary = torch.cat([ts_summary, img_summary], dim=-1)
-        virtual_prompt = self.prompt_generator(multimodal_summary).view(B, self.num_virtual_prompts, self.text_dim)
-
-        # # ================ Text Encoding & Routing ================
-        align_loss = torch.tensor(0.0, device=device, dtype=ts_embeddings.dtype)
-
-        # ================ Text Encoding ================
+        # ================ Text (사전 임베딩 lookup만) ================
         if not self.disable_txt:
-            with timer("Text Encoder", None):
-                """
-                이미지 모달리티와 동일한 방식으로 unique한 텍스트만을 뽑아서 BioClinicalBERT를 통한 인코딩을 수행함.
-                """
-                text_tensor = torch.zeros(B, T, 768, device=device, dtype=ts_embeddings.dtype)
+            with timer("Text Lookup", None):
+                text_tensor = torch.zeros(B, T, self.text_emb_dim, device=device, dtype=ts_embeddings.dtype)
                 has_text_tok = torch.zeros(B, T, device=device, dtype=torch.bool)
 
-                unique_input_ids = text_data['unique_input_ids']
-                unique_attention_mask = text_data['unique_attention_mask']
+                unique_text_embs = text_data['unique_embs']     # [N_txt, text_emb_dim]
                 unique_indices = text_data['unique_indices']
                 pos = text_data['positions']
 
-                if unique_input_ids.numel() > 0:
-                    outputs = self.text_encoder(unique_input_ids, attention_mask=unique_attention_mask)
-                    cls_embeddings = outputs.last_hidden_state[:, 0, :]  # [N_unique, 768]
-                    scattered = cls_embeddings[unique_indices]
-                    scattered = scattered.to(dtype=ts_embeddings.dtype)
-
+                if unique_text_embs.numel() > 0 and pos.numel() > 0:
+                    scattered = unique_text_embs[unique_indices].to(dtype=ts_embeddings.dtype)
                     b, t = pos[:, 0].long(), pos[:, 1].long()
                     text_tensor[b, t] = scattered
                     has_text_tok[b, t] = True
 
                 text_embeddings = text_tensor
 
-            # [Alignment Loss] Cosine Similarity (방향성 정렬)
-            v_p_sum = virtual_prompt.mean(dim=1)
-            r_t_sum = (text_embeddings.sum(dim=1) / (has_text_tok.sum(dim=1, keepdim=True).float() + 1e-6)).detach()
-
-            valid_text_mask = has_text_tok.sum(dim=1) > 0  # 텍스트가 있는 배치 인덱스 확인 [B]
-
-            if valid_text_mask.sum() > 0:
-                cos_sim = F.cosine_similarity(v_p_sum[valid_text_mask], r_t_sum[valid_text_mask], dim=-1)
-                align_loss = (1.0 - cos_sim).mean()
-            else:
-                # 텍스트가 아예 없다면 Loss 0 처리
-                align_loss = torch.tensor(0.0, device=device, requires_grad=True)
-
-            # [Scheduled Modality Routing]
-            if self.training:
-                # 에포크가 진행될수록 가상 프롬프트 사용 확률(p_virtual) 증가
-                p_real = max(0.1, 1.0 - (current_epoch / total_epochs)) # 최소 10%는 실제 텍스트 유지
-                if torch.rand(1).item() < p_real:
-                    final_text_input = text_embeddings
-                    final_text_mask = has_text_tok
-                else:
-                    final_text_input = virtual_prompt
-                    final_text_mask = torch.ones(B, self.num_virtual_prompts, device=device, dtype=torch.bool)
-            else:
-                # 추론 시에는 100% 가상 프롬프트 (External Validation 대응)
-                final_text_input = virtual_prompt
-                final_text_mask = torch.ones(B, self.num_virtual_prompts, device=device, dtype=torch.bool)
-
-        else: 
-            final_text_input = virtual_prompt
-            final_text_mask = torch.ones(B, self.num_virtual_prompts, device=device, dtype=torch.bool)
-
-        # Turn off Text modality (For ablation study)
-        # else:
-        #     text_embeddings = torch.zeros(B, T, 768, device=device, dtype=ts_embeddings.dtype)
-        #     has_text_tok = torch.zeros(B, T, device=device, dtype=torch.bool)
-        #     has_text = torch.zeros_like(has_text)
-
+        else:
+            text_embeddings = torch.zeros(B, T, self.text_emb_dim, device=device, dtype=ts_embeddings.dtype)
+            has_text_tok = torch.zeros(B, T, device=device, dtype=torch.bool)
+            has_text = torch.zeros_like(has_text)
 
         # ================ Multimodal Fusion ================
         with timer("TS-Centric Fusion", None):
-            L = self.ts_centric_fusion.num_latents
             time_idx = time_steps.to(dtype=ts_embeddings.dtype)  # [B, T]
 
             fused_embeddings = self.ts_centric_fusion(
-                ts_embeddings=ts_embeddings,           # [B, T, 512]
-                img_embeddings=img_embeddings,         # [B, T, 1024]
-                # text_embeddings=text_embeddings,       # [B, T, 768]
-                text_embeddings=final_text_input,
-                time_indices=time_idx,                 # [B, T] - 시간 정보
-                img_key_padding_mask=~has_img,         # [B, T] - 이미지 없는 곳 표시 (True where no image)
-                # text_key_padding_mask=~has_text_tok,   # [B, T] - 텍스트 없는 곳 표시 (True where no text)
-                text_key_padding_mask=~final_text_mask,
-                # num_iterations=args.num_iterations
-            )  # Output: [B, L, 256]
+                ts_embeddings=ts_embeddings,                # [B, T, ts_hidden_size]
+                img_embeddings=img_embeddings,              # [B, T, img_shared_dim]
+                text_embeddings=text_embeddings,            # [B, T, text_emb_dim]
+                time_indices=time_idx,
+                img_key_padding_mask=~has_img,
+                text_key_padding_mask=~has_text_tok,
+            )
 
-        return fused_embeddings, align_loss
-        # return fused_embeddings
+        # ================ CTR Anchor: window 내 가장 마지막 CXR의 CTR ================
+        # has_img: [B, T]. CXR이 하나도 없으면 0으로 둠 (cxr_anchor_mask=0이라 loss에서 마스킹됨)
+        t_idx = torch.arange(T, device=device)
+        masked_t = t_idx.unsqueeze(0).expand(B, T).masked_fill(~has_img, -1)
+        last_t = masked_t.max(dim=1).values             # [B], CXR 없는 행은 -1
+        valid_b = last_t >= 0
+        last_t_safe = last_t.clamp(min=0)
+        b_arange = torch.arange(B, device=device)
+        ctr_anchor = ctr_tensor[b_arange, last_t_safe]  # [B]
+        ctr_anchor = torch.where(valid_b, ctr_anchor, torch.zeros_like(ctr_anchor))
+
+        return fused_embeddings, seg_proj, has_img, text_embeddings, has_text_tok, ctr_anchor
 
 
 class MultiModalMultiTaskModel(nn.Module):
     """
-    End-to-end multi-task model: encoder + task readout heads trained jointly.
+    End-to-end model: encoder + edema readout head.
+    Subtype head는 비활성화(주석) — 학습 타깃이 edema_soft 단일로 정리됨.
     """
     def __init__(self, args, encoder):
         super().__init__()
         self.encoder = encoder
 
-        self.edema_readout = TaskReadout(
-            d_model=256,
-            num_queries=4,
-            num_classes=1 
+        self.edema_readout = TaskReadout(d_model=256, num_queries=2, num_classes=1) # 기존 4
+
+        # +1: window 내 마지막 CXR의 CTR scalar
+        self.cardiomegaly_head = nn.Sequential(nn.Linear(args.img_shared_dim + 1, 64), nn.ReLU(), nn.Linear(64, 1))
+        self.pneumonia_head = nn.Sequential(nn.Linear(args.img_shared_dim, 64), nn.ReLU(), nn.Linear(64, 1))
+
+        # EHR + CXR fused vector projection
+        self.contrastive_proj = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
         )
 
-        self.subtype_readout = TaskReadout(
-            d_model=256,
-            num_queries=1,
-            num_classes=3
+        self.text_contrastive_proj = nn.Sequential(
+            nn.Linear(args.text_emb_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128)
         )
 
-    def forward(self, args, ts_series, cxr_data, text_data, prompt_data, has_cxr, has_text, time_steps=None, current_epoch=0, total_epoch=50):
-        # batch_embeddings = self.encoder(
-        batch_embeddings, align_loss = self.encoder(
-            args, ts_series, cxr_data, text_data, prompt_data, has_cxr, has_text, time_steps,
-            current_epoch=current_epoch, total_epochs=total_epoch
+        # self.subtype_readout = TaskReadout(
+        #     d_model=256,
+        #     num_queries=1,
+        #     num_classes=3
+        # )
+
+    def forward(self, args, ts_series, cxr_data, text_data, has_cxr, has_text, time_steps=None):
+        batch_embeddings, seg_proj, has_img, text_embeddings, has_text_tok, ctr_anchor = self.encoder(
+            args, ts_series, cxr_data, text_data, has_cxr, has_text, time_steps
         )
 
         edema_logits = self.edema_readout(batch_embeddings)
-        subtype_logits = self.subtype_readout(batch_embeddings)
+        # subtype_logits = self.subtype_readout(batch_embeddings)
+
+        mask = has_img.float().unsqueeze(-1)               # [B, T, 1]
+        denom = mask.sum(dim=1).clamp(min=1.0)             # [B, 1]
+
+        lung_tokens_t, heart_tokens_t = seg_proj[:, :, 0, :], seg_proj[:, :, 1, :]
+
+        lung_window = (lung_tokens_t * mask).sum(dim=1) / denom
+        heart_window = (heart_tokens_t * mask).sum(dim=1) / denom
+
+        # 마지막 CXR의 CTR(scalar)을 cardio head 입력에 concat
+        cardio_input = torch.cat([heart_window, ctr_anchor.unsqueeze(-1)], dim=-1)  # [B, img_shared_dim + 1]
+        cardiomegaly_logits = self.cardiomegaly_head(cardio_input)
+        pneumonia_logits = self.pneumonia_head(lung_window)
+
+        clinical_vector = batch_embeddings.mean(dim=1)            # [B, 256] # 일단 GAP
+        proj_emb = self.contrastive_proj(clinical_vector)         # [B, 128]
+
+        txt_mask = has_text_tok.float().unsqueeze(-1)            # [B, T, 1]
+        txt_denom = txt_mask.sum(dim=1).clamp(min=1.0)           # [B, 1]
+        
+        text_vector = (text_embeddings * txt_mask).sum(dim=1) / txt_denom  # [B, 768]
+        proj_text_emb = self.text_contrastive_proj(text_vector)
+
+        valid_txt_mask = (has_text_tok.sum(dim=1) > 0)
 
         return {
             'edema_logits': edema_logits,
-            'subtype_logits': subtype_logits,
-            'align_loss': align_loss,
-            'batch_embeddings': batch_embeddings,
+            # 'subtype_logits': subtype_logits,
+            'cardiomegaly_logits': cardiomegaly_logits,
+            'pneumonia_logits': pneumonia_logits,
+            'proj_emb': proj_emb,                   # EHR + CXR
+            'proj_text_emb': proj_text_emb,         # 텍스트
+            'valid_txt_mask': valid_txt_mask        # 매칭 마스크
         }
+
+
+class ImageSegmentCrossAttention(nn.Module):
+    """
+    Query=CXR(RadDino) 임베딩, Key/Value=Segment(Lung/Heart) 임베딩.
+    사전 임베딩은 frozen이고, caching해서 뽑은 임베딩을 lookup table 형태로 사용하며 본 모듈에서는 projection/MHA만 학습.
+    (Future) lesion_emb를 추가할 경우 K/V를 [seg_kv; lesion_kv] 형태로 concat하여 확장 가능.
+    """
+    def __init__(self, d_model, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.ln_q = nn.LayerNorm(d_model)
+        self.ln_kv = nn.LayerNorm(d_model)
+        self.ln_out = nn.LayerNorm(d_model)
+
+    def forward(self, img_q, seg_kv, has_img):
+        B, T, D = img_q.shape
+
+        q = img_q.reshape(B * T, 1, D)        # [B*T, 1, D] - 쿼리는 1개 (CXR)
+        kv = seg_kv.reshape(B * T, 2, D)      # [B*T, 2, D] - 키/밸류는 2개 (Lung, Heart)
+
+        q_norm = self.ln_q(q)
+        kv_norm = self.ln_kv(kv)
+
+        out, _ = self.mha(q_norm, kv_norm, kv_norm) # attn_weight는 일단 처리 안함.
+        out = out.view(B, T, D)
+        out = out * has_img.unsqueeze(-1).to(dtype=out.dtype)  # 이미지 없는 타임스텝은 0으로 처리
+        return self.ln_out(img_q + out)
 
 
 ###########################################################################
@@ -281,7 +297,11 @@ class TaskReadout(nn.Module):
         
         self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, batch_first=True)
         
-        self.classifier = nn.Linear(num_queries * d_model, num_classes)
+        # self.classifier = nn.Linear(num_queries * d_model, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=0.3),
+            nn.Linear(num_queries * d_model, num_classes)
+        )
 
     def forward(self, latent_embeddings):
         """
@@ -382,13 +402,14 @@ class TemporalMultiheadAttention_v2(nn.Module):
         # MHA 연산 합치기 [B, H, T_q, d_k] → [B, T_q, D]
         out = out.transpose(1, 2).reshape(B, T_q, D)
         out = self.out_proj(out)
+        out = F.dropout(out, p=0.1, training=self.training)
         return out
 
 
 class TimeSeriesCentricCrossAttention_v4(nn.Module):
     def __init__(self, args, d_model=256, num_heads=8,
                 ts_input_dim=512, img_input_dim=1024, txt_input_dim=768,
-                disable_cxr=False, disable_txt=False, disable_prompt=False
+                disable_cxr=False, disable_txt=False,
         ):
         super().__init__()
         self.d_model = d_model                      # latent embedding dimension
@@ -508,7 +529,8 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
                 latent_updates.append(out_i)
 
             ts_out = torch.cat(latent_updates, dim=1) # [B, L, 256]
-            latent = latent + ts_out
+            latent = latent + F.dropout(ts_out, p=0.2, training=self.training)
+            # latent = latent + ts_out
 
             if len(all_attention_weights) > 0: # For debugging
                 self.debug_ts_attn = torch.stack(all_attention_weights, dim=1)
@@ -521,21 +543,26 @@ class TimeSeriesCentricCrossAttention_v4(nn.Module):
                     value=img_with_time,
                     key_padding_mask=img_key_padding_mask
                 )
-                latent = latent + img_out
+                # latent = latent + img_out
+                latent = latent + F.dropout(img_out, p=0.2, training=self.training)
 
             # ==================== Text -> Latent ====================
-            if not self.disable_txt and text_embeddings is not None and text_embeddings.size(1) > 0:
-                text_out = self.text_cross_attn(
-                    query=latent,
-                    key=text_with_time,
-                    value=text_with_time,
-                    key_padding_mask=text_key_padding_mask
-                )
-                latent = latent + text_out
+            # if not self.disable_txt and text_embeddings is not None and text_embeddings.size(1) > 0:
+            #     text_out = self.text_cross_attn(
+            #         query=latent,
+            #         key=text_with_time,
+            #         value=text_with_time,
+            #         key_padding_mask=text_key_padding_mask
+            #     )
+            #     # latent = latent + text_out
+            #     if self.training and torch.rand(1).item() < 0.50:
+            #         text_out = text_out * 0.0
+                    
+            #     latent = latent + F.dropout(text_out, p=0.2, training=self.training)
 
             # ==================== Temporal Mixing ====================
             latent = self.ln_latent(latent)
-            latent = self.tsmixer(latent, src_key_padding_mask=None)  # [B, L, 256]
+            # latent = self.tsmixer(latent, src_key_padding_mask=None)  # [B, L, 256]
 
         return latent
 

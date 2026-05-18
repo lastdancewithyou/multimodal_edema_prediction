@@ -22,6 +22,7 @@ wandb/
 *.npy
 *.npz
 *.gz
+*.DS_Store
 
 # Logs
 *.log
@@ -54,3 +55,12 @@ models/cxrformer_model.py
 icu_cxr
 
 IMAGE_FILENAMES.txt
+
+models/bio_clinicalbert_safetensors
+models/hybridgnet/_pycache_
+models/hybridgnet/models
+models/hybridgnet/utils
+models/hybridgnet/Weights
+
+hybridgnet_embeddings/
+hybridgnet_visuals/

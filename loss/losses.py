@@ -23,109 +23,142 @@ class MultiModalLoss(nn.Module):
         # ==================== Binary Cross-Entropy Loss (Edema Detection) ====================
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
 
-        # ==================== CE Loss ====================
-        if self.use_label_smooth:
-            self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1, label_smoothing=self.label_smoothing)
-        else:
-            self.ce_loss = nn.CrossEntropyLoss(ignore_index=-1)
+        # ==================== Contrastive Loss ====================
+        init_temp = args.contrast_temperature
+        self.temperature = nn.Parameter(torch.tensor(init_temp))
+        print(f"[Loss] BCE Loss and InfoNCE Loss initialized")
 
-        print(f"[Loss] BCE Loss initialized for edema detection")
-        if self.use_label_smooth:
-            print(f"[Loss] CE Loss initialized for subtype classification with label smoothing (factor={self.label_smoothing})")
-        else:
-            print(f"[Loss] CE Loss initialized for subtype classification without label smoothing")
+    def info_nce_loss(self, clinical_emb, text_emb):
+        clinical_emb = F.normalize(clinical_emb, p=2, dim=1)
+        text_emb = F.normalize(text_emb, p=2, dim=1)
+        
+        logits = torch.matmul(clinical_emb, text_emb.T) / self.temperature
+        
+        labels = torch.arange(logits.size(0), device=logits.device)
+        
+        loss_c2t = F.cross_entropy(logits, labels)
+        loss_t2c = F.cross_entropy(logits.T, labels)
+        
+        return (loss_c2t + loss_t2c) / 2
 
     # Edema Detection Head
-    def binary_cross_entropy(self, edema_logits, edema_labels):
-        edema_logits_squeezed = edema_logits.squeeze(-1).float()
-        edema_labels_flat = edema_labels.float()
+    def binary_cross_entropy(self, edema_logits, edema_soft_labels):
+        logits = edema_logits.squeeze(-1).float()
+        labels = edema_soft_labels.float()
 
-        valid_mask = (edema_labels_flat != -1)
+        valid_mask = ~torch.isnan(labels)
         num_samples = valid_mask.sum().item()
 
         if num_samples == 0:
-            # return torch.tensor(0.0, device=edema_logits.device, requires_grad=False), 0
             return 0.0 * edema_logits.sum(), 0
 
-        logits_valid = edema_logits_squeezed[valid_mask]
-        labels_valid = edema_labels_flat[valid_mask]
+        loss_per_sample = self.bce_loss(logits[valid_mask], labels[valid_mask])
+        return loss_per_sample.mean(), int(num_samples)
 
-        # Compute per-sample loss [N]
-        loss_per_sample = self.bce_loss(logits_valid, labels_valid)
-        bce_loss = loss_per_sample.mean()
+    # Sub-task BCE (Cardiomegaly/Pneumonia 공용 — NaN 라벨 마스킹)
+    def _subtask_bce(self, logits, labels):
+        logits = logits.squeeze(-1).float()
+        labels = labels.float()
 
-        return bce_loss, num_samples
-
-
-    # Subtype Classification Head
-    def cross_entropy(self, subtype_logits, subtype_labels, edema_labels):
-        logits = subtype_logits.float()
-        edema_labels_long = edema_labels.long()
-        subtype_labels_long = subtype_labels.long()
-
-        # Edema-positive + Valid subtype label only (Intermediate, Non-cardiogenic, Cardiogenic))
-        valid_mask = ((edema_labels_long == 1) & ((subtype_labels_long == 0) | (subtype_labels_long == 1) | (subtype_labels_long == 2)))
+        valid_mask = ~torch.isnan(labels)
         num_samples = valid_mask.sum().item()
 
         if num_samples == 0:
-            # return torch.tensor(0.0, device=subtype_logits.device, requires_grad=False), 0
-            return 0.0 * subtype_logits.sum(), 0
+            return 0.0 * logits.sum(), 0
 
-        # Extract valid samples
-        logits_valid = logits[valid_mask]                 # [N_valid, 3]
-        labels_valid = subtype_labels_long[valid_mask]    # [N_valid] in {0, 1, 2}
+        loss_per_sample = self.bce_loss(logits[valid_mask], labels[valid_mask])
+        return loss_per_sample.mean(), int(num_samples)
 
-        ce_loss = self.ce_loss(logits_valid, labels_valid)
-
-        return ce_loss, num_samples
+    # # Subtype Classification Head — 주석 보존 (재활성 대비)
+    # def cross_entropy(self, subtype_logits, subtype_labels, edema_labels):
+    #     logits = subtype_logits.float()
+    #     edema_labels_long = edema_labels.long()
+    #     subtype_labels_long = subtype_labels.long()
+    #     valid_mask = ((edema_labels_long == 1) & ((subtype_labels_long == 0) | (subtype_labels_long == 1) | (subtype_labels_long == 2)))
+    #     num_samples = valid_mask.sum().item()
+    #     if num_samples == 0:
+    #         return 0.0 * subtype_logits.sum(), 0
+    #     logits_valid = logits[valid_mask]
+    #     labels_valid = subtype_labels_long[valid_mask]
+    #     ce_loss = self.ce_loss(logits_valid, labels_valid)
+    #     return ce_loss, num_samples
 
     def forward(
             self,
-            edema_logits, subtype_logits,
-            edema_labels, subtype_labels, 
-            bce_weight=0.0, ce_weight=0.0, 
-            device=None, accelerator=None
+            edema_logits,
+            edema_soft_labels,
+            cardiomegaly_logits=None, cardiomegaly_labels=None, cardio_weight=0.0,
+            pneumonia_logits=None, pneumonia_labels=None, pneumo_weight=0.0,
+            # subtype_logits=None, subtype_labels=None, ce_weight=0.0,
+            bce_weight=0.0, 
+            info_loss_t=None, info_weight=0.0,
+            # contrast_weight=0.0, proj_view1=None, proj_view2=None,
+            device=None, accelerator=None,
         ):
-        # -------------------- (0) Binary CE Loss (Edema Detection) --------------------
-        if bce_weight > 0.0 and edema_logits is not None and edema_labels is not None:
+        # -------------------- BCE Loss (Edema Soft) --------------------
+        if bce_weight > 0.0 and edema_logits is not None and edema_soft_labels is not None:
             with timer("BCE Loss", accelerator):
-                bce_loss, bce_count = self.binary_cross_entropy(
-                    edema_logits,
-                    edema_labels,
-                )
+                bce_loss, bce_count = self.binary_cross_entropy(edema_logits, edema_soft_labels)
         else:
             bce_loss = torch.tensor(0.0, device=device, requires_grad=False)
             bce_count = 0
 
-        # -------------------- (1) CE Loss (Subtype Classification) --------------------
-        if ce_weight > 0.0:
-            with timer("CE Loss", accelerator):
-                ce_loss, ce_count = self.cross_entropy(subtype_logits, subtype_labels, edema_labels)
+        # -------------------- Sub-task --------------------
+        if cardio_weight > 0.0 and cardiomegaly_logits is not None and cardiomegaly_labels is not None:
+            with timer("Cardio BCE", accelerator):
+                cardio_loss, cardio_count = self._subtask_bce(cardiomegaly_logits, cardiomegaly_labels)
         else:
-            ce_loss = torch.tensor(0.0, device=device, requires_grad=False)
-            ce_count = 0
+            cardio_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            cardio_count = 0
+
+        if pneumo_weight > 0.0 and pneumonia_logits is not None and pneumonia_labels is not None:
+            with timer("Pneumo BCE", accelerator):
+                pneumo_loss, pneumo_count = self._subtask_bce(pneumonia_logits, pneumonia_labels)
+        else:
+            pneumo_loss = torch.tensor(0.0, device=device, requires_grad=False)
+            pneumo_count = 0
+
+        # # -------------------- CE Loss (Subtype) — 주석 --------------------
+        # if ce_weight > 0.0:
+        #     with timer("CE Loss", accelerator):
+        #         ce_loss, ce_count = self.cross_entropy(subtype_logits, subtype_labels, edema_labels)
+        # else:
+        #     ce_loss = torch.tensor(0.0, device=device, requires_grad=False)
+        #     ce_count = 0
+        ce_loss = torch.tensor(0.0, device=device, requires_grad=False)
+        ce_count = 0
+
+        # -------------------- NTXent (시계열 two-view contrastive) --------------------
+        # if contrast_weight > 0.0 and proj_view1 is not None and proj_view2 is not None and proj_view1.size(0) >= 2:
+        #     with timer("NTXent Loss", accelerator):
+        #         ntxent_loss = self.ntxent_loss(proj_view1, proj_view2)
+        #     ntxent_count = int(proj_view1.size(0))
+        # else:
+        #     ntxent_loss = torch.tensor(0.0, device=device, requires_grad=False)
+        #     ntxent_count = 0
+
+        if info_loss_t is None:
+            info_loss_t = torch.tensor(0.0, device=device, requires_grad=False)
 
 
-        # -------------------- NaN Detection --------------------
-        if torch.isnan(bce_loss) or torch.isinf(bce_loss):
-            print(f"[WARNING] BCE Loss is NaN/Inf: {bce_loss.item()}")
-
-        if torch.isnan(ce_loss) or torch.isinf(ce_loss):
-            print(f"[WARNING] CE Loss is NaN/Inf: {ce_loss.item()}")
-
-        # -------------------- Total Loss --------------------
         total_loss = (
-            bce_weight * bce_loss +
-            ce_weight * ce_loss
+            bce_weight * bce_loss
+            + cardio_weight * cardio_loss
+            + pneumo_weight * pneumo_loss
+            # + contrast_weight * ntxent_loss
+            + info_weight * info_loss_t 
+            # + ce_weight * ce_loss
         )
 
-        # -------------------- Sample Counts --------------------
         loss_counts = {
             'bce_count': bce_count,
             'ce_count': ce_count,
+            'cardio_count': cardio_count,
+            'pneumo_count': pneumo_count,
+            'info_count': 1 if info_loss_t.item() > 0 else 0,
         }
 
-        return total_loss, bce_loss, ce_loss, loss_counts
+        return total_loss, bce_loss, ce_loss, cardio_loss, pneumo_loss, info_loss_t, loss_counts
 
     # validation & test
     def inference(self, classification_input, logits, labels):
@@ -134,6 +167,41 @@ class MultiModalLoss(nn.Module):
             'labels': labels,
             'window_embeddings': classification_input
         }
+
+
+# class NTXentLoss(torch.nn.Module):
+#     def __init__(self, temperature=0.1):
+#         super().__init__()
+#         self.temperature = temperature
+#         self.criterion = torch.nn.CrossEntropyLoss()
+
+#     def forward(self, z_i, z_j):
+#         """
+#         z_i: [B, Dim] - View 1의 잠재 임베딩 (Latent)
+#         z_j: [B, Dim] - View 2의 잠재 임베딩 (Latent)
+#         """
+#         B = z_i.size(0)
+
+#         # 1. L2 정규화 (코사인 유사도를 구하기 위해)
+#         z_i = F.normalize(z_i, dim=1)
+#         z_j = F.normalize(z_j, dim=1)
+
+#         # 2. 모든 임베딩을 하나로 합침: [2B, Dim]
+#         z = torch.cat([z_i, z_j], dim=0)
+
+#         # 3. 유사도 행렬 계산: [2B, 2B]
+#         sim_matrix = torch.matmul(z, z.T) / self.temperature
+
+#         # 4. 자기 자신과의 유사도(대각 원소)는 정답이 될 수 없으므로 아주 작은 값으로 마스킹
+#         sim_matrix.fill_diagonal_(-1e9)
+
+#         # 5. 정답 라벨 생성 (i의 짝은 i+B, i+B의 짝은 i)
+#         labels = torch.cat([torch.arange(B, 2*B), torch.arange(B)], dim=0).to(z.device)
+
+#         # 6. 크로스 엔트로피로 Loss 계산
+#         loss = self.criterion(sim_matrix, labels)
+        
+#         return loss    
 
 
 ############################################################################################################
