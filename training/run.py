@@ -8,7 +8,7 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="Soft_Laebeling", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="32", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="34", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--wandb_on', type=bool, default=True, help='Enable Weights & Biases logging')
 
@@ -28,7 +28,7 @@ def parse_arguments():
     # Early prediction
     parser.add_argument('--prediction_horizon', type=int, default=0, help='Hours ahead to predict for early prediction')
     parser.add_argument('--window_size', type=int, default=24, help='Sliding window size')
-    parser.add_argument('--train_stride', type=int, default=8, help='Sliding window moving stride')
+    parser.add_argument('--train_stride', type=int, default=6, help='Sliding window moving stride')
     parser.add_argument('--eval_stride', type=int, default=1, help='Sliding window moving stride')
 
     #################################### Multi-task Learning ####################################
@@ -66,7 +66,7 @@ def parse_arguments():
     # (Future) parser.add_argument('--lesion_emb_dim', type=int, default=512, help='Pre-computed lesion embedding dim')
 
     ## text modal (사전 임베딩 차원)
-    parser.add_argument('--token_max_length', type=int, default=512, help="max length of tokens (legacy, unused)")
+    # parser.add_argument('--token_max_length', type=int, default=512, help="max length of tokens (legacy, unused)")
     parser.add_argument('--text_emb_dim', type=int, default=768, help='Pre-computed text embedding dim (Bio_ClinicalBERT CLS)')
 
     # cross attention
@@ -91,7 +91,7 @@ def parse_arguments():
 
     args = parser.parse_args([])
 
-    args.wandb_run_name = f"{args.experiment_id}: [Single GPU] Train stride=8/Test stride=1"
+    args.wandb_run_name = f"{args.experiment_id}: [Single GPU] Train stride=6/Test stride=1"
 
     if args.run_name is None:
         args.run_name = f"experiment_{args.experiment_id}"

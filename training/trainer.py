@@ -99,10 +99,14 @@ def train_single_stage_multimodal_model(train_df, val_df, test_df, args):
     # Loss Module
     loss_module = MultiModalLoss(args)
 
-    # Optimizer: separate LR for encoder vs task heads
+    # Optimizer: separate LR for encoder vs task heads / projections
     optimizer = torch.optim.AdamW([
         {'params': model.encoder.parameters(), 'lr': args.encoder_lr},
         {'params': list(model.edema_readout.parameters()), 'lr': args.head_lr},
+        {'params': list(model.cardiomegaly_head.parameters()), 'lr': args.head_lr},
+        {'params': list(model.pneumonia_head.parameters()), 'lr': args.head_lr},
+        {'params': list(model.contrastive_proj.parameters()), 'lr': args.head_lr},
+        {'params': list(model.text_contrastive_proj.parameters()), 'lr': args.head_lr},
         # {'params': list(model.subtype_readout.parameters()), 'lr': args.head_lr},
     ], weight_decay=args.weight_decay)
     accelerator.print(f"[Optimizer] encoder_lr={args.encoder_lr:.0e}, head_lr={args.head_lr:.0e}")
