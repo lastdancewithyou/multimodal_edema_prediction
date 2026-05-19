@@ -299,7 +299,7 @@ class TaskReadout(nn.Module):
         
         # self.classifier = nn.Linear(num_queries * d_model, num_classes)
         self.classifier = nn.Sequential(
-            nn.Dropout(p=0.3),
+            nn.Dropout(p=0.2),
             nn.Linear(num_queries * d_model, num_classes)
         )
 

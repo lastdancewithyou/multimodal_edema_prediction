@@ -6,7 +6,7 @@ def parse_arguments():
 
     # wandb
     parser.add_argument('--project_name', type=str, default="Soft_Labeling(2)", help="Wandb project name")
-    parser.add_argument('--experiment_id', type=str, default="2", help="Experiment ID")
+    parser.add_argument('--experiment_id', type=str, default="5", help="Experiment ID")
     parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--wandb_on', type=bool, default=True, help='Enable Weights & Biases logging')
 
@@ -36,19 +36,18 @@ def parse_arguments():
     # Sub-task BCE (Cardiomegaly / Pneumonia)
     parser.add_argument('--cardio_weight', type=float, default=0.0, help='Cardiomegaly sub-task BCE weight')
     parser.add_argument('--pneumo_weight', type=float, default=0.0, help='Pneumonia sub-task BCE weight')
-    parser.add_argument('--info_weight', type=float, default=0.1, help='Weight for Text Alignment InfoNCE loss')
+    parser.add_argument('--info_weight', type=float, default=0.08, help='Weight for Text Alignment InfoNCE loss')
 
     parser.add_argument('--unsupervised_weight', type=float, default=0.0, help='Unsupervised contrastive loss weight (0 to disable)')
     parser.add_argument('--contrast_temperature', type=float, default=0.1, help='Contrastive temperature')
 
     # Augmentation
-    # parser.add_argument('--feature_mask_prob', type=float, default=0.2, help='Per-cell masking probability for two-view augmentation (applies only where flag==1)')
 
     parser.add_argument('--weight_decay', type=float, default=1e-3)
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
-    parser.add_argument('--encoder_lr', type=float, default=5e-8, help='Learning rate for encoder')
-    parser.add_argument('--head_lr', type=float, default=1e-4, help='Learning rate for task readout heads')
+    parser.add_argument('--encoder_lr', type=float, default=1e-4, help='Learning rate for encoder') # 5e-8
+    parser.add_argument('--head_lr', type=float, default=5e-4, help='Learning rate for task readout heads')
 
     # model
     ## time-series modal
@@ -57,14 +56,12 @@ def parse_arguments():
     parser.add_argument('--ts_encoder_num_layers', type=int, default=2, help="The number of layers in TF")
 
     ## cxr modal (사전 임베딩 차원)
-    # parser.add_argument('--cxr_input_size', type=int, default=224, help='CXR input image size (legacy, unused in pre-embedding pipeline)')
     parser.add_argument('--img_emb_dim', type=int, default=768, help='Pre-computed RadDino Output embedding dim')
     parser.add_argument('--seg_emb_dim', type=int, default=32, help='Pre-computed HybridGNet segment embedding dim')
     parser.add_argument('--img_shared_dim', type=int, default=256, help='Shared latent dim for image-segment cross-attention')
     # (Future) parser.add_argument('--lesion_emb_dim', type=int, default=512, help='Pre-computed lesion embedding dim')
 
     ## text modal (사전 임베딩 차원)
-    # parser.add_argument('--token_max_length', type=int, default=512, help="max length of tokens (legacy, unused)")
     parser.add_argument('--text_emb_dim', type=int, default=768, help='Pre-computed text embedding dim (Bio_ClinicalBERT CLS)')
 
     # cross attention
@@ -89,7 +86,7 @@ def parse_arguments():
 
     args = parser.parse_args([])
 
-    args.wandb_run_name = f"{args.experiment_id}: [Single GPU] Reform_V5__iter=3_stride=12"
+    args.wandb_run_name = f"{args.experiment_id}: [Single GPU] Reform_V5_iter=2_stride=12/lr=1e-4"
 
     if args.run_name is None:
         args.run_name = f"experiment_{args.experiment_id}"
