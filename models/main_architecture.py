@@ -52,7 +52,7 @@ class MultiModalEncoder(nn.Module):
         )
 
         # TS-Centric Fusion Module
-        self.ts_centric_fusion = TimeSeriesCentricCrossAttention_v4(
+        self.ts_centric_fusion = TimeSeriesCentricCrossAttention_v5(
             args=args,
             d_model=256,
             num_heads=8,
@@ -404,6 +404,171 @@ class TemporalMultiheadAttention_v2(nn.Module):
         out = self.out_proj(out)
         out = F.dropout(out, p=0.1, training=self.training)
         return out
+
+
+class TimeSeriesCentricCrossAttention_v5(nn.Module):
+    def __init__(self, args, d_model=256, num_heads=8,
+                ts_input_dim=512, img_input_dim=1024, txt_input_dim=768,
+                disable_cxr=False, disable_txt=False,
+        ):
+        super().__init__()
+        self.d_model = d_model                      # latent embedding dimension
+        self.num_heads = num_heads                  # Multi-head attention head 개수
+        self.num_latents = args.num_latents         # Latent array query 개수
+        self.disable_cxr = disable_cxr
+        self.disable_txt = disable_txt
+
+        # Latent embeddings
+        self.latent_init = nn.Parameter(torch.empty(1, self.num_latents, d_model))
+        nn.init.trunc_normal_(self.latent_init, std=0.02)
+        self.latent_pos_embed = nn.Parameter(torch.empty(1, self.num_latents, d_model))
+        nn.init.trunc_normal_(self.latent_pos_embed, std=0.02)
+
+        # Cross-attention modules with modality-specific input dimensions
+        self.ts_cross_attn = TemporalMultiheadAttention_v2(
+            d_model, num_heads, key_input_dim=ts_input_dim, attn_dropout=0.1
+        )
+        self.img_cross_attn = TemporalMultiheadAttention_v2(
+            d_model, num_heads, key_input_dim=img_input_dim, attn_dropout=0.1
+        )
+        # self.text_cross_attn = TemporalMultiheadAttention_v2(
+        #     d_model, num_heads, key_input_dim=txt_input_dim, attn_dropout=0.1
+        # )
+
+        # Modality-specific Time2Vec for time encoding
+        self.time2vec_ts = Time2Vec(ts_input_dim)
+        self.time2vec_img = Time2Vec(img_input_dim)
+        # self.time2vec_txt = Time2Vec(txt_input_dim)
+
+        self.ln_time_ts = nn.LayerNorm(ts_input_dim)
+        self.ln_time_img = nn.LayerNorm(img_input_dim)
+        # self.ln_time_txt = nn.LayerNorm(txt_input_dim)
+
+        self.latent_self_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.latent_ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model),
+            nn.Dropout(0.1),
+        )
+
+        self.ln_sa  = nn.LayerNorm(d_model)  # self-attn 전
+        self.ln_ffn = nn.LayerNorm(d_model)  # FFN 전
+
+        self.debug_ts_attn = None
+
+    def forward(
+            self, ts_embeddings, img_embeddings=None, text_embeddings=None, time_indices=None,
+            img_key_padding_mask=None, text_key_padding_mask=None, seq_valid_mask=None,
+            num_iterations=2
+        ):
+
+        B, T, _ = ts_embeddings.shape
+        L = self.num_latents
+
+        # ================ Time Embedding ================
+        time_emb_ts  = self.ln_time_ts(self.time2vec_ts(time_indices.unsqueeze(-1)))
+        time_emb_img = self.ln_time_img(self.time2vec_img(time_indices.unsqueeze(-1)))
+        # time_emb_txt = self.ln_time_txt(self.time2vec_txt(time_indices.unsqueeze(-1)))
+
+        latent = (self.latent_init + self.latent_pos_embed).expand(B, -1, -1)
+
+        # 유효하지 않은 time step 마스킹.
+        ts_key_padding_mask = None
+        if seq_valid_mask is not None:
+            ts_key_padding_mask = ~seq_valid_mask.bool()
+
+        # T개 time step을 L개 구간으로 나눔.
+        segments = build_hard_segments(T, L)
+
+        ts_with_time = ts_embeddings + time_emb_ts
+        img_with_time = img_embeddings + time_emb_img
+
+        # if text_embeddings.size(1) == T:
+        #     text_with_time = text_embeddings + time_emb_txt
+        # else:
+        #     text_with_time = text_embeddings
+
+        # ================ Iterative Fusion ================
+        for iter in range(num_iterations):
+            self.ts_cross_attn.save_attn = (iter == 0) # 첫 iteration만 attention 저장함. (첫 에포크 첫 배치 시각화용)
+
+            # ==================== TS -> Latent ====================
+            latent_updates = []
+            all_attention_weights = []
+
+            # 각 segment 별 독립적으로 cross-attention 수행함.
+            for i, (s, e) in enumerate(segments):
+                q_i = latent[:, i:i+1, :] # [B, 1, D] - i번째 latent query
+                k_i = ts_with_time[:, s:e, :] # [B, seg, D] - i번째 구간의 TS
+                kp_i = ts_key_padding_mask[:, s:e] if ts_key_padding_mask is not None else None
+
+                out_i = self.ts_cross_attn(
+                    query=q_i,
+                    key=k_i,
+                    value=k_i,
+                    key_padding_mask=kp_i
+                )
+
+                # For visualization
+                if self.ts_cross_attn.last_attn is not None:
+                    attn = self.ts_cross_attn.last_attn.squeeze(1)  # [B, 1, seg] -> [B, seg]
+                    attn_full = torch.zeros(B, T, device=attn.device)
+                    attn_full[:, s:e] = attn
+                    all_attention_weights.append(attn_full)
+
+                latent_updates.append(out_i)
+
+            ts_out = torch.cat(latent_updates, dim=1) # [B, L, 256]
+            latent = latent + F.dropout(ts_out, p=0.2, training=self.training)
+
+            if len(all_attention_weights) > 0: # For debugging
+                self.debug_ts_attn = torch.stack(all_attention_weights, dim=1)
+
+            # ==================== IMG -> Latent ====================
+            if not self.disable_cxr and img_embeddings is not None and img_embeddings.size(1) > 0:
+                img_out = self.img_cross_attn(
+                    query=latent,
+                    key=img_with_time,
+                    value=img_with_time,
+                    key_padding_mask=img_key_padding_mask
+                )
+                # latent = latent + img_out
+                latent = latent + F.dropout(img_out, p=0.2, training=self.training)
+
+            # ==================== Text -> Latent ====================
+            # if not self.disable_txt and text_embeddings is not None and text_embeddings.size(1) > 0:
+            #     text_out = self.text_cross_attn(
+            #         query=latent,
+            #         key=text_with_time,
+            #         value=text_with_time,
+            #         key_padding_mask=text_key_padding_mask
+            #     )
+            #     # latent = latent + text_out
+            #     if self.training and torch.rand(1).item() < 0.50:
+            #         text_out = text_out * 0.0
+                    
+            #     latent = latent + F.dropout(text_out, p=0.2, training=self.training)
+
+            # ==================== Temporal Mixing ====================
+            sa_out, _ = self.latent_self_attn(
+                query=self.ln_sa(latent),
+                key=self.ln_sa(latent),
+                value=self.ln_sa(latent)
+            )
+            latent = latent + F.dropout(sa_out, p=0.2, training=self.training)
+
+            latent = latent + F.dropout(
+                self.latent_ffn(self.ln_ffn(latent)),
+                p=0.2, training=self.training
+            )
+
+        return latent
 
 
 class TimeSeriesCentricCrossAttention_v4(nn.Module):
@@ -907,157 +1072,7 @@ class Time2Vec(nn.Module):
 #         return latent  # [B, L+1, 256]
 
 
-# class TimeSeriesCentricCrossAttention_v5(nn.Module):
-#     """
-#     - Global Token 도입
-#         - Global token -> Edema detection
-#         - Local token -> Subtype classification
-#     """
-#     def __init__(self, args, d_model=256, num_heads=8,
-#                 ts_input_dim=512, img_input_dim=768, txt_input_dim=768,
-#                 disable_cxr=False, disable_txt=False, disable_prompt=False
-#         ):
-#         super().__init__()
-#         self.d_model = d_model                          # latent embedding dimension
-#         self.num_heads = num_heads                      # Multi-head attention head 개수
-#         self.num_latents = args.num_latents             # Latent array query 개수
-#         self.total_latents = self.num_latents + 1       # Global token 1개 추가
-    
-#         self.disable_cxr = disable_cxr
-#         self.disable_txt = disable_txt
 
-#         # Latent embeddings
-#         self.latent_init = nn.Parameter(torch.empty(1, self.total_latents, d_model))
-#         nn.init.trunc_normal_(self.latent_init, std=0.02)
-#         self.latent_pos_embed = nn.Parameter(torch.empty(1, self.total_latents, d_model)) # Latent에 순서 정보를 부여하는 위치 임베딩 추가
-#         nn.init.trunc_normal_(self.latent_pos_embed, std=0.02)
-
-#         # Cross-attention modules with modality-specific input dimensions
-#         self.ts_cross_attn = TemporalMultiheadAttention_v2(
-#             d_model, num_heads, key_input_dim=ts_input_dim, attn_dropout=0.1
-#         )
-#         self.img_cross_attn = TemporalMultiheadAttention_v2(
-#             d_model, num_heads, key_input_dim=img_input_dim, attn_dropout=0.1
-#         )
-#         self.text_cross_attn = TemporalMultiheadAttention_v2(
-#             d_model, num_heads, key_input_dim=txt_input_dim, attn_dropout=0.1
-#         )
-
-#         # latent 간 정보 교환
-#         self.tsmixer = TSMixerEncoder(
-#             d_model=d_model,
-#             max_seq_len=self.total_latents,
-#             num_layers=2
-#         )
-
-#         # Modality-specific Time2Vec for time encoding
-#         self.time2vec_ts = Time2Vec(ts_input_dim)
-#         self.time2vec_img = Time2Vec(img_input_dim)
-#         self.time2vec_txt = Time2Vec(txt_input_dim)
-
-#         self.ln_time_ts = nn.LayerNorm(ts_input_dim)
-#         self.ln_time_img = nn.LayerNorm(img_input_dim)
-#         self.ln_time_txt = nn.LayerNorm(txt_input_dim)
-#         self.ln_latent = nn.LayerNorm(d_model)
-
-#         self.debug_ts_attn = None
-
-#     def forward(
-#             self, ts_embeddings, img_embeddings=None, text_embeddings=None, time_indices=None,
-#             img_key_padding_mask=None, text_key_padding_mask=None,
-#             num_iterations=2
-#         ):
-
-#         B, T, _ = ts_embeddings.shape
-#         L = self.num_latents
-
-#         # ================ 1. Time emb add to TS & Text modality  ================
-#         time_emb_ts_raw = self.time2vec_ts(time_indices.unsqueeze(-1))  # [B, T, 768]
-#         time_emb_ts = self.ln_time_ts(time_emb_ts_raw)
-#         ts_with_time = ts_embeddings + time_emb_ts
-
-#         if not self.disable_txt and text_embeddings is not None and text_embeddings.size(1) > 0:
-#             time_emb_txt_raw = self.time2vec_txt(time_indices.unsqueeze(-1))  
-#             time_emb_txt = self.ln_time_txt(time_emb_txt_raw)
-#             text_with_time = text_embeddings + time_emb_txt
-
-#         time_emb_img_raw = self.time2vec_img(time_indices.unsqueeze(-1))  # [B, T, 768]
-#         time_emb_img = self.ln_time_img(time_emb_img_raw)
-
-#         # ================ 2. Image Region Sequence 처리 ================
-#         img_with_time = None
-#         img_key_padding_mask_flat = None
-        
-#         if not self.disable_cxr and img_embeddings is not None and img_embeddings.size(1) > 0:
-#             # img_embeddings shape: [B, T, 6, 768]
-#             time_emb_img_raw = self.time2vec_img(time_indices.unsqueeze(-1))  # [B, T, 768]
-#             time_emb_img = self.ln_time_img(time_emb_img_raw)
-            
-#             # Time emb를 6개 region에 동일하게 브로드캐스팅하여 더함
-#             img_with_time = img_embeddings + time_emb_img.unsqueeze(2) # [B, T, 6, 768]
-            
-#             # Attention을 위해 시퀀스를 길게 펼침: [B, T, 6, 768] -> [B, T * 6, 768]
-#             Num_Regions = img_with_time.size(2)
-#             img_with_time = img_with_time.view(B, T * Num_Regions, -1)
-            
-#             # Mask도 동일하게 펼침: [B, T] -> [B, T, 6] -> [B, T * 6]
-#             if img_key_padding_mask is not None:
-#                 expanded_mask = img_key_padding_mask.unsqueeze(2).expand(-1, -1, Num_Regions)
-#                 img_key_padding_mask_flat = expanded_mask.reshape(B, T * Num_Regions)
-
-#         # ================ 3. Latent 초기화 ================
-#         latent = (self.latent_init + self.latent_pos_embed).expand(B, -1, -1)
-
-#         # In window-level batching, all timesteps are valid - no padding needed
-#         ts_key_padding_mask = None
-
-#         # T개 time step을 L개 구간으로 나눔
-#         segments = build_hard_segments(T, L)
-
-#         # ================ 4. Iterative Fusion ================
-#         for iter in range(num_iterations):
-#             # Latent 분리
-#             global_latent = latent[:, 0:1, :]  # [B, 1, 256]
-#             local_latents = latent[:, 1:, :]   # [B, L, 256]
-
-#             # ==================== 4-1. Ts to Latent matrix ====================
-#             latent_updates = []
-
-#             # 각 segment 별 독립적으로 cross-attention 수행함.
-#             for i, (s, e) in enumerate(segments):
-#                 q_i = local_latents[:, i:i+1, :]  # Use local_latents instead of latent
-#                 k_i = ts_with_time[:, s:e, :]
-
-#                 kp_i = ts_key_padding_mask[:, s:e] if ts_key_padding_mask is not None else None
-
-#                 out_i = self.ts_cross_attn(query=q_i, key=k_i, value=k_i, key_padding_mask=kp_i)
-
-#                 latent_updates.append(out_i)
-
-#             local_latents = local_latents + torch.cat(latent_updates, dim=1)
-
-#             # ==================== 4-2. Ts to Global vector ====================
-#             global_ts_out = self.ts_cross_attn(query=global_latent, key=ts_with_time, value=ts_with_time, key_padding_mask=ts_key_padding_mask)
-#             global_latent = global_latent + global_ts_out
-
-#             # ==================== 4-3. IMG to Global vector ====================
-#             if img_with_time is not None:
-#                 img_out = self.img_cross_attn(query=global_latent, key=img_with_time, value=img_with_time, key_padding_mask=img_key_padding_mask_flat)
-#                 global_latent = global_latent + img_out
-
-#             # ==================== 4-4. Text to Global vector ====================
-#             if not self.disable_txt and text_embeddings is not None and text_embeddings.size(1) > 0:
-#                 text_out = self.text_cross_attn(query=global_latent, key=text_with_time, value=text_with_time, key_padding_mask=text_key_padding_mask)
-#                 global_latent = global_latent + text_out
-
-#             # ==================== Temporal Mixing ====================
-#             # Global Token이 얻어온 이미지/텍스트 정보를 Local Token들과 교환
-#             latent = torch.cat([global_latent, local_latents], dim=1)  # [B, L+1, 256]
-
-#             latent = self.tsmixer(latent, src_key_padding_mask=None)  # [B, L+1, 256]
-#             latent = self.ln_latent(latent)
-
-#         return latent  # [B, L+1, 256]
 
 
 

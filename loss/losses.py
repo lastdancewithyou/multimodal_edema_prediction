@@ -24,9 +24,9 @@ class MultiModalLoss(nn.Module):
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
 
         # ==================== Contrastive Loss ====================
-        init_temp = args.contrast_temperature
-        self.temperature = nn.Parameter(torch.tensor(init_temp))
-        print(f"[Loss] BCE Loss and InfoNCE Loss initialized")
+        # init_temp = args.contrast_temperature
+        # self.temperature = nn.Parameter(torch.tensor(init_temp))
+        self.temperature = args.contrast_temperature 
 
     def info_nce_loss(self, clinical_emb, text_emb):
         clinical_emb = F.normalize(clinical_emb, p=2, dim=1)
