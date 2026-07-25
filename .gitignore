@@ -28,6 +28,7 @@ check*
 *.DS_Store
 *.png
 *.pdf
+*.md
 
 # Logs
 *.log
@@ -93,3 +94,5 @@ training/
 checkpoints/
 checkpoints_duett/
 inference.py
+utils/
+train_cxr_linear_head_icu.py
