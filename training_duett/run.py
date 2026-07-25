@@ -26,11 +26,6 @@ DEFAULT_TAG_EXCLUDE = frozenset({
 def make_diff_tag(parser: argparse.ArgumentParser,
                   args: argparse.Namespace,
                   exclude=DEFAULT_TAG_EXCLUDE) -> str:
-    """argparse default와 실제 args 값이 다른 항목만 골라 tag 문자열 생성.
-
-    사용자가 CLI에서 override한 hparam만 자동으로 이름에 반영되므로
-    key hparam 목록을 별도로 유지할 필요 없음.
-    """
     defaults = {a.dest: a.default for a in parser._actions
                 if a.dest != "help" and a.dest not in exclude}
     diff = {k: v for k, v in vars(args).items()
