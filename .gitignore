@@ -56,7 +56,6 @@ multimodal_preprocessing_groundwork.ipynb
 (old)multimodal_preprocessing_groundwork.ipynb
 cxr_unimodal.ipynb
 preprocess/\[All_label]multimodal_preprocessing_groundwork.ipynb
-.gitignore
 preprocess/split_functions.py
 preprocess/scaling_functions.py
 models/cxrformer_model.py
