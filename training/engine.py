@@ -1,20 +1,17 @@
-import os
 import warnings
 warnings.filterwarnings('ignore', message='Spectral initialisation failed')
 
 import torch
-import torch.nn.functional as F
 
 from utils.utils import timer
 
 
-# 단일 배치 학습 함수
+# 단일 배치 학습 함수 (LUPI dual-stream)
 def train_batch(
         args, model, batch, loss_module, device, accelerator,
         disable_cxr=False, disable_txt=False,
-        bce_weight=None, cardio_weight=0.0, pneumo_weight=0.0, info_weight=0.0,
-        # contrast_weight=0.0, mask_prob=0.15,
-        current_epoch=0, is_training=True,
+        is_training=True, eval_path='deploy',
+        disable_txt_priv=False,
     ):
 
     if is_training:
@@ -25,14 +22,14 @@ def train_batch(
         edema_soft_labels = batch['edema_soft_labels']
         edema_hard_labels = batch['edema_hard_labels']
         cxr_anchor_mask = batch['cxr_anchor_mask']
-        cardiomegaly_labels = batch['cardiomegaly_labels']
-        pneumonia_labels = batch['pneumonia_labels']
-        # subtype_labels = batch['subtype_labels']
+        subtype_soft_labels = batch['subtype_soft_labels']      # [B, 3]
+        subtype_label       = batch['subtype_label']            # [B] long (-1 = invalid)
+        subtype_mask        = batch['subtype_mask']             # [B] float
 
         img_index_tensor = batch['img_index_tensor']
         txt_index_tensor = batch['text_index_tensor']
-        has_cxr = (img_index_tensor != -1).long()   # [B, T]
-        has_text = (txt_index_tensor != -1).long()  # [B, T]
+        has_cxr = (img_index_tensor != -1).long()
+        has_text = (txt_index_tensor != -1).long()
 
     # ==================== 2. 모델 입력 데이터 전처리 ====================
     with timer("데이터 전처리 작업", accelerator):
@@ -42,82 +39,125 @@ def train_batch(
             disable_txt=disable_txt,
         )
 
-    # ==================== 3. Forward Pass 및 Loss 계산 ====================
-    use_info_nce = is_training and info_weight > 0.0
-    
-    with timer("Batch별 Embedding 추출 및 Loss 연산 총", accelerator):
+    # ==================== 3. Forward Pass (Dual-stream) ====================
+    with timer("Dual-stream forward + Loss 연산 총", accelerator):
         with accelerator.autocast():
             time_steps = batch['time_steps']
 
+            # 평가 시 priv path를 보고 싶으면 lupi_mode=True 강제하여 두 path 모두 계산
+            need_priv = is_training or eval_path == 'priv'
             model_outputs = model(
                 args, ts_series, cxr_data, text_data,
                 has_cxr, has_text,
                 time_steps=time_steps,
+                ts_valid_mask=batch['ts_valid_mask'],
+                lupi_mode=need_priv,
+                disable_txt_priv=disable_txt_priv,   # Modality Dropout on teacher
             )
 
-            edema_logits = model_outputs['edema_logits']
-            cardiomegaly_logits = model_outputs['cardiomegaly_logits']
-            pneumonia_logits = model_outputs['pneumonia_logits']
+            logit_priv   = model_outputs['logit_priv']
+            logit_deploy = model_outputs['logit_deploy']
+            fused_priv   = model_outputs['fused_priv']
+            fused_deploy = model_outputs['fused_deploy']
+            feat_priv    = model_outputs.get('feat_priv',   None)
+            feat_deploy  = model_outputs.get('feat_deploy', None)
+            subtype_logits_deploy = model_outputs.get('subtype_logits_deploy', None)
+            subtype_logits_priv   = model_outputs.get('subtype_logits_priv',   None)
 
-            info_loss_t = torch.tensor(0.0, device=device)
-        
-            if use_info_nce:
-                proj_clinical = model_outputs['proj_emb']
-                proj_text = model_outputs['proj_text_emb']
-                valid_txt_mask = model_outputs['valid_txt_mask']
+            # 평가 시 어떤 path의 logit을 메트릭에 쓸지 선택
+            eval_logit = logit_priv if (not is_training and eval_path == 'priv') else logit_deploy
+            eval_subtype_logits = (
+                subtype_logits_priv if (not is_training and eval_path == 'priv')
+                else subtype_logits_deploy
+            )
 
-                if valid_txt_mask.sum() > 1:
-                    info_loss_t = loss_module.info_nce_loss(
-                        proj_clinical[valid_txt_mask], 
-                        proj_text[valid_txt_mask]
+            if is_training:
+                with timer("LUPI Loss 연산", accelerator):
+                    (
+                        total_batch_loss,
+                        bce_priv_t, bce_deploy_t,
+                        fd_loss_t, rd_loss_t, kd_loss_t, cov_loss_t,
+                        subtype_loss_t,
+                        loss_counts,
+                    ) = loss_module(
+                        logit_priv=logit_priv,
+                        logit_deploy=logit_deploy,
+                        fused_priv=fused_priv,
+                        fused_deploy=fused_deploy,
+                        feat_priv=feat_priv,
+                        feat_deploy=feat_deploy,
+                        edema_soft_labels=edema_soft_labels,
+                        subtype_logits_priv=subtype_logits_priv,
+                        subtype_logits_deploy=subtype_logits_deploy,
+                        subtype_target_probs=subtype_soft_labels,
+                        subtype_mask=subtype_mask,
+                        device=device, accelerator=accelerator,
                     )
-            
-            # cardio/pneumo 라벨은 CXR이 있는 window에서만 의미 있음 → cxr_anchor=0이면 NaN으로 마스킹
-            cxr_mask = (cxr_anchor_mask == 1)
-            cardio_targets = torch.where(cxr_mask, cardiomegaly_labels, torch.full_like(cardiomegaly_labels, float('nan')))
-            pneumo_targets = torch.where(cxr_mask, pneumonia_labels, torch.full_like(pneumonia_labels, float('nan')))
+            else:
+                # eval/inference: 선택된 path에 BCE only (메트릭 추적용)
+                bce_deploy_t, bce_count = loss_module.deploy_bce(eval_logit, edema_soft_labels)
+                total_batch_loss = bce_deploy_t
+                bce_priv_t = torch.tensor(0.0, device=device)
+                fd_loss_t  = torch.tensor(0.0, device=device)
+                rd_loss_t  = torch.tensor(0.0, device=device)
+                kd_loss_t  = torch.tensor(0.0, device=device)
+                cov_loss_t = torch.tensor(0.0, device=device)
+                subtype_loss_t = torch.tensor(0.0, device=device)
+                loss_counts = {
+                    'bce_count': bce_count, 'rd_cos': 0.0, 'rd_mse': 0.0,
+                    'subtype_count': 0,
+                    'subtype_loss_priv': 0.0, 'subtype_loss_deploy': 0.0,
+                }
 
-            with timer("Main loss 연산", accelerator):
-                total_batch_loss, bce_loss_t, ce_loss_t, cardio_loss_t, pneumo_loss_t, final_info_loss_t, loss_counts = loss_module(
-                    edema_logits=edema_logits,
-                    edema_soft_labels=edema_soft_labels,
-                    cardiomegaly_logits=cardiomegaly_logits, cardiomegaly_labels=cardio_targets, cardio_weight=cardio_weight,
-                    pneumonia_logits=pneumonia_logits, pneumonia_labels=pneumo_targets, pneumo_weight=pneumo_weight,
-                    # subtype_logits=subtype_logits, subtype_labels=subtype_labels, ce_weight=...,
-                    bce_weight=bce_weight,
-                    info_loss_t=info_loss_t, info_weight=info_weight,
-                    # contrast_weight=contrast_weight if use_contrastive else 0.0, proj_view1=proj_view1, proj_view2=proj_view2,
-                    device=device, accelerator=accelerator,
-                )
+    # ==================== 4. Metrics ====================
+    batch_bce_priv   = float(bce_priv_t.detach().item())
+    batch_bce_deploy = float(bce_deploy_t.detach().item())
+    batch_fd         = float(fd_loss_t.detach().item())
+    batch_rd         = float(rd_loss_t.detach().item())
+    batch_kd         = float(kd_loss_t.detach().item())
+    batch_cov        = float(cov_loss_t.detach().item())
+    batch_subtype    = float(subtype_loss_t.detach().item())
 
-    # ==================== 4. Metrics 수집 ====================
-    batch_bce = float(bce_loss_t.detach().item())
-    batch_ce = float(ce_loss_t.detach().item())  # 현재는 0으로만 처리됨.(향후 cardio/noncardio task용)
-    batch_cardio = float(cardio_loss_t.detach().item())
-    batch_pneumo = float(pneumo_loss_t.detach().item())
-    batch_info = float(final_info_loss_t.detach().item())
+    # ── Privileged vs Deploy 경로 차이 진단 ──
+    diag_fused_diff = 0.0
+    diag_logit_diff = 0.0
+    if is_training and fused_priv is not None and fused_deploy is not None:
+        with torch.no_grad():
+            diag_fused_diff = float((fused_priv - fused_deploy).abs().mean().item())
+            diag_logit_diff = float((logit_priv - logit_deploy).abs().mean().item())
 
+    # 평가/추론용 logit
+    metric_logit = logit_priv if (not is_training and eval_path == 'priv') else logit_deploy
     batch_outputs = {
         'edema_soft_labels': edema_soft_labels,
         'edema_hard_labels': edema_hard_labels,
-        'cxr_anchor_mask': cxr_anchor_mask,
-        'edema_logits': edema_logits,
-        'cardiomegaly_logits': cardiomegaly_logits,
-        'pneumonia_logits': pneumonia_logits,
-        'cardiomegaly_labels': cardiomegaly_labels,
-        'pneumonia_labels': pneumonia_labels,
-        # 'subtype_labels': subtype_labels,
-        # 'subtype_logits': subtype_logits,
+        'cxr_anchor_mask':   cxr_anchor_mask,
+        'edema_logits':      metric_logit,
+        'logit_priv':        logit_priv,       # 진단용
+        # ── Subtype eval outputs (eval_path에 맞춰 priv/deploy 라우팅) ──
+        'subtype_logits':  eval_subtype_logits,      # [B, 3] or None
+        'subtype_label':   subtype_label,            # [B] long, -1 where mask=0
+        'subtype_mask':    subtype_mask,             # [B] float
     }
 
     batch_counts = {
-        'bce_count': loss_counts['bce_count'],
-        'ce_count': loss_counts['ce_count'],
-        'cardio_count': loss_counts['cardio_count'],
-        'pneumo_count': loss_counts['pneumo_count'],
-        'info_count': loss_counts['info_count'],
+        'bce_count':       loss_counts['bce_count'],
+        'bce_priv_loss':   batch_bce_priv,
+        'bce_deploy_loss': batch_bce_deploy,
+        'fd_loss':         batch_fd,
+        'rd_loss':         batch_rd,
+        'rd_cos':          loss_counts.get('rd_cos', 0.0),
+        'rd_mse':          loss_counts.get('rd_mse', 0.0),
+        'kd_loss':         batch_kd,
+        'cov_loss':        batch_cov,
+        'subtype_loss':        batch_subtype,
+        'subtype_loss_priv':   loss_counts.get('subtype_loss_priv',   0.0),
+        'subtype_loss_deploy': loss_counts.get('subtype_loss_deploy', 0.0),
+        'subtype_count':       loss_counts.get('subtype_count', 0),
+        'diag_fused_diff': diag_fused_diff,
+        'diag_logit_diff': diag_logit_diff,
     }
-    return total_batch_loss, batch_bce, batch_ce, batch_cardio, batch_pneumo, batch_info, batch_outputs, batch_counts
+    return total_batch_loss, batch_bce_priv, batch_bce_deploy, batch_outputs, batch_counts
 
 
 def prepare_multiview_inputs(batch, has_cxr, has_text, disable_cxr=False, disable_txt=False):
@@ -138,7 +178,6 @@ def prepare_multiview_inputs(batch, has_cxr, has_text, disable_cxr=False, disabl
         cxr_data = {
             'unique_embs': batch['unique_img_embs'],
             'unique_segment_embs': batch['unique_segment_embs'],
-            'unique_ctr': batch['unique_ctr'],
             'segment_index_tensor': batch['segment_index_tensor'],
             'unique_indices': unique_indices,
             'positions': valid_positions,
@@ -147,7 +186,6 @@ def prepare_multiview_inputs(batch, has_cxr, has_text, disable_cxr=False, disabl
         cxr_data = {
             'unique_embs': torch.empty(0),
             'unique_segment_embs': torch.empty(0),
-            'unique_ctr': torch.empty(0),
             'segment_index_tensor': torch.empty(0, dtype=torch.long),
             'unique_indices': torch.empty(0, dtype=torch.long),
             'positions': torch.empty(0, 2, dtype=torch.long),
@@ -161,73 +199,17 @@ def prepare_multiview_inputs(batch, has_cxr, has_text, disable_cxr=False, disabl
         else:
             unique_indices = torch.empty(0, dtype=torch.long)
         text_data = {
-            'unique_embs': batch['unique_text_embs'],
-            'unique_indices': unique_indices,
-            'positions': valid_positions,
+            'unique_input_ids':  batch['unique_text_input_ids'],   # [N_uniq, 128] long
+            'unique_attn_mask':  batch['unique_text_attn_mask'],   # [N_uniq, 128] long
+            'unique_indices':    unique_indices,
+            'positions':         valid_positions,
         }
     else:
         text_data = {
-            'unique_embs': torch.empty(0),
-            'unique_indices': torch.empty(0, dtype=torch.long),
-            'positions': torch.empty(0, 2, dtype=torch.long),
+            'unique_input_ids':  torch.empty(0, 128, dtype=torch.long),
+            'unique_attn_mask':  torch.empty(0, 128, dtype=torch.long),
+            'unique_indices':    torch.empty(0, dtype=torch.long),
+            'positions':         torch.empty(0, 2, dtype=torch.long),
         }
 
     return ts_series, cxr_data, text_data, has_cxr, has_text
-
-
-
-
-# def build_two_views(ts_series, value_col_idx, flag_col_idx, mask_prob=0.15):
-#     """
-#     ts_series: [B, T, D] — value 컬럼과 flag 컬럼이 한 텐서에 함께 들어있음
-#     value_col_idx: [Dv] long — value 컬럼의 last-dim 인덱스
-#     flag_col_idx:  [Dv] long — 위 value에 대응하는 '<var>_flag' 컬럼 인덱스 (순서 일치)
-#     mask_prob: flag==1 셀 중 얼마나 가릴지
-
-#     return: (view1, view2) — 둘 다 [B, T, D]. 마스킹된 위치는 value=0, flag=0.
-#     같은 mask_prob로 독립 샘플링되어 두 개의 augmentation view를 만든다.
-#     """
-#     ts_values = ts_series.index_select(-1, value_col_idx)  # [B, T, Dv]
-#     ts_flags = ts_series.index_select(-1, flag_col_idx)    # [B, T, Dv]
-
-#     v1_vals, v1_flags = feature_masking(ts_values, ts_flags, mask_prob=mask_prob)
-#     v2_vals, v2_flags = feature_masking(ts_values, ts_flags, mask_prob=mask_prob)
-
-#     view1 = ts_series.clone()
-#     view1[..., value_col_idx] = v1_vals
-#     view1[..., flag_col_idx] = v1_flags.to(view1.dtype)
-
-#     view2 = ts_series.clone()
-#     view2[..., value_col_idx] = v2_vals
-#     view2[..., flag_col_idx] = v2_flags.to(view2.dtype)
-
-#     return view1, view2
-
-
-# def feature_masking(ts_tensor, flag_tensor, mask_prob=0.15):
-#     """
-#     ts_tensor: [B, T, D] - 스케일링된 시계열 데이터
-#     flag_tensor: [B, T, D] - 각 변수 및 시간대별 측정 여부 (1: 존재, 0: 결측)
-#     mask_prob: 유효한 데이터 중 몇 %를 인위적으로 가릴 것인가 (기본 15%)
-#     """
-#     # 1. 원본 훼손 방지를 위한 복제
-#     aug_ts = ts_tensor.clone()
-#     aug_flags = flag_tensor.clone()
-
-#     # 2. 0~1 사이의 난수 생성 [B, T, D]
-#     rand_matrix = torch.rand_like(aug_ts)
-
-#     # 3. [핵심] 인위적 결측 타겟 선정
-#     # 조건 A: 원래 데이터가 존재하는 곳 (flag_tensor == 1)
-#     # 조건 B: 난수가 mask_prob 보다 작은 곳 (예: 15% 확률)
-#     # 두 조건을 모두 만족하는 위치만 True가 되는 Boolean Mask 생성
-#     target_mask = (flag_tensor == 1) & (rand_matrix < mask_prob)
-
-#     # 4. 타겟 위치 마스킹 수행
-#     # 선택된 위치의 시계열 값을 0.0 (또는 평균값)으로 만듦
-#     aug_ts[target_mask] = 0.0
-    
-#     # 해당 위치의 플래그도 0으로 변경하여, 모델이 이 값이 결측되었음을 알게 함
-#     aug_flags[target_mask] = 0 
-
-#     return aug_ts, aug_flags

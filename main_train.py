@@ -20,10 +20,10 @@ def load_preprocessed_data():
     """
     스플릿까지 완료된 데이터 로드
     """
-    data_dir = '/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/data/4th_preprocessed_data/'
-    train_df = pd.read_feather(data_dir + 'train_multimodal_20260513.ftr')
-    val_df = pd.read_feather(data_dir + 'val_multimodal_20260513.ftr')
-    test_df = pd.read_feather(data_dir + 'test_multimodal_20260513.ftr')
+    data_dir = '/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/data/full_data/subject_data/'
+    train_df = pd.read_feather(data_dir + 'train_multimodal_20260611.ftr') # 0609가 기존 데이터
+    val_df = pd.read_feather(data_dir + 'val_multimodal_20260611.ftr')
+    test_df = pd.read_feather(data_dir + 'test_multimodal_20260611.ftr')
 
     print(f"\n[Data Loading] Train: {len(train_df):,} rows, Val: {len(val_df):,} rows, Test: {len(test_df):,} rows")
 

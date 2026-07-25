@@ -11,6 +11,9 @@ wandb/
 *.pth
 *.pt
 *.ckpt
+*_seperated.py
+*_original.py
+check*
 
 # Data
 *.csv
@@ -23,6 +26,8 @@ wandb/
 *.npz
 *.gz
 *.DS_Store
+*.png
+*.pdf
 
 # Logs
 *.log
@@ -36,9 +41,12 @@ logs/
 # Env
 .env
 
-/output/
-/augmentation_debug/
-/data/
+replay_pretrained_test.py
+timeseries_ssl.ipynb
+
+output/
+augmentation_debug/
+data/
 training/model_backup_0321.py
 models/LoRA_test.ipynb
 tester.ipynb
@@ -52,7 +60,22 @@ preprocess/\[All_label]multimodal_preprocessing_groundwork.ipynb
 preprocess/split_functions.py
 preprocess/scaling_functions.py
 models/cxrformer_model.py
-icu_cxr
+icu_cxr/
+analysis/alpha_sweep.py
+timeseries_ssl.ipynb
+raddino_cxr_embeddings/
+outputs/
+models/hybridgnet/
+128/
+64/
+analysis/figs_check/
+analysis/figs_test/
+analysis/grad_diag_first/
+duett/preprocessed/
+preprocess/cxr_preprocess_modeling.ipynb
+preprocess/fulldata_time_series_preprocess.ipynb
+preprocess/triplet_modification.ipynb
+preprocess/time_series_cxr_preprocess_20260316.ipynb
 
 IMAGE_FILENAMES.txt
 
@@ -64,3 +87,10 @@ models/hybridgnet/Weights
 
 hybridgnet_embeddings/
 hybridgnet_visuals/
+
+diagnostics/
+PatchTST_self_supervised/
+training/
+checkpoints/
+checkpoints_duett/
+inference.py
