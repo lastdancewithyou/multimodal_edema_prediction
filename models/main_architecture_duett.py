@@ -133,9 +133,7 @@ class CXREncoder(nn.Module):
     return_patches=False (default): CLS 토큰만 [B, D] 반환
     return_patches=True:            (cls, patches) 튜플 반환 — patches [B, N, D]
     """
-
-    def __init__(self, model_name: str = "microsoft/rad-dino",
-                 freeze: bool = True, return_patches: bool = True):
+    def __init__(self, model_name: str = "microsoft/rad-dino", freeze: bool = True, return_patches: bool = True):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(model_name)
         self.d_out = self.backbone.config.hidden_size
@@ -413,7 +411,7 @@ class PatchDualPathologyPerceiver(nn.Module):
             dropout: float = 0.1,
             head_hidden: int = 64,
             head_dropout: float = 0.1,
-            beta_init: float = 1.0,   # per-pathology correction scale의 초기값
+            # beta_init: float = 1.0,   # per-pathology correction scale의 초기값
         ):
         super().__init__()
         self.n_pathologies = n_pathologies

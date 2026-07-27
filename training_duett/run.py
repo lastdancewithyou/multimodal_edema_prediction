@@ -163,6 +163,23 @@ def _add_common(p: argparse.ArgumentParser):
                    help="매 epoch 끝에 train 앞쪽 N 배치(deterministic subset)에서 gap 표/AUROC "
                         "계산. 0=비활성. 100 (약 12.8k 샘플)이면 val보다 넓어 AUROC 통계 충분.")
 
+    # Correction-only Linear Probing (dual_patch 전용, over-fit 진단/치료 stage)
+    # best ckpt 를 불러와 correction_head + beta 만 재학습. 다른 모든 파라미터는 freeze +
+    # eval mode 로 두어 backbone/perceiver 내부 dropout 이 재현성 있는 forward 를 만들도록 함.
+    p.add_argument("--lp_only_correction", action="store_true",
+                   help="linear probing: correction_head + beta 만 학습, 나머지 전부 freeze+eval. "
+                        "dual_patch teacher 에서만 지원. --lp_ckpt 필수.")
+    p.add_argument("--lp_ckpt", type=str, default="",
+                   help="LP 시작점 checkpoint 경로 (train_teacher 가 저장한 best.pt).")
+    p.add_argument("--lp_beta_l2", type=float, default=1e-3,
+                   help="beta L2 penalty coefficient. loss += lp_beta_l2 * mean(beta**2).")
+    p.add_argument("--lp_corr_l2", type=float, default=1e-2,
+                   help="scaled_correction L2 penalty coefficient. "
+                        "loss += lp_corr_l2 * mean((beta*ts_correction)**2) (batch mean).")
+    p.add_argument("--lp_correction_dropout", type=float, default=0.3,
+                   help="LP 시 correction_head 내부 nn.Dropout.p 를 이 값으로 override. "
+                        "0 이면 override 하지 않음.")
+
     
 
 

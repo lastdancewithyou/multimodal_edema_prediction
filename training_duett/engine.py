@@ -4,6 +4,22 @@ import torch
 import torch.nn as nn
 
 
+def _set_train_with_frozen_eval(teacher, accelerator=None):
+    """teacher 는 train() 로 두되, frozen submodule (모든 param.requires_grad=False) 은 eval() 로.
+    Residual fusion 학습 중 frozen backbone (DuETT/CXR/pretrained_cxr_head) 의 dropout 이
+    stochastic anchor 를 만들어 correction_head 가 노이즈 상쇄 방향으로 편향 학습되는 것을 방지.
+    """
+    teacher.train()
+    unwrapped = accelerator.unwrap_model(teacher) if accelerator is not None else teacher
+    for attr in ("duett", "cxr", "pretrained_cxr_head"):
+        mod = getattr(unwrapped, attr, None)
+        if mod is None:
+            continue
+        params = list(mod.parameters(recurse=True))
+        if params and not any(p.requires_grad for p in params):
+            mod.eval()
+
+
 def _move_lists(batch: dict, device: torch.device) -> dict:
     """Move list-of-tensors entries (x_ts, x_static, bin_ends) to device."""
     out = {
@@ -117,7 +133,9 @@ def train_teacher_pathology_batch(batch, teacher, path_loss_fn, optimizer, devic
 # Teacher — Dual Pathology mode (image / ts / fusion 3-way BCE)
 # =============================================================================
 def train_teacher_dual_pathology_batch(batch, teacher, path_loss_fn, optimizer, device, accelerator=None):
-    teacher.train()
+    # train() + frozen submodule eval() — frozen backbone dropout 으로 anchor 가 흔들려
+    # correction_head 가 노이즈 상쇄 방향으로 편향 학습되는 것을 방지.
+    _set_train_with_frozen_eval(teacher, accelerator)
     b = _move_lists(batch, device)
     out = teacher(b["x_ts"], b["x_static"], b["bin_ends"], b["pixel_values"])
     if not isinstance(out, dict):
@@ -140,6 +158,64 @@ def train_teacher_dual_pathology_batch(batch, teacher, path_loss_fn, optimizer, 
         "img_per":    losses["img_per"].cpu(),        # [K]
         "ts_per":     losses["ts_per"].cpu(),         # [K]
         "fus_per":    losses["fus_per"].cpu(),        # [K]
+        "main_logit":    out["main_logit"].detach(),
+        "img_logits":    out["img_logits"].detach(),
+        "ts_logits":     out["ts_logits"].detach(),
+        "fusion_logits": out["fusion_logits"].detach(),
+        "y":             b["y"].detach(),
+        "y_multi":       b["y_multi"].detach(),
+        "y_multi_mask":  b["y_multi_mask"].detach(),
+    }
+
+
+# =============================================================================
+# Teacher — Dual Pathology LP mode (correction_head + beta only)
+# =============================================================================
+def train_teacher_dual_pathology_lp_batch(batch, teacher, path_loss_fn, optimizer, device,
+                                          accelerator=None, beta_l2: float = 0.0,
+                                          corr_l2: float = 0.0):
+    """LP step: teacher 전체를 eval() 로 고정 (frozen 모듈의 dropout/stochastic 경로 차단) →
+    unwrap 해서 perceiver.correction_head 만 train() 로 되돌림.
+    trainable 은 correction_head + perceiver.beta 뿐이므로 다른 branch 는 상수처럼 동작.
+    reg = beta_l2 * mean(beta^2) + corr_l2 * mean(scaled_correction^2) 를 fusion loss 에 더함.
+    """
+    teacher.eval()
+    unwrapped = accelerator.unwrap_model(teacher) if accelerator is not None else teacher
+    unwrapped.perceiver.correction_head.train()
+
+    b = _move_lists(batch, device)
+    out = teacher(b["x_ts"], b["x_static"], b["bin_ends"], b["pixel_values"])
+    if not isinstance(out, dict):
+        raise RuntimeError("dual_pathology LP 모드인데 TeacherModel 이 dict 를 반환하지 않았습니다.")
+
+    losses = path_loss_fn(out["img_logits"], out["ts_logits"], out["fusion_logits"],
+                          b["y_multi"], b["y_multi_mask"])
+
+    reg_beta = torch.zeros((), device=device)
+    reg_corr = torch.zeros((), device=device)
+    if beta_l2 > 0.0:
+        reg_beta = beta_l2 * (unwrapped.perceiver.beta ** 2).mean()
+    if corr_l2 > 0.0:
+        reg_corr = corr_l2 * (out["scaled_correction"] ** 2).mean()
+    total = losses["total"] + reg_beta + reg_corr
+
+    optimizer.zero_grad()
+    if accelerator is not None:
+        accelerator.backward(total)
+    else:
+        total.backward()
+    optimizer.step()
+
+    return {
+        "loss":       total.detach().item(),
+        "img_total":  losses["img_total"].item(),
+        "ts_total":   losses["ts_total"].item(),
+        "fus_total":  losses["fus_total"].item(),
+        "img_per":    losses["img_per"].cpu(),
+        "ts_per":     losses["ts_per"].cpu(),
+        "fus_per":    losses["fus_per"].cpu(),
+        "reg_beta_l2": float(reg_beta.detach().item()),
+        "reg_corr_l2": float(reg_corr.detach().item()),
         "main_logit":    out["main_logit"].detach(),
         "img_logits":    out["img_logits"].detach(),
         "ts_logits":     out["ts_logits"].detach(),

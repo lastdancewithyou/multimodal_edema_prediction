@@ -100,7 +100,8 @@ def _extract_duett(loader, backbone, device, feature_type: str):
         )
         y = batch["y"].float()
         duett_in = backbone.feats_to_input(x, y.shape[0])
-        tokens = backbone.encode(duett_in)                    # [B, T+1, d_rep]
+        # encode() returns (transformed [B, T+1, d_rep], psi [B, T+1, V+1, d_emb]); psi 미사용.
+        tokens = backbone.encode(duett_in)[0]
         feat = _pool_duett_tokens(tokens, feature_type)
         feats.append(feat.detach().float().cpu())
         labels.append(y)

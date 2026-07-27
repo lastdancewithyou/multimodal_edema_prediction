@@ -1,23 +1,8 @@
-"""Logit-level fusion probe.
-
-Frozen unimodal backbones (CXR = RAD-DINO, TS = DuETT)에서 각각 linear probe를 학습한 뒤,
-그 unimodal logits를 단순 concat → 소형 fusion head 학습 → image-only 대비 개선 여부 확인.
-
-두 backbone 모두 frozen. 학습되는 건 각 unimodal linear head + fusion head 뿐.
-Fusion에 넣는 신호는 오직 unimodal logits(스칼라 · 병리 개수만큼)뿐이므로,
-성능 향상이 있다면 그건 "logit calibration + cross-modal linear/nonlinear 결합" 만의 기여.
+"""
+Logit-level fusion probe.
 
 사용법:
-    python analysis/logit_fusion_probe.py --ts_modality duett_multiscale --fusion_type linear
-
---fusion_type:
-    per_label : pathology별 독립 2→1 결합 (img 가중치=1로 init → image-only에서 출발)
-    linear    : [2L → L] 단일 linear layer
-    mlp       : [2L → hidden → L] 소형 MLP
-
-Options:
-    --features_dir <dir>  : unimodal_linear_probe.py --save_features로 미리 저장한 feature 사용.
-                            없거나 파일 없으면 backbone forward 재실행.
+    python analysis/logit_fusion_probe.py --fusion_type per_label --labels label_edema,label_cardiomegaly,label_effusion,label_pneumonia 
 """
 from __future__ import annotations
 

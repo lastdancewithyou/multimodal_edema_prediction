@@ -101,8 +101,7 @@ def _strip_module_prefix(state: dict[str, torch.Tensor]) -> dict[str, torch.Tens
     return state
 
 
-def _different_subject_permutation(subject_ids: np.ndarray,
-                                   rng: np.random.Generator) -> np.ndarray:
+def _different_subject_permutation(subject_ids: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """Return a within-batch permutation maximizing cross-subject pairing."""
     n = len(subject_ids)
     if n <= 1:

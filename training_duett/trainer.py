@@ -17,7 +17,8 @@ from transformers import AutoImageProcessor
 from .data_processing import (AnchorConfig, build_datasets, duett_kd_collate,
                               DEFAULT_PATHOLOGY_LABELS)
 from .engine import (train_teacher_batch, train_student_batch, eval_teacher_batch, eval_student_batch,
-                     train_teacher_pathology_batch, train_teacher_dual_pathology_batch)
+                     train_teacher_pathology_batch, train_teacher_dual_pathology_batch,
+                     train_teacher_dual_pathology_lp_batch)
 from .evaluator import (evaluate_binary, make_teacher_forward,
                           make_teacher_aux_forward, make_student_forward,
                           evaluate_pathology, format_pathology_gap_table,
@@ -91,7 +92,8 @@ def _make_param_groups(model, args):
             continue
         if name.startswith(backbone_prefixes):
             backbone.append(p)
-        elif "correction_head" in name:
+        elif "correction_head" in name or name.endswith(".beta") or name == "beta":
+            # beta 는 correction_head 와 함께 correction group 으로 (correction_lr_mult 공유).
             correction.append(p)
         elif name.endswith("pathology_queries"):
             queries.append(p)
@@ -103,17 +105,13 @@ def _make_param_groups(model, args):
 
     groups = []
     if backbone:
-        groups.append({"params": backbone,   "lr": args.lr * args.backbone_lr_mult,
-                       "name": "backbone"})
+        groups.append({"params": backbone,   "lr": args.lr * args.backbone_lr_mult, "name": "backbone"})
     if queries:
-        groups.append({"params": queries,    "lr": args.lr * query_mult,
-                       "name": "pathology_queries"})
+        groups.append({"params": queries,    "lr": args.lr * query_mult, "name": "pathology_queries"})
     if correction:
-        groups.append({"params": correction, "lr": args.lr * corr_mult,
-                       "name": "correction_head"})
+        groups.append({"params": correction, "lr": args.lr * corr_mult, "name": "correction_head"})
     if rest:
-        groups.append({"params": rest,       "lr": args.lr,
-                       "name": "rest"})
+        groups.append({"params": rest,       "lr": args.lr, "name": "rest"})
     return groups
 
 
@@ -121,19 +119,9 @@ def _make_scheduler(optimizer, total_steps: int, args):
     """Linear warmup (0 → base lr) → cosine anneal (base lr → base lr × min_lr_ratio)."""
     warmup = max(int(args.warmup_steps), 1)
     cosine_steps = max(int(total_steps) - warmup, 1)
-    # LinearLR: start_factor부터 시작해서 warmup 스텝에 걸쳐 end_factor=1.0(=base lr)로 이동.
-    # start_factor를 0으로 두면 첫 스텝 lr=0이라 unstable → 아주 작은 값으로 시작.
-    warmup_sched = LinearLR(optimizer,
-                             start_factor=1e-4, end_factor=1.0,
-                             total_iters=warmup)
-    # CosineAnnealingLR eta_min은 param group마다 동일한 절대값이지만,
-    # 각 group의 base lr에서 eta_min까지 스무스하게 감소하므로 실용상 무방.
-    cosine_sched = CosineAnnealingLR(optimizer,
-                                      T_max=cosine_steps,
-                                      eta_min=args.lr * args.min_lr_ratio)
-    return SequentialLR(optimizer,
-                         schedulers=[warmup_sched, cosine_sched],
-                         milestones=[warmup])
+    warmup_sched = LinearLR(optimizer, start_factor=1e-4, end_factor=1.0, total_iters=warmup)
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=args.lr * args.min_lr_ratio)
+    return SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup])
 
 
 def _steps_per_epoch(train_loader, args) -> int:
@@ -172,6 +160,53 @@ def _wandb_finish(wb):
     if wb is None:
         return
     wb.finish()
+
+
+# =============================================================================
+# Linear Probing helpers (correction-only mode)
+# =============================================================================
+def _apply_lp_setup(teacher_unwrapped, ckpt_path: str, correction_dropout: float,
+                    logger=print):
+    """LP 진입 시 1회 호출.
+        1) best ckpt 를 로드 (strict=True — 아키텍처 mismatch 는 명시적 에러).
+        2) 모든 파라미터 freeze → correction_head + beta 만 unfreeze.
+        3) correction_head 내부 nn.Dropout.p 를 correction_dropout 으로 override (>0 일 때).
+    반환: (unfrozen_names, dropout_reset_count).
+    """
+    if not ckpt_path:
+        raise ValueError("--lp_only_correction 요구: --lp_ckpt <path> 를 지정해 주세요.")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"--lp_ckpt not found: {ckpt_path}")
+
+    state = torch.load(ckpt_path, map_location="cpu")
+    if "model" not in state:
+        raise KeyError(f"ckpt 에 'model' key 가 없음: {ckpt_path}")
+    teacher_unwrapped.load_state_dict(state["model"], strict=True)
+    logger(f"[teacher LP] loaded ckpt from {ckpt_path}  (saved epoch={state.get('epoch','?')}, "
+           f"metric={state.get('metric','?')})")
+
+    per = teacher_unwrapped.perceiver
+    if not hasattr(per, "correction_head") or not hasattr(per, "beta"):
+        raise RuntimeError("LP 는 residual fusion (correction_head + beta) 구조 전제. "
+                           f"perceiver={type(per).__name__} 에 필요 attr 없음.")
+
+    for p in teacher_unwrapped.parameters():
+        p.requires_grad = False
+
+    unfrozen = []
+    for name, p in per.correction_head.named_parameters():
+        p.requires_grad = True
+        unfrozen.append(f"perceiver.correction_head.{name}")
+    per.beta.requires_grad = True
+    unfrozen.append("perceiver.beta")
+
+    n_dropout = 0
+    if correction_dropout > 0.0:
+        for m in per.correction_head.modules():
+            if isinstance(m, nn.Dropout):
+                m.p = float(correction_dropout)
+                n_dropout += 1
+    return unfrozen, n_dropout
 
 
 # =============================================================================
@@ -317,6 +352,23 @@ def train_teacher(args):
                                              if is_dual_pathology else None))
     teacher.to(device)
 
+    # ─── Correction-only Linear Probing setup (dual_patch 전용) ────────────
+    # best ckpt 로드 → correction_head + beta 만 unfreeze → correction_head dropout override.
+    # 이후 param_groups 는 이 requires_grad 상태를 기준으로 build 됨.
+    if args.lp_only_correction:
+        if not is_patch_dual_pathology:
+            raise ValueError("--lp_only_correction 은 --perceiver_type dual_patch 에서만 지원됩니다. "
+                             f"현재 perceiver_type={args.perceiver_type!r}")
+        unfrozen, n_dropout_reset = _apply_lp_setup(
+            teacher, args.lp_ckpt, args.lp_correction_dropout,
+            logger=accelerator.print,
+        )
+        accelerator.print(f"[teacher LP] unfrozen params ({len(unfrozen)}): {unfrozen}")
+        accelerator.print(f"[teacher LP] correction_head dropout override "
+                          f"→ p={args.lp_correction_dropout}  (updated {n_dropout_reset} module(s))")
+        accelerator.print(f"[teacher LP] regularizers: beta_l2={args.lp_beta_l2}  "
+                          f"corr_l2={args.lp_corr_l2}")
+
     # Trainable parameter 수 출력
     n_total = sum(p.numel() for p in teacher.parameters())
     n_trainable = sum(p.numel() for p in teacher.parameters() if p.requires_grad)
@@ -400,7 +452,11 @@ def train_teacher(args):
         running_fus  = 0.0
         n = 0
         for step, batch in enumerate(pbar):
-            if uses_dual_loss:
+            if uses_dual_loss and args.lp_only_correction:
+                out = train_teacher_dual_pathology_lp_batch(
+                    batch, teacher, dual_loss_fn, optimizer, device, accelerator,
+                    beta_l2=args.lp_beta_l2, corr_l2=args.lp_corr_l2)
+            elif uses_dual_loss:
                 out = train_teacher_dual_pathology_batch(
                     batch, teacher, dual_loss_fn, optimizer, device, accelerator)
             elif is_pathology:
@@ -445,6 +501,18 @@ def train_teacher(args):
                     log["train/img_loss"] = avg_img
                     log["train/ts_loss"]  = avg_ts
                     log["train/fus_loss"] = avg_fus
+                    # LP regularizer 계측 (마지막 batch 값 그대로 — 스무딩 없이 최신치를 보여 β/correction magnitude 변화 감지)
+                    if args.lp_only_correction:
+                        reg_b = float(out.get("reg_beta_l2", 0.0))
+                        reg_c = float(out.get("reg_corr_l2", 0.0))
+                        parts.append(f"reg_β={reg_b:.4f}")
+                        parts.append(f"reg_c={reg_c:.4f}")
+                        log["train/lp_reg_beta_l2"] = reg_b
+                        log["train/lp_reg_corr_l2"] = reg_c
+                        unwrapped = accelerator.unwrap_model(teacher)
+                        beta_vec = unwrapped.perceiver.beta.detach().float().cpu()
+                        log["train/lp_beta_mean_abs"] = float(beta_vec.abs().mean())
+                        log["train/lp_beta_max_abs"]  = float(beta_vec.abs().max())
                 elif is_pathology:
                     avg_s2 = float(running_s2 / max(n, 1))
                     avg_s4 = float(running_s4 / max(n, 1))
