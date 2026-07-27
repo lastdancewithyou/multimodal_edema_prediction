@@ -6,7 +6,13 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch \
   main_train_teacher_duett.py \
   --eval_train_batches 100 \
   --perceiver_type dual_patch \
-  --freeze_duett
+  --freeze_duett \
+  --aux_img_alpha 0.2 \
+  --aux_ts_alpha 0.1 \d
+  --aux_fus_alpha 1.0 \
+  --query_lr_mult 0.5 \
+  --correction_lr_mult 3.0
+
 
   # --wandb_disabled \
   # --aug_noise 0.05 --aug_mask 0.15 \

@@ -52,8 +52,8 @@ def _attach_meta_path(args: argparse.Namespace) -> argparse.Namespace:
 def _add_common(p: argparse.ArgumentParser):
 
     # wandb
-    p.add_argument("--wandb_project",  type=str, default="duett-kd")
-    p.add_argument("--wandb_run_name", type=str, default="[Teacher] Shared Pathology Query", help="비우면 stage명(teacher/student) 사용")
+    p.add_argument("--wandb_project",  type=str, default="Teacher Modal Upgrade")
+    p.add_argument("--wandb_run_name", type=str, default="[Teacher] Residual TS-2", help="비우면 stage명(teacher/student) 사용")
     p.add_argument("--wandb_disabled", action="store_true")
 
 
@@ -91,6 +91,18 @@ def _add_common(p: argparse.ArgumentParser):
                    help="head/perceiver/proj 등 신규 파라미터의 base lr")
     p.add_argument("--backbone_lr_mult", type=float, default=0.2,
                    help="pretrained backbone(DuETT/CXR) lr = args.lr × 이 값")
+    p.add_argument("--correction_lr_mult", type=float, default=5.0,
+                   help="dual_patch residual mode: correction_head lr = args.lr × 이 값. "
+                        "correction_head 는 늦게 살아나야 하므로 base lr 보다 크게.")
+    p.add_argument("--query_lr_mult",   type=float, default=0.2,
+                   help="dual_patch residual mode: shared pathology_queries lr = args.lr × 이 값. "
+                        "queries 는 image/ts branches 와 attention 공유하므로 천천히 이동.")
+
+    # Gradient flow diagnostics (dual_patch 전용)
+    p.add_argument("--grad_diag_every", type=int, default=3,
+                   help="dual_patch: N epoch 마다 gradient flow 진단 실행. 0 이면 비활성.")
+    p.add_argument("--grad_diag_batches", type=int, default=8,
+                   help="grad_diag 시 사용할 batch 수 (train_eval_loader 또는 val_loader 앞쪽).")
     p.add_argument("--weight_decay",   type=float, default=5e-2)
     p.add_argument("--batch_size",     type=int, default=128)
     p.add_argument("--num_workers",    type=int, default=8)

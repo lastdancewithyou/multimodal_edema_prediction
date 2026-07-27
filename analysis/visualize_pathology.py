@@ -41,13 +41,17 @@ from training_duett.engine import _move_lists
 from training_duett.evaluator import (evaluate_pathology, format_pathology_gap_table,
                                         evaluate_dual_pathology, format_dual_pathology_gap_table)
 from models.main_architecture_duett import (
-    CXREncoder, DualPathologyPerceiver, PatchDualPathologyPerceiver,
+    CXREncoder, PatchDualPathologyPerceiver,
     TeacherModel, load_duett_backbone,
 )
 try:
     from models.main_architecture_duett import PathologyPerceiver
 except ImportError:
     PathologyPerceiver = None
+try:
+    from models.main_architecture_duett import DualPathologyPerceiver
+except ImportError:
+    DualPathologyPerceiver = None
 
 
 # =============================================================================
@@ -130,6 +134,9 @@ def load_teacher(ckpt_path: str, device):
     cxr_enc = CXREncoder(model_name=args.cxr_model_name, freeze=True, return_patches=True)
 
     if mode == "dual":
+        if DualPathologyPerceiver is None:
+            raise ImportError("DualPathologyPerceiver 가 models/main_architecture_duett.py 에서 "
+                              "주석 처리되어 있음. dual 모드 ckpt 를 쓰려면 un-comment 필요.")
         perceiver = DualPathologyPerceiver(
             n_pathologies=len(pathology_labels),
             d_ts=backbone.d_representation,

@@ -25,7 +25,7 @@ from .evaluator import (evaluate_binary, make_teacher_forward,
 
 from models.main_architecture_duett import (
     DuettFeatureExtractor, load_duett_backbone,
-    CXREncoder, DualPathologyPerceiver, PatchDualPathologyPerceiver,
+    CXREncoder, PatchDualPathologyPerceiver,
     TeacherModel, StudentModel,
 )
 # Legacy 클래스들은 사용자가 주석 처리할 수 있음 — soft import (없으면 해당 mode 사용 시 명확 에러)
@@ -37,6 +37,10 @@ try:
     from models.main_architecture_duett import PathologyPerceiver
 except ImportError:
     PathologyPerceiver = None
+try:
+    from models.main_architecture_duett import DualPathologyPerceiver
+except ImportError:
+    DualPathologyPerceiver = None
 from loss.losses_duett import StudentKDLoss, PathologyMultiLabelLoss, DualPathologyLoss
 
 warnings.filterwarnings("ignore", message=r".*weights_only.*")
@@ -70,26 +74,46 @@ def _save_ckpt(path, model, optimizer, epoch, metric, args):
 # Differential LR + Warmup/Cosine scheduler
 # =============================================================================
 def _make_param_groups(model, args):
-    """Backbone(DuETT/CXR)에 낮은 lr, 신규 초기화 부분(head/perceiver/proj)에 base lr.
+    """LR groups (dual_patch residual mode 대응):
 
-    Backbone은 pretrained라 미세조정, 나머지는 처음부터 학습이므로 학습 강도 차별화.
+        backbone(DuETT / CXR)           : args.lr × backbone_lr_mult (기본 0.2)
+        pathology_queries (shared query): args.lr × query_lr_mult    (기본 0.2)
+        correction_head                 : args.lr × correction_lr_mult (기본 5.0)
+        rest (head/perceiver/proj/...)  : args.lr
+
+    query 는 image/ts branch 가 공유하므로 급격히 흔들리면 두 branch 모두 손상 → 낮은 LR.
+    correction_head 는 zero-init 라 초기에 gradient 신호가 미미 → 높은 LR 로 빠르게 살림.
     """
     backbone_prefixes = ("duett.", "cxr.")
-    backbone, head_ish = [], []
+    backbone, correction, queries, rest = [], [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         if name.startswith(backbone_prefixes):
             backbone.append(p)
+        elif "correction_head" in name:
+            correction.append(p)
+        elif name.endswith("pathology_queries"):
+            queries.append(p)
         else:
-            head_ish.append(p)
+            rest.append(p)
+
+    corr_mult  = float(getattr(args, "correction_lr_mult", 5.0))
+    query_mult = float(getattr(args, "query_lr_mult", 0.2))
+
     groups = []
     if backbone:
-        groups.append({"params": backbone,  "lr": args.lr * args.backbone_lr_mult,
+        groups.append({"params": backbone,   "lr": args.lr * args.backbone_lr_mult,
                        "name": "backbone"})
-    if head_ish:
-        groups.append({"params": head_ish, "lr": args.lr,
-                       "name": "head_perceiver_proj"})
+    if queries:
+        groups.append({"params": queries,    "lr": args.lr * query_mult,
+                       "name": "pathology_queries"})
+    if correction:
+        groups.append({"params": correction, "lr": args.lr * corr_mult,
+                       "name": "correction_head"})
+    if rest:
+        groups.append({"params": rest,       "lr": args.lr,
+                       "name": "rest"})
     return groups
 
 
@@ -155,8 +179,7 @@ def _wandb_finish(wb):
 # =============================================================================
 def train_teacher(args):
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(mixed_precision=args.mixed_precision,
-                              kwargs_handlers=[ddp_kwargs])
+    accelerator = Accelerator(mixed_precision=args.mixed_precision, kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
     accelerator.print(f"[teacher] device={device}  procs={accelerator.num_processes}")
 
@@ -230,6 +253,9 @@ def train_teacher(args):
                           return_patches=cxr_return_patches)
 
     if is_dual_pathology:
+        if DualPathologyPerceiver is None:
+            raise ImportError("DualPathologyPerceiver is commented out in models/main_architecture_duett.py. "
+                              "Un-comment the class to use --perceiver_type dual.")
         perceiver = DualPathologyPerceiver(
             n_pathologies=len(pathology_labels_tuple),
             d_ts=backbone.d_representation,
@@ -347,6 +373,16 @@ def train_teacher(args):
     if train_eval_loader is not None:
         train_eval_loader = accelerator.prepare(train_eval_loader)
 
+    # dual_patch residual: 학습 시작 시점의 shared query 스냅샷 (query_cos_to_init 계산용).
+    # optimizer.step() 호출 전에 detach().clone() 로 고정.
+    query_ref = None
+    if is_patch_dual_pathology:
+        _per = accelerator.unwrap_model(teacher).perceiver
+        if hasattr(_per, "pathology_queries"):
+            query_ref = _per.pathology_queries.detach().float().clone()
+            accelerator.print(f"[teacher] query_ref snapshot: shape={tuple(query_ref.shape)} "
+                              f"norm={float(query_ref.norm(dim=-1).mean()):.4f}")
+
     wb = _wandb_init(args, accelerator, stage="teacher")
 
     best_auroc = -1.0
@@ -429,7 +465,8 @@ def train_teacher(args):
         # ─── Validation ────────────────────────────────────────────────
         improved = False
         if uses_dual_loss:
-            val_p = evaluate_dual_pathology(teacher, val_loader, device, pathology_labels_tuple)
+            val_p = evaluate_dual_pathology(teacher, val_loader, device, pathology_labels_tuple,
+                                             query_ref=query_ref)
             val_m = {"auroc": val_p["main_auroc"], "auprc": val_p["main_auprc"], "n": val_p["n"]}
             if accelerator.is_main_process:
                 print(f"[teacher ep{epoch}] main(Edema fusion) "
@@ -518,7 +555,8 @@ def train_teacher(args):
         # ─── Train-set evaluation (overfit 진단용) ─────────────────────
         if train_eval_loader is not None:
             if uses_dual_loss:
-                train_p = evaluate_dual_pathology(teacher, train_eval_loader, device, pathology_labels_tuple)
+                train_p = evaluate_dual_pathology(teacher, train_eval_loader, device, pathology_labels_tuple,
+                                                   query_ref=query_ref)
                 if accelerator.is_main_process:
                     print(f"[teacher ep{epoch}] TRAIN main(Edema fusion) "
                           f"AUROC={train_p['main_auroc']:.4f} AUPRC={train_p['main_auprc']:.4f} "
@@ -574,6 +612,29 @@ def train_teacher(args):
                         "train_eval/main_gap_over_val": train_m["auroc"] - val_m["auroc"],
                     }, step=global_step)
 
+        # ─── Gradient flow diagnostics (dual_patch, 3 epoch 마다, main rank only) ──
+        if (is_patch_dual_pathology and dual_loss_fn is not None
+                and accelerator.is_main_process
+                and args.grad_diag_every > 0
+                and (epoch % args.grad_diag_every == 0)):
+            try:
+                from analysis.grad_flow_diagnostics import (
+                    run_dual_gradient_diagnostics, format_gradient_diagnostics,
+                    gradient_diagnostics_to_log_dict,
+                )
+                diag_loader = train_eval_loader if train_eval_loader is not None else val_loader
+                accelerator.print(f"[teacher ep{epoch}] running gradient flow diagnostics "
+                                  f"(max_batches={args.grad_diag_batches})")
+                grad_report = run_dual_gradient_diagnostics(
+                    accelerator.unwrap_model(teacher), diag_loader, dual_loss_fn, device,
+                    max_batches=args.grad_diag_batches,
+                    label_names=list(pathology_labels_tuple),
+                )
+                print(format_gradient_diagnostics(grad_report))
+                _wandb_log(wb, gradient_diagnostics_to_log_dict(grad_report), step=global_step)
+            except Exception as exc:  # 진단은 학습에 영향 없어야 함
+                accelerator.print(f"[teacher] grad_diag skipped: {exc}")
+
         # Early stopping (모든 rank에서 동일하게 판단해야 hang 안 남)
         improved_t = torch.tensor(int(improved), device=device)
         if accelerator.num_processes > 1:
@@ -590,7 +651,8 @@ def train_teacher(args):
         state = torch.load(best_ckpt, map_location=device)
         accelerator.unwrap_model(teacher).load_state_dict(state["model"])
     if uses_dual_loss:
-        test_p = evaluate_dual_pathology(teacher, test_loader, device, pathology_labels_tuple)
+        test_p = evaluate_dual_pathology(teacher, test_loader, device, pathology_labels_tuple,
+                                          query_ref=query_ref)
         if accelerator.is_main_process:
             print(f"[teacher] test main(Edema fusion) AUROC={test_p['main_auroc']:.4f}  "
                   f"AUPRC={test_p['main_auprc']:.4f}")

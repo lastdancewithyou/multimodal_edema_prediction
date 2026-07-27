@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 
@@ -171,22 +172,50 @@ def format_pathology_gap_table(result: dict) -> str:
 # =============================================================================
 # Dual pathology mode evaluation (3-branch: image / ts / fusion per pathology)
 # =============================================================================
+def _bce_per_sample(logits: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Numerically-stable element-wise BCE: max(l,0) - l*y + log(1+exp(-|l|))."""
+    return np.maximum(logits, 0) - logits * y + np.log1p(np.exp(-np.abs(logits)))
+
+
+def _pearson(a: np.ndarray, b: np.ndarray) -> float:
+    """Population Pearson correlation. NaN if either has zero variance."""
+    if a.size < 2:
+        return float("nan")
+    va = a.std()
+    vb = b.std()
+    if va == 0 or vb == 0:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
 @torch.no_grad()
-def evaluate_dual_pathology(model, loader, device, pathology_labels: tuple[str, ...]) -> dict:
-    """DualPathologyPerceiver teacher 평가.
+def evaluate_dual_pathology(model, loader, device, pathology_labels: tuple[str, ...],
+                             *, query_ref: torch.Tensor | None = None) -> dict:
+    """DualPathologyPerceiver / PatchDualPathologyPerceiver teacher 평가.
 
-    loader 전체에서 img_logits/ts_logits/fusion_logits 및 multi-label을 모아
-    pathology 마다 valid mask 적용해 AUROC/AUPRC + gap 계산.
+    loader 전체에서 img_logits/ts_logits/fusion_logits + (residual mode 시)
+    scaled_correction 을 모아 pathology 마다 valid mask 적용해 지표 계산.
 
-    gap_i2f = fusion_auroc - img_auroc  (fusion이 image-only 이겼나)
-    gap_t2f = fusion_auroc - ts_auroc   (fusion이 ts-only 이겼나)
+    지표:
+        - AUROC / AUPRC (per branch: img, ts, fus) + gain (fus - img)
+        - BCE  (per branch) + delta_BCE = fus_BCE - img_BCE
+        - mean_abs_correction : |scaled_correction| 의 sample-mean (residual mode 만)
+        - correction_residual_corr : Pearson(scaled_correction, y - sigmoid(img_logit))
+        - beta[k] : perceiver.beta 파라미터 값
+        - query_cos[k] : cos(current pathology_queries[k], query_ref[k])
 
-    main_auroc = per_label[0]["fus_auroc"]  (Edema fusion)   ← best ckpt 선정 기준
+    main_auroc = per_label[0]["fus_auroc"]  (index 0 label의 fusion AUROC).
+
+    Parameters
+    ----------
+    query_ref : Optional[Tensor of shape [K, D]]
+        학습 시작 시점의 pathology_queries 스냅샷. 없으면 query_cos 는 NaN.
     """
     from .engine import _move_lists
 
     model.eval()
-    img_all, ts_all, fus_all, y_all, mask_all = [], [], [], [], []
+    img_all, ts_all, fus_all, y_all, mask_all, corr_all = [], [], [], [], [], []
+    has_correction = None
     for batch in loader:
         b = _move_lists(batch, device)
         out = model(b["x_ts"], b["x_static"], b["bin_ends"], b["pixel_values"])
@@ -197,52 +226,123 @@ def evaluate_dual_pathology(model, loader, device, pathology_labels: tuple[str, 
         fus_all.append(out["fusion_logits"].cpu())
         y_all.append(b["y_multi"].cpu())
         mask_all.append(b["y_multi_mask"].cpu())
+        if has_correction is None:
+            has_correction = "scaled_correction" in out
+        if has_correction:
+            corr_all.append(out["scaled_correction"].cpu())
 
     img = torch.cat(img_all).float().numpy()
     ts  = torch.cat(ts_all).float().numpy()
     fus = torch.cat(fus_all).float().numpy()
     y   = torch.cat(y_all).float().numpy()
     mk  = torch.cat(mask_all).float().numpy()
+    corr = torch.cat(corr_all).float().numpy() if has_correction else None
+
+    # perceiver 에서 beta / current query 추출 (available 하면)
+    unwrapped = model.module if hasattr(model, "module") else model
+    perceiver = getattr(unwrapped, "perceiver", None)
+    beta_vec = None
+    if perceiver is not None and hasattr(perceiver, "beta"):
+        beta_vec = perceiver.beta.detach().float().cpu().numpy()
+    query_cos_vec = None
+    if (query_ref is not None and perceiver is not None
+            and hasattr(perceiver, "pathology_queries")):
+        cur = perceiver.pathology_queries.detach().float()
+        ref = query_ref.detach().float().to(cur.device)
+        if cur.shape == ref.shape:
+            query_cos_vec = F.cosine_similarity(cur, ref, dim=-1).cpu().numpy()
 
     K = len(pathology_labels)
     per_label = []
     for k in range(K):
         m = mk[:, k].astype(bool)
         yk = y[m, k]
-        pi = 1.0 / (1.0 + np.exp(-img[m, k]))
-        pt = 1.0 / (1.0 + np.exp(-ts[m, k]))
-        pf = 1.0 / (1.0 + np.exp(-fus[m, k]))
+        li, lt, lf = img[m, k], ts[m, k], fus[m, k]
+        pi = 1.0 / (1.0 + np.exp(-li))
+        pt = 1.0 / (1.0 + np.exp(-lt))
+        pf = 1.0 / (1.0 + np.exp(-lf))
         ai, at, af = _safe(roc_auc_score, yk, pi), _safe(roc_auc_score, yk, pt), _safe(roc_auc_score, yk, pf)
         ri, rt, rf = _safe(average_precision_score, yk, pi), _safe(average_precision_score, yk, pt), _safe(average_precision_score, yk, pf)
+
+        # BCE per branch (mean over valid samples)
+        img_bce = float(_bce_per_sample(li, yk).mean()) if yk.size else float("nan")
+        ts_bce  = float(_bce_per_sample(lt, yk).mean()) if yk.size else float("nan")
+        fus_bce = float(_bce_per_sample(lf, yk).mean()) if yk.size else float("nan")
+
+        # residual mode 전용 지표
+        if corr is not None and yk.size:
+            ck = corr[m, k]
+            mean_abs_corr = float(np.abs(ck).mean())
+            corr_r = _pearson(ck, yk - pi)
+        else:
+            mean_abs_corr = float("nan")
+            corr_r = float("nan")
+
+        beta_k     = float(beta_vec[k])      if beta_vec      is not None else float("nan")
+        q_cos_k    = float(query_cos_vec[k]) if query_cos_vec is not None else float("nan")
+
         per_label.append({
-            "name":       pathology_labels[k],
-            "n_valid":    int(m.sum()),
-            "pos_frac":   float(yk.mean()) if len(yk) else float("nan"),
-            "img_auroc":  ai, "ts_auroc":  at, "fus_auroc":  af,
-            "gap_i2f":    af - ai,  "gap_t2f": af - at,
-            "img_auprc":  ri, "ts_auprc":  rt, "fus_auprc":  rf,
-            "gap_i2f_pr": rf - ri,  "gap_t2f_pr": rf - rt,
+            "name":         pathology_labels[k],
+            "n_valid":      int(m.sum()),
+            "pos_frac":     float(yk.mean()) if len(yk) else float("nan"),
+            "img_auroc":    ai, "ts_auroc":  at, "fus_auroc":  af,
+            "gap_i2f":      af - ai,  "gap_t2f": af - at,
+            "img_auprc":    ri, "ts_auprc":  rt, "fus_auprc":  rf,
+            "gap_i2f_pr":   rf - ri,  "gap_t2f_pr": rf - rt,
+            "img_bce":      img_bce,
+            "ts_bce":       ts_bce,
+            "fus_bce":      fus_bce,
+            "delta_bce":    fus_bce - img_bce,        # 음수면 fusion 개선
+            "mean_abs_corr": mean_abs_corr,           # residual 사용량
+            "corr_residual": corr_r,                  # 방향성 (양수=오류 수정 방향)
+            "beta":         beta_k,
+            "query_cos":    q_cos_k,
         })
 
     return {
         "labels":     list(pathology_labels),
         "n":          int(len(y)),
-        "main_auroc": per_label[0]["fus_auroc"],   # Edema fusion = main task
+        "main_auroc": per_label[0]["fus_auroc"],
         "main_auprc": per_label[0]["fus_auprc"],
         "per_label":  per_label,
     }
 
 
+def _fmt(v, spec="7.3f"):
+    """NaN-safe formatter — returns '--' for NaN."""
+    import math
+    width = spec.split(".")[0].lstrip("+")
+    try:
+        if math.isnan(float(v)):
+            return f"{'--':>{width}s}"
+    except (TypeError, ValueError):
+        return f"{'--':>{width}s}"
+    return f"{v:{spec}}"
+
+
 def format_dual_pathology_gap_table(result: dict) -> str:
-    """3-way 성능표: img / ts / fusion AUROC · AUPRC."""
-    header = (f"{'label':<22s} {'n':>6s} {'pos':>7s} "
-              f"{'img_roc':>8s} {'ts_roc':>8s} {'fus_roc':>8s}  "
-              f"{'img_prc':>8s} {'ts_prc':>8s} {'fus_prc':>8s}")
-    lines = [header]
+    """Residual fusion 종합 지표 표.
+
+    label  imgROC  tsROC  fusROC  gain   imgPR  fusPR  dBCE  |corr|  corr_r  beta  q_cos
+    """
+    header = (
+        f"{'label':<12s} "
+        f"{'imgROC':>7s} {'tsROC':>7s} {'fusROC':>7s} {'gain':>7s}  "
+        f"{'imgPR':>6s} {'fusPR':>6s}  "
+        f"{'dBCE':>7s}  "
+        f"{'|corr|':>7s} {'corr_r':>7s}  "
+        f"{'beta':>6s} {'q_cos':>6s}"
+    )
+    lines = [header, "-" * len(header)]
     for r in result["per_label"]:
+        short = r["name"].replace("label_", "")
         lines.append(
-            f"{r['name']:<22s} {r['n_valid']:>6d} {r['pos_frac']:>7.4f} "
-            f"{r['img_auroc']:>8.4f} {r['ts_auroc']:>8.4f} {r['fus_auroc']:>8.4f}  "
-            f"{r['img_auprc']:>8.4f} {r['ts_auprc']:>8.4f} {r['fus_auprc']:>8.4f}"
+            f"{short:<12s} "
+            f"{_fmt(r['img_auroc'], '7.3f')} {_fmt(r['ts_auroc'], '7.3f')} "
+            f"{_fmt(r['fus_auroc'], '7.3f')} {_fmt(r['gap_i2f'], '+7.3f')}  "
+            f"{_fmt(r['img_auprc'], '6.3f')} {_fmt(r['fus_auprc'], '6.3f')}  "
+            f"{_fmt(r['delta_bce'], '+7.4f')}  "
+            f"{_fmt(r['mean_abs_corr'], '7.4f')} {_fmt(r['corr_residual'], '+7.3f')}  "
+            f"{_fmt(r['beta'], '6.3f')} {_fmt(r['query_cos'], '6.3f')}"
         )
     return "\n".join(lines)

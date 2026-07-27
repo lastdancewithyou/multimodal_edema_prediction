@@ -412,12 +412,13 @@ class PatchDualPathologyPerceiver(nn.Module):
             n_heads: int = 4,
             dropout: float = 0.1,
             head_hidden: int = 64,
-            head_dropout: float = 0.1
+            head_dropout: float = 0.1,
+            beta_init: float = 1.0,   # per-pathology correction scale의 초기값
         ):
         super().__init__()
         self.n_pathologies = n_pathologies
         self.d_latent = d_latent
-        
+
         # self.image_queries    = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
         # self.temporal_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
 
@@ -429,12 +430,14 @@ class PatchDualPathologyPerceiver(nn.Module):
         self.ts_cross  = _PerceiverBlock(d_latent, n_heads, dropout)
         self.ts_self   = _PerceiverBlock(d_latent, n_heads, dropout)
 
-        self.fusion = nn.Sequential(
-            nn.Linear(2 * d_latent, 4 * d_latent),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(4 * d_latent, d_latent),
-        )
+        # ── OLD: concat MLP fusion (실험 위해 잠시 주석)
+        # self.fusion = nn.Sequential(
+        #     nn.Linear(2 * d_latent, 4 * d_latent),
+        #     nn.GELU(),
+        #     nn.Dropout(dropout),
+        #     nn.Linear(4 * d_latent, d_latent),
+        # )
+
         def _mk_head(): # logit 출력기
             return nn.Sequential(
                 nn.Linear(d_latent, head_hidden), nn.GELU(), nn.Dropout(head_dropout),
@@ -449,12 +452,29 @@ class PatchDualPathologyPerceiver(nn.Module):
         # 모달리티별 공통된 헤드로 질병을 분류하도록 테스트함.
         self.image_head = _mk_head()
         self.temporal_head = _mk_head()
-        self.fusion_head = _mk_head()
+        # self.fusion_head = _mk_head()   # ── OLD: fusion_head 대신 correction_head 사용
 
-        # Prevalence 차이를 허용하기 위해 
+        # ── NEW: residual fusion — image logit을 anchor 로, TS 는 correction 만 담당.
+        # fusion_logits = img_logits.detach() + beta * correction_head(T_tok)
+        # detach 로 fusion loss 가 image branch 로 흘러 shortcut 학습되는 걸 차단.
+        # image branch 는 image_head + auxiliary L_img 로 별도 학습됨.
+        self.correction_head = nn.Sequential(
+            nn.LayerNorm(d_latent),
+            nn.Linear(d_latent, head_hidden),
+            nn.GELU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(head_hidden, 1, bias=False),
+        )
+        # 마지막 Linear zero-init → 초기 correction ≡ 0 → fusion == image-only 성능에서 출발.
+        nn.init.zeros_(self.correction_head[-1].weight)
+
+        # pathology 별 learnable scale. beta_init 을 0 에 가깝게 두어 초반 correction 영향 최소화.
+        self.beta = nn.Parameter(torch.ones(n_pathologies))
+
+        # Prevalence 차이를 허용하기 위해
         self.image_label_bias = nn.Parameter(torch.zeros(n_pathologies))
         self.temporal_label_bias = nn.Parameter(torch.zeros(n_pathologies))
-        self.fusion_label_bias = nn.Parameter(torch.zeros(n_pathologies))
+        # self.fusion_label_bias = nn.Parameter(torch.zeros(n_pathologies))   # image_label_bias 를 상속
 
     def forward(self, ts_tokens, img_patches_proj, return_attn=False, ts_ablation="hourly_only"):
         B = ts_tokens.size(0)
@@ -479,106 +499,123 @@ class PatchDualPathologyPerceiver(nn.Module):
         T_tok, ts_attn = (self.ts_cross(ts_q, ts_kv, return_attn=True)
                           if return_attn else (self.ts_cross(ts_q, ts_kv), None))
         T_tok = self.ts_self(T_tok, T_tok)
-        F_tok = self.fusion(torch.cat([I, T_tok], dim=-1))
+        # F_tok = self.fusion(torch.cat([I, T_tok], dim=-1))   # ── OLD: concat MLP fusion
         # img_logits    = torch.stack([h(I[:, k]).squeeze(-1)     for k, h in enumerate(self.image_heads)],    dim=1)
         # ts_logits     = torch.stack([h(T_tok[:, k]).squeeze(-1) for k, h in enumerate(self.temporal_heads)], dim=1)
         # fusion_logits = torch.stack([h(F_tok[:, k]).squeeze(-1) for k, h in enumerate(self.fusion_heads)],   dim=1)
 
         # [B, K, d] → [B, K, 1] → [B, K]
         img_logits    = self.image_head(I).squeeze(-1) + self.image_label_bias.unsqueeze(0) # Prevalence Bias
-        ts_logits     = self.temporal_head(T_tok).squeeze(-1) + self.temporal_label_bias.unsqueeze(0) 
-        fusion_logits = self.fusion_head(F_tok).squeeze(-1) + self.fusion_label_bias.unsqueeze(0) 
+        ts_logits     = self.temporal_head(T_tok).squeeze(-1) + self.temporal_label_bias.unsqueeze(0)
+        # fusion_logits = self.fusion_head(F_tok).squeeze(-1) + self.fusion_label_bias.unsqueeze(0)  # ── OLD
 
-        out = {"img_logits": img_logits, "ts_logits": ts_logits, "fusion_logits": fusion_logits,
-               "img_tokens": I, "ts_tokens": T_tok, "fusion_tokens": F_tok}
+        # ── NEW: residual fusion. image logit 을 anchor, TS 는 correction 만 담당.
+        # detach → fusion loss 가 image branch 를 통해 학습되는 shortcut 을 차단.
+        # correction_head 마지막 Linear zero-init → 초기 fusion == image-only.
+        ts_correction     = self.correction_head(T_tok).squeeze(-1)          # [B, K]  raw
+        scaled_correction = self.beta.unsqueeze(0) * ts_correction           # [B, K]  β·raw
+        fusion_logits     = img_logits.detach() + scaled_correction          # [B, K]
+
+        # residual 모드에서는 token 레벨의 "fusion 표현" 이 없음. downstream (viz Fig4 등)
+        # 호환을 위해 T_tok 을 fusion_tokens placeholder 로 노출 (ts panel 과 동일).
+        out = {
+            "img_logits":        img_logits,
+            "ts_logits":         ts_logits,
+            "fusion_logits":     fusion_logits,
+            "img_tokens":        I,
+            "ts_tokens":         T_tok,
+            "fusion_tokens":     T_tok,
+            "ts_correction":     ts_correction,
+            "scaled_correction": scaled_correction,
+        }
         if return_attn: out["img_attn"] = img_attn; out["ts_attn"] = ts_attn
         return out
 
 
 # ─── NEW: Pathology-wise residual fusion ─────────────────────────────────────
-class DualPathologyPerceiver(nn.Module):
-    """Image branch = frozen pretrained CXR head (TeacherModel에서 계산되어 4개 logit으로 주입).
-    Temporal branch = pathology query × ts_tokens (cross-attn) + self-attn → per-pathology 벡터.
-    Fusion = pathology별 residual: fusion_logit[k] = img_logit[k] + residual_head_k(T[:, k]).
+# class DualPathologyPerceiver(nn.Module):
+#     """Image branch = frozen pretrained CXR head (TeacherModel에서 계산되어 4개 logit으로 주입).
+#     Temporal branch = pathology query × ts_tokens (cross-attn) + self-attn → per-pathology 벡터.
+#     Fusion = pathology별 residual: fusion_logit[k] = img_logit[k] + residual_head_k(T[:, k]).
 
-    240k CXR로 pretrain된 image branch에 temporal이 "보정치"만 더하는 구조.
-    """
+#     240k CXR로 pretrain된 image branch에 temporal이 "보정치"만 더하는 구조.
+#     """
 
-    def __init__(self,
-                 n_pathologies: int,
-                 d_ts: int,
-                 d_latent: int = 256,
-                 n_heads: int = 4,
-                 dropout: float = 0.1,
-                 head_hidden: int = 64,
-                 head_dropout: float = 0.1):
-        super().__init__()
-        self.n_pathologies = n_pathologies
-        self.d_latent = d_latent
+#     def __init__(self,
+#                  n_pathologies: int,
+#                  d_ts: int,
+#                  d_latent: int = 256,
+#                  n_heads: int = 4,
+#                  dropout: float = 0.1,
+#                  head_hidden: int = 64,
+#                  head_dropout: float = 0.1):
+#         super().__init__()
+#         self.n_pathologies = n_pathologies
+#         self.d_latent = d_latent
 
-        self.temporal_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
-        self.ts_proj = nn.Linear(d_ts, d_latent)
-        self.ts_cross = _PerceiverBlock(d_latent, n_heads, dropout)
-        self.ts_self  = _PerceiverBlock(d_latent, n_heads, dropout)
+#         self.temporal_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
+#         self.ts_proj = nn.Linear(d_ts, d_latent)
+#         self.ts_cross = _PerceiverBlock(d_latent, n_heads, dropout)
+#         self.ts_self  = _PerceiverBlock(d_latent, n_heads, dropout)
 
-        def _mk_head():
-            return nn.Sequential(
-                nn.Linear(d_latent, head_hidden), nn.GELU(), nn.Dropout(head_dropout),
-                nn.Linear(head_hidden, 1),
-            )
-        # ts_logits (aux, TS-only 예측) 용
-        self.temporal_heads = nn.ModuleList([_mk_head() for _ in range(n_pathologies)])
+#         def _mk_head():
+#             return nn.Sequential(
+#                 nn.Linear(d_latent, head_hidden), nn.GELU(), nn.Dropout(head_dropout),
+#                 nn.Linear(head_hidden, 1),
+#             )
+#         # ts_logits (aux, TS-only 예측) 용
+#         self.temporal_heads = nn.ModuleList([_mk_head() for _ in range(n_pathologies)])
         
-        # EdemaResidualMLP, CardiomegalyResidualMLP, EffusionResidualMLP 
-        self.residual_heads = nn.ModuleList([_mk_head() for _ in range(n_pathologies)])
+#         # EdemaResidualMLP, CardiomegalyResidualMLP, EffusionResidualMLP 
+#         self.residual_heads = nn.ModuleList([_mk_head() for _ in range(n_pathologies)])
 
-    def forward(self, ts_tokens: torch.Tensor, img_logits: torch.Tensor,
-                return_attn: bool = False, ts_ablation: str = "hourly_only") -> dict:
-        """
-        Args:
-            ts_tokens:  [B, T+1, d_ts]  DuETT tokens (마지막이 [REP])
-            img_logits: [B, K]           pretrained CXR head가 뽑은 K개 pathology logit (frozen)
-        """
-        B = ts_tokens.size(0)
+#     def forward(self, ts_tokens: torch.Tensor, img_logits: torch.Tensor,
+#                 return_attn: bool = False, ts_ablation: str = "hourly_only") -> dict:
+#         """
+#         Args:
+#             ts_tokens:  [B, T+1, d_ts]  DuETT tokens (마지막이 [REP])
+#             img_logits: [B, K]           pretrained CXR head가 뽑은 K개 pathology logit (frozen)
+#         """
+#         B = ts_tokens.size(0)
 
-        if ts_ablation == "full":
-            ts_selected = ts_tokens
-        elif ts_ablation == "hourly_only":
-            ts_selected = ts_tokens[:, :-1, :]
-        elif ts_ablation == "rep_only":
-            ts_selected = ts_tokens[:, -1:, :]
-        else:
-            raise ValueError(
-                f"unknown ts_ablation={ts_ablation!r}; "
-                "expected one of {'full', 'hourly_only', 'rep_only'}")
-        ts_kv = self.ts_proj(ts_selected)                          # [B, T*, d]
+#         if ts_ablation == "full":
+#             ts_selected = ts_tokens
+#         elif ts_ablation == "hourly_only":
+#             ts_selected = ts_tokens[:, :-1, :]
+#         elif ts_ablation == "rep_only":
+#             ts_selected = ts_tokens[:, -1:, :]
+#         else:
+#             raise ValueError(
+#                 f"unknown ts_ablation={ts_ablation!r}; "
+#                 "expected one of {'full', 'hourly_only', 'rep_only'}")
+#         ts_kv = self.ts_proj(ts_selected)                          # [B, T*, d]
 
-        ts_q = self.temporal_queries.unsqueeze(0).expand(B, -1, -1)
-        ts_attn = None
-        if return_attn:
-            T_tok, ts_attn = self.ts_cross(ts_q, ts_kv, return_attn=True)
-        else:
-            T_tok = self.ts_cross(ts_q, ts_kv)
-        T_tok = self.ts_self(T_tok, T_tok)                         # [B, K, d]
+#         ts_q = self.temporal_queries.unsqueeze(0).expand(B, -1, -1)
+#         ts_attn = None
+#         if return_attn:
+#             T_tok, ts_attn = self.ts_cross(ts_q, ts_kv, return_attn=True)
+#         else:
+#             T_tok = self.ts_cross(ts_q, ts_kv)
+#         T_tok = self.ts_self(T_tok, T_tok)                         # [B, K, d]
 
-        ts_logits = torch.stack(
-            [h(T_tok[:, k]).squeeze(-1) for k, h in enumerate(self.temporal_heads)], dim=1)
-        residuals = torch.stack(
-            [h(T_tok[:, k]).squeeze(-1) for k, h in enumerate(self.residual_heads)], dim=1)
-        fusion_logits = img_logits + residuals                     # [B, K]
-        # fusion_logits = img_logits                     # [B, K]
+#         ts_logits = torch.stack(
+#             [h(T_tok[:, k]).squeeze(-1) for k, h in enumerate(self.temporal_heads)], dim=1)
+#         residuals = torch.stack(
+#             [h(T_tok[:, k]).squeeze(-1) for k, h in enumerate(self.residual_heads)], dim=1)
+#         fusion_logits = img_logits + residuals                     # [B, K]
+#         # fusion_logits = img_logits                     # [B, K]
 
 
-        out = {
-            "img_logits":    img_logits,       # [B, K]  (passthrough, no grad)
-            "ts_logits":     ts_logits,        # [B, K]  aux TS-only
-            "fusion_logits": fusion_logits,    # [B, K]  main
-            "ts_tokens":     T_tok,            # [B, K, d]
-            "residuals":     residuals,        # [B, K]  진단용
-        }
-        if return_attn:
-            out["ts_attn"] = ts_attn           # [B, K, T*]
-        return out
+#         out = {
+#             "img_logits":    img_logits,       # [B, K]  (passthrough, no grad)
+#             "ts_logits":     ts_logits,        # [B, K]  aux TS-only
+#             "fusion_logits": fusion_logits,    # [B, K]  main
+#             "ts_tokens":     T_tok,            # [B, K, d]
+#             "residuals":     residuals,        # [B, K]  진단용
+#         }
+#         if return_attn:
+#             out["ts_attn"] = ts_attn           # [B, K, T*]
+#         return out
 
 ##########################################################################################
 ##########################################################################################
@@ -743,10 +780,13 @@ class TeacherModel(nn.Module):
             # out = self.perceiver(ts_tokens, img_patches_proj, return_attn=return_attn)
             
             result = {
-                "main_logit":    out["fusion_logits"][:, 0],
-                "img_logits":    out["img_logits"],
-                "ts_logits":     out["ts_logits"],
-                "fusion_logits": out["fusion_logits"],
+                "main_logit":        out["fusion_logits"][:, 0],
+                "img_logits":        out["img_logits"],
+                "ts_logits":         out["ts_logits"],
+                "fusion_logits":     out["fusion_logits"],
+                # residual fusion 진단용 (evaluator가 사용). 항상 노출.
+                "ts_correction":     out["ts_correction"],
+                "scaled_correction": out["scaled_correction"],
             }
             if return_attn:
                 result["img_tokens"]    = out["img_tokens"]
