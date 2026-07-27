@@ -96,3 +96,5 @@ checkpoints_duett/
 inference.py
 utils/
 train_cxr_linear_head_icu.py
+models/encoder.py
+models/main_architecture.py
