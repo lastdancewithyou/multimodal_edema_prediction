@@ -133,7 +133,8 @@ def _permute_tuple(values: tuple[torch.Tensor, ...], perm: np.ndarray):
 def _encode_ts(model: TeacherModel,
                x_ts: tuple[torch.Tensor, ...],
                x_static: tuple[torch.Tensor, ...],
-               bin_ends: tuple[torch.Tensor, ...]) -> torch.Tensor:
+               bin_ends: tuple[torch.Tensor, ...]
+               ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = len(x_ts)
     duett_in = model.duett.feats_to_input((x_ts, x_static, bin_ends), batch_size)
     return model.duett.encode(duett_in)
@@ -274,7 +275,7 @@ def collect_predictions(model: TeacherModel,
         img_input = _image_branch_input(model, b["pixel_values"], perceiver_type)
         ts_full = _encode_ts(model, b["x_ts"], b["x_static"], b["bin_ends"])
 
-        ts_inputs: dict[str, torch.Tensor] = {"full": ts_full}
+        ts_inputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {"full": ts_full}
 
         # Shuffle the complete EHR package (dynamic + static + time-bin metadata).
         ts_inputs["patient_shuffle"] = _encode_ts(
@@ -305,11 +306,16 @@ def collect_predictions(model: TeacherModel,
         # (image_shuffle 필요 시 여기서 별도 perceiver 호출)
 
         outputs = {}
-        for cond, ts_tokens in ts_inputs.items():
+        for cond, (ts_tokens, ts_event_grid) in ts_inputs.items():
             need_attn = (cond == "full")
-            outputs[cond] = model.perceiver(
-                ts_tokens, img_input,
-                return_attn=need_attn, ts_ablation="hourly_only")
+            if perceiver_type == "dual_patch":
+                outputs[cond] = model.perceiver(
+                    ts_event_grid, img_input, return_attn=need_attn
+                )
+            else:
+                outputs[cond] = model.perceiver(
+                    ts_tokens, img_input,
+                    return_attn=need_attn, ts_ablation="hourly_only")
 
         for cond, out in outputs.items():
             fus[cond].append(out["fusion_logits"].cpu())
@@ -317,7 +323,8 @@ def collect_predictions(model: TeacherModel,
         img_full.append(outputs["full"]["img_logits"].cpu())
         y_all.append(b["y_multi"].cpu())
         mask_all.append(b["y_multi_mask"].cpu())
-        attn_all.append(outputs["full"]["ts_attn"].cpu())
+        attention_key = "event_attn" if perceiver_type == "dual_patch" else "ts_attn"
+        attn_all.append(outputs["full"][attention_key].cpu())
 
     return {
         "fus":    {c: torch.cat(v).float().numpy() for c, v in fus.items()},
@@ -326,7 +333,7 @@ def collect_predictions(model: TeacherModel,
         "y":      torch.cat(y_all).float().numpy(),
         "mask":   torch.cat(mask_all).float().numpy(),
         "subject_ids": torch.cat(subject_all).numpy(),
-        "ts_attn":     torch.cat(attn_all).float().numpy(),
+        "attention":   torch.cat(attn_all).float().numpy(),
         "shuffle_same_subject": shuffled_same_subject,
         "shuffle_total": shuffled_total,
     }
@@ -335,7 +342,8 @@ def collect_predictions(model: TeacherModel,
 def _print_results(pred: dict,
                    labels: tuple[str, ...],
                    n_boot: int,
-                   seed: int):
+                   seed: int,
+                   attention_axis: str):
     y, mask = pred["y"], pred["mask"]
     subject_ids = pred["subject_ids"]
 
@@ -385,13 +393,13 @@ def _print_results(pred: dict,
     print("img logits는 TS 무관 → invariance는 항상 0 (perceiver 입력에서 image branch가 TS와 분리)")
 
     # ── [4] Temporal attention entropy (full 조건) ───────────────────
-    attn = pred["ts_attn"]              # [N, K, T*]
+    attn = pred["attention"]             # [N, K, V] or [N, K, T*]
     if attn.size > 0 and attn.ndim == 3 and attn.shape[-1] > 0:
-        hourly = attn / np.clip(attn.sum(axis=-1, keepdims=True), 1e-12, None)
-        entropy = -(hourly * np.log(np.clip(hourly, 1e-12, None))).sum(axis=-1)
-        T = hourly.shape[-1]
-        entropy = entropy / max(math.log(T), 1e-12)
-        print(f"\n[4] Full-condition TS attention (hourly-only, T={T}): "
+        normalized_attn = attn / np.clip(attn.sum(axis=-1, keepdims=True), 1e-12, None)
+        entropy = -(normalized_attn * np.log(np.clip(normalized_attn, 1e-12, None))).sum(axis=-1)
+        axis_size = normalized_attn.shape[-1]
+        entropy = entropy / max(math.log(axis_size), 1e-12)
+        print(f"\n[4] Full-condition TS attention ({attention_axis}, N={axis_size}): "
               "normalized entropy per label")
         print(f"{'label':<24s} {'mean entropy':>14s}")
         for k, label in enumerate(labels):
@@ -522,8 +530,10 @@ def build_model_and_loader(args, checkpoint: dict, device: torch.device):
     else:  # dual_patch
         cxr = CXREncoder(model_name=cxr_model_name, freeze=True, return_patches=True)
         perceiver = PatchDualPathologyPerceiver(
-            n_pathologies=K, d_ts=backbone.d_representation,
-            d_latent=d_latent, n_heads=n_heads, dropout=dropout)
+            n_pathologies=K,
+            d_latent=d_latent, n_heads=n_heads, dropout=dropout,
+            n_timesteps=n_timesteps,
+            d_event_embedding=backbone.d_embedding)
         teacher = TeacherModel(
             backbone, cxr, perceiver,
             head_hidden=head_hidden, head_dropout=head_dropout,
@@ -585,7 +595,14 @@ def main():
         args, checkpoint, device)
     print(f"perceiver_type={perceiver_type}  labels={labels}")
     pred = collect_predictions(model, loader, device, perceiver_type, args.seed)
-    _print_results(pred, labels, args.bootstrap, args.seed)
+    _print_results(
+        pred,
+        labels,
+        args.bootstrap,
+        args.seed,
+        attention_axis=("variables" if perceiver_type == "dual_patch"
+                        else "time tokens"),
+    )
 
     if args.output_npz:
         output_dir = os.path.dirname(os.path.abspath(args.output_npz))
@@ -596,7 +613,7 @@ def main():
             "y": pred["y"],
             "mask": pred["mask"],
             "img_full": pred["img"],
-            "ts_attn_full": pred["ts_attn"],
+            "ts_attention_full": pred["attention"],
         }
         for condition in CONDITIONS:
             payload[f"fus_{condition}"] = pred["fus"][condition]

@@ -132,7 +132,8 @@ def train_teacher_pathology_batch(batch, teacher, path_loss_fn, optimizer, devic
 # =============================================================================
 # Teacher — Dual Pathology mode (image / ts / fusion 3-way BCE)
 # =============================================================================
-def train_teacher_dual_pathology_batch(batch, teacher, path_loss_fn, optimizer, device, accelerator=None):
+def train_teacher_dual_pathology_batch(batch, teacher, path_loss_fn, optimizer, device,
+                                       accelerator=None, aux_residual_alpha: float = 0.0):
     # train() + frozen submodule eval() — frozen backbone dropout 으로 anchor 가 흔들려
     # correction_head 가 노이즈 상쇄 방향으로 편향 학습되는 것을 방지.
     _set_train_with_frozen_eval(teacher, accelerator)
@@ -143,18 +144,31 @@ def train_teacher_dual_pathology_batch(batch, teacher, path_loss_fn, optimizer, 
 
     losses = path_loss_fn(out["img_logits"], out["ts_logits"], out["fusion_logits"], b["y_multi"], b["y_multi_mask"])
 
+    total = losses["total"]
+    aux_residual_loss = torch.zeros((), device=device)
+    if aux_residual_alpha > 0.0 and "scaled_correction" in out:
+        img_prob = torch.sigmoid(out["img_logits"].detach())
+        aux_target = (b["y_multi"].float() - img_prob).detach()
+        mask = b["y_multi_mask"].float()
+        denom = mask.sum().clamp(min=1.0)
+        aux_residual_loss = (
+            ((out["scaled_correction"] - aux_target) ** 2) * mask
+        ).sum() / denom
+        total = total + aux_residual_alpha * aux_residual_loss
+
     optimizer.zero_grad()
     if accelerator is not None:
-        accelerator.backward(losses["total"])
+        accelerator.backward(total)
     else:
-        losses["total"].backward()
+        total.backward()
     optimizer.step()
 
     return {
-        "loss":       losses["total"].detach().item(),
+        "loss":       total.detach().item(),
         "img_total":  losses["img_total"].item(),
         "ts_total":   losses["ts_total"].item(),
         "fus_total":  losses["fus_total"].item(),
+        "aux_residual": float(aux_residual_loss.detach().item()),
         "img_per":    losses["img_per"].cpu(),        # [K]
         "ts_per":     losses["ts_per"].cpu(),         # [K]
         "fus_per":    losses["fus_per"].cpu(),        # [K]
@@ -173,7 +187,8 @@ def train_teacher_dual_pathology_batch(batch, teacher, path_loss_fn, optimizer, 
 # =============================================================================
 def train_teacher_dual_pathology_lp_batch(batch, teacher, path_loss_fn, optimizer, device,
                                           accelerator=None, beta_l2: float = 0.0,
-                                          corr_l2: float = 0.0):
+                                          corr_l2: float = 0.0,
+                                          aux_residual_alpha: float = 0.0):
     """LP step: teacher 전체를 eval() 로 고정 (frozen 모듈의 dropout/stochastic 경로 차단) →
     unwrap 해서 perceiver.correction_head 만 train() 로 되돌림.
     trainable 은 correction_head + perceiver.beta 뿐이므로 다른 branch 는 상수처럼 동작.
@@ -193,11 +208,20 @@ def train_teacher_dual_pathology_lp_batch(batch, teacher, path_loss_fn, optimize
 
     reg_beta = torch.zeros((), device=device)
     reg_corr = torch.zeros((), device=device)
+    aux_residual_loss = torch.zeros((), device=device)
     if beta_l2 > 0.0:
         reg_beta = beta_l2 * (unwrapped.perceiver.beta ** 2).mean()
     if corr_l2 > 0.0:
         reg_corr = corr_l2 * (out["scaled_correction"] ** 2).mean()
-    total = losses["total"] + reg_beta + reg_corr
+    if aux_residual_alpha > 0.0 and "scaled_correction" in out:
+        img_prob = torch.sigmoid(out["img_logits"].detach())
+        aux_target = (b["y_multi"].float() - img_prob).detach()
+        mask = b["y_multi_mask"].float()
+        denom = mask.sum().clamp(min=1.0)
+        aux_residual_loss = (
+            ((out["scaled_correction"] - aux_target) ** 2) * mask
+        ).sum() / denom
+    total = losses["total"] + reg_beta + reg_corr + aux_residual_alpha * aux_residual_loss
 
     optimizer.zero_grad()
     if accelerator is not None:
@@ -216,6 +240,7 @@ def train_teacher_dual_pathology_lp_batch(batch, teacher, path_loss_fn, optimize
         "fus_per":    losses["fus_per"].cpu(),
         "reg_beta_l2": float(reg_beta.detach().item()),
         "reg_corr_l2": float(reg_corr.detach().item()),
+        "aux_residual": float(aux_residual_loss.detach().item()),
         "main_logit":    out["main_logit"].detach(),
         "img_logits":    out["img_logits"].detach(),
         "ts_logits":     out["ts_logits"].detach(),

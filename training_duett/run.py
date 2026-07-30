@@ -23,9 +23,7 @@ DEFAULT_TAG_EXCLUDE = frozenset({
 })
 
 
-def make_diff_tag(parser: argparse.ArgumentParser,
-                  args: argparse.Namespace,
-                  exclude=DEFAULT_TAG_EXCLUDE) -> str:
+def make_diff_tag(parser: argparse.ArgumentParser, args: argparse.Namespace, exclude=DEFAULT_TAG_EXCLUDE) -> str:
     defaults = {a.dest: a.default for a in parser._actions
                 if a.dest != "help" and a.dest not in exclude}
     diff = {k: v for k, v in vars(args).items()
@@ -35,8 +33,7 @@ def make_diff_tag(parser: argparse.ArgumentParser,
     return "_".join(f"{k}={v}" for k, v in sorted(diff.items()))
 
 
-def _finalize_ckpt_dir(parser: argparse.ArgumentParser,
-                       args: argparse.Namespace) -> argparse.Namespace:
+def _finalize_ckpt_dir(parser: argparse.ArgumentParser, args: argparse.Namespace) -> argparse.Namespace:
     """{ckpt_dir}/{timestamp}_{diff_tag}/ 형태로 유일 경로 확정."""
     tag = make_diff_tag(parser, args)
     args.run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + tag
@@ -53,7 +50,7 @@ def _add_common(p: argparse.ArgumentParser):
 
     # wandb
     p.add_argument("--wandb_project",  type=str, default="Teacher Modal Upgrade")
-    p.add_argument("--wandb_run_name", type=str, default="[Teacher] Residual TS-2", help="비우면 stage명(teacher/student) 사용")
+    p.add_argument("--wandb_run_name", type=str, default="correction_head_Q:T_K,V:I", help="비우면 stage명(teacher/student) 사용")
     p.add_argument("--wandb_disabled", action="store_true")
 
 
@@ -63,10 +60,6 @@ def _add_common(p: argparse.ArgumentParser):
     p.add_argument("--label_col",     type=str, default="label_edema")
     p.add_argument("--n_timesteps",   type=int, default=24)
     p.add_argument("--split_seed",    type=int, default=42)
-    # Aligned split(pretrained head와 정합) 사용으로 val_size/test_size는 미사용.
-    # 스플릿 비율은 pretrained head의 70/15/15가 자동 상속됨.
-    # p.add_argument("--val_size",      type=float, default=0.10)
-    # p.add_argument("--test_size",     type=float, default=0.10)
 
     # DuETT backbone
     p.add_argument("--duett_ckpt",    type=str, default=REPO_DEFAULTS["duett_ckpt"])
@@ -120,7 +113,7 @@ def _add_common(p: argparse.ArgumentParser):
                    help="cosine anneal 최종 lr = args.lr × 이 값")
 
     # Early stopping
-    p.add_argument("--patience",       type=int, default=10,
+    p.add_argument("--patience",       type=int, default=5,
                    help="val AUROC 개선 없는 epoch가 이 값 이상이면 조기 종료. 0이면 비활성")
 
     # Auxiliary CXR-only head
@@ -153,6 +146,10 @@ def _add_common(p: argparse.ArgumentParser):
                    help="[dual] TS branch loss 가중치 (독립 gradient path 확보 위해 0.5+)")
     p.add_argument("--aux_fus_alpha",   type=float, default=1.0,
                    help="[dual] fusion branch loss 가중치 (main task)")
+    p.add_argument("--aux_residual_alpha", type=float, default=0.0,
+                   help="[dual_patch] Correction 이 image residual (y − sigmoid(img_logit.detach())) 을 "
+                        "직접 예측하도록 강제하는 MSE aux loss weight. 0 이면 비활성. "
+                        "fusion loss 만으로 correction 방향 학습이 실패할 때 사용.")
     p.add_argument("--pretrained_cxr_head_ckpt", type=str,
                    default=REPO_DEFAULTS["pretrained_cxr_head_ckpt"],
                    help="[dual] 240k CXR로 학습된 frozen linear head checkpoint. "

@@ -202,14 +202,15 @@ def evaluate_dual_pathology(model, loader, device, pathology_labels: tuple[str, 
         - mean_abs_correction : |scaled_correction| 의 sample-mean (residual mode 만)
         - correction_residual_corr : Pearson(scaled_correction, y - sigmoid(img_logit))
         - beta[k] : perceiver.beta 파라미터 값
-        - query_cos[k] : cos(current pathology_queries[k], query_ref[k])
+        - query_cos[k] : cos(current temporal_queries[k], query_ref[k])
+        - modal_query_cos[k] : cos(image_queries[k], temporal_queries[k])
 
     main_auroc = per_label[0]["fus_auroc"]  (index 0 label의 fusion AUROC).
 
     Parameters
     ----------
     query_ref : Optional[Tensor of shape [K, D]]
-        학습 시작 시점의 pathology_queries 스냅샷. 없으면 query_cos 는 NaN.
+        학습 시작 시점의 temporal_queries 스냅샷. 없으면 query_cos 는 NaN.
     """
     from .engine import _move_lists
 
@@ -246,11 +247,21 @@ def evaluate_dual_pathology(model, loader, device, pathology_labels: tuple[str, 
         beta_vec = perceiver.beta.detach().float().cpu().numpy()
     query_cos_vec = None
     if (query_ref is not None and perceiver is not None
-            and hasattr(perceiver, "pathology_queries")):
-        cur = perceiver.pathology_queries.detach().float()
+            and hasattr(perceiver, "temporal_queries")):
+        cur = perceiver.temporal_queries.detach().float()
         ref = query_ref.detach().float().to(cur.device)
         if cur.shape == ref.shape:
             query_cos_vec = F.cosine_similarity(cur, ref, dim=-1).cpu().numpy()
+    modal_query_cos_vec = None
+    if (perceiver is not None
+            and hasattr(perceiver, "image_queries")
+            and hasattr(perceiver, "temporal_queries")):
+        img_q = perceiver.image_queries.detach().float()
+        ts_q = perceiver.temporal_queries.detach().float()
+        if img_q.shape == ts_q.shape:
+            modal_query_cos_vec = F.cosine_similarity(
+                img_q, ts_q, dim=-1
+            ).cpu().numpy()
 
     K = len(pathology_labels)
     per_label = []
@@ -280,6 +291,8 @@ def evaluate_dual_pathology(model, loader, device, pathology_labels: tuple[str, 
 
         beta_k     = float(beta_vec[k])      if beta_vec      is not None else float("nan")
         q_cos_k    = float(query_cos_vec[k]) if query_cos_vec is not None else float("nan")
+        modal_q_cos_k = (float(modal_query_cos_vec[k])
+                         if modal_query_cos_vec is not None else float("nan"))
 
         per_label.append({
             "name":         pathology_labels[k],
@@ -297,6 +310,7 @@ def evaluate_dual_pathology(model, loader, device, pathology_labels: tuple[str, 
             "corr_residual": corr_r,                  # 방향성 (양수=오류 수정 방향)
             "beta":         beta_k,
             "query_cos":    q_cos_k,
+            "modal_query_cos": modal_q_cos_k,
         })
 
     return {
@@ -328,10 +342,10 @@ def format_dual_pathology_gap_table(result: dict) -> str:
     header = (
         f"{'label':<12s} "
         f"{'imgROC':>7s} {'tsROC':>7s} {'fusROC':>7s} {'gain':>7s}  "
-        f"{'imgPR':>6s} {'fusPR':>6s}  "
+        f"{'imgPRC':>6s} {'fusPRC':>6s}  "
         f"{'dBCE':>7s}  "
         f"{'|corr|':>7s} {'corr_r':>7s}  "
-        f"{'beta':>6s} {'q_cos':>6s}"
+        f"{'beta':>6s} {'q_cos':>6s} {'i-t_cos':>7s}"
     )
     lines = [header, "-" * len(header)]
     for r in result["per_label"]:
@@ -343,6 +357,7 @@ def format_dual_pathology_gap_table(result: dict) -> str:
             f"{_fmt(r['img_auprc'], '6.3f')} {_fmt(r['fus_auprc'], '6.3f')}  "
             f"{_fmt(r['delta_bce'], '+7.4f')}  "
             f"{_fmt(r['mean_abs_corr'], '7.4f')} {_fmt(r['corr_residual'], '+7.3f')}  "
-            f"{_fmt(r['beta'], '6.3f')} {_fmt(r['query_cos'], '6.3f')}"
+            f"{_fmt(r['beta'], '6.3f')} {_fmt(r['query_cos'], '6.3f')} "
+            f"{_fmt(r['modal_query_cos'], '7.3f')}"
         )
     return "\n".join(lines)

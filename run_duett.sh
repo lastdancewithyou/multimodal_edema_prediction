@@ -8,11 +8,12 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch \
   --perceiver_type dual_patch \
   --freeze_duett \
   --aux_img_alpha 0.5 \
-  --aux_ts_alpha 0.0 \
+  --aux_ts_alpha 0.5 \
   --aux_fus_alpha 1.0 \
   --query_lr_mult 0.5 \
-  --correction_lr_mult 2.0 \
-  --wandb_run_name alpha 0.5_0.0_1.0
+  --correction_lr_mult 8.0 \
+  --aux_residual_alpha 0.5 \
+  --wandb_disabled
 
   # alpha 0.0_0.5_1.0
   # alpha 0.5_0.5_1.0
@@ -25,7 +26,7 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch \
 
 
 # ── Correction-only Linear Probing ────────────────────────
-# LP_CKPT="/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/checkpoints_duett/teacher/20260727_073449_aux_img_alpha=0.2_aux_ts_alpha=0.1_correction_lr_mult=3.0_eval_train_batches=100_freeze_duett=True_perceiver_type=dual_patch_query_lr_mult=0.5/best.pt"
+# LP_CKPT="/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/checkpoints_duett/teacher/20260728_182107_correction_lr_mult=8.0_eval_train_batches=100_freeze_duett=True_perceiver_type=dual_patch_query_lr_mult=0.5/best.pt"
 # CUDA_VISIBLE_DEVICES=0 accelerate launch \
 #   --config_file /home/DAHS1/.cache/huggingface/accelerate/config_single_gpu_0.yaml \
 #   main_train_teacher_duett.py \
@@ -44,7 +45,7 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch \
 #   --epochs 15 \
 #   --patience 5 \
 #   --eval_train_batches 100 \
-#   --wandb_run_name "[Teacher LP] correction-only"
+#   --wandb_disabled
 
   # --lp_beta_l2 1e-3 \
   # --lp_corr_l2 1e-2 \

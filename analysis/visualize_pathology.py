@@ -67,6 +67,9 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--dim_reduce", type=str, default="auto", choices=["auto", "umap", "tsne"],
                    help="stage4 token 투영 방식. auto = umap 있으면 사용, 없으면 tsne")
+    p.add_argument("--ts_attn_require_pos", type=str, default="",
+                   help="TS attention heatmap 에서 필터할 pathology 이름들 (콤마 구분). "
+                        "지정한 label 이 모두 1(양성)인 sample 만 사용. 예: 'edema,cardiomegaly'")
     return p.parse_args()
 
 
@@ -135,8 +138,7 @@ def load_teacher(ckpt_path: str, device):
 
     if mode == "dual":
         if DualPathologyPerceiver is None:
-            raise ImportError("DualPathologyPerceiver 가 models/main_architecture_duett.py 에서 "
-                              "주석 처리되어 있음. dual 모드 ckpt 를 쓰려면 un-comment 필요.")
+            raise ImportError("DualPathologyPerceiver 가 models/main_architecture_duett.py에서 주석 처리되어 있음. dual 모드 ckpt 를 쓰려면 un-comment 필요.")
         perceiver = DualPathologyPerceiver(
             n_pathologies=len(pathology_labels),
             d_ts=backbone.d_representation,
@@ -147,10 +149,12 @@ def load_teacher(ckpt_path: str, device):
     elif mode == "dual_patch":
         perceiver = PatchDualPathologyPerceiver(
             n_pathologies=len(pathology_labels),
-            d_ts=backbone.d_representation,
             d_latent=args.d_latent,
+            d_ts=backbone.d_representation,
             n_heads=args.n_perceiver_heads,
             dropout=0.0,
+            n_timesteps=args.n_timesteps,
+            d_event_embedding=backbone.d_embedding,
         )
     else:  # "single"
         if PathologyPerceiver is None:
@@ -281,20 +285,35 @@ def viz_patch_attention(teacher, loader, device, processor, pathology_labels,
 # Fig 2: TS attention heatmap per sample (K × (T+1))
 # =============================================================================
 def viz_ts_attention(teacher, loader, device, pathology_labels,
-                     n_samples: int, outpath: str):
+                     n_samples: int, outpath: str, ts_vars=None,
+                     require_pos_idx: tuple[int, ...] = ()):
     attns, labels_multi = [], []
+    uses_event_attention = hasattr(teacher.perceiver, "event_query_proj")
+    attention_key = "event_attn" if uses_event_attention else "ts_attn"
     with torch.no_grad():
         for batch in loader:
             b = _move_lists(batch, device)
             out = teacher(b["x_ts"], b["x_static"], b["bin_ends"], b["pixel_values"],
                           return_attn=True)
+            y_batch    = b["y_multi"].cpu()          # [B, K]
+            mask_batch = b["y_multi_mask"].cpu()     # [B, K]
             for i in range(b["pixel_values"].shape[0]):
-                attns.append(out["ts_attn"][i].cpu().numpy())  # [K, T+1]
-                labels_multi.append(b["y_multi"][i].cpu().numpy())
+                if require_pos_idx and not all(
+                    bool(mask_batch[i, k].item()) and int(y_batch[i, k].item()) == 1
+                    for k in require_pos_idx
+                ):
+                    continue
+                attns.append(out[attention_key][i].cpu().numpy())
+                labels_multi.append(y_batch[i].numpy())
                 if len(attns) >= n_samples:
                     break
             if len(attns) >= n_samples:
                 break
+    if len(attns) < n_samples:
+        print(f"[viz] warn: ts_attention 조건에 맞는 sample {len(attns)}/{n_samples} 개만 확보")
+    if not attns:
+        print(f"[viz] skip: {outpath} — 조건에 맞는 sample 이 없어 heatmap 생략")
+        return
 
     K = len(pathology_labels)
     label_short = [_short(n) for n in pathology_labels]
@@ -307,20 +326,35 @@ def viz_ts_attention(teacher, loader, device, pathology_labels,
         ax = axes[i]
         im = ax.imshow(a, aspect="auto", cmap="viridis")
         ax.set_yticks(range(K)); ax.set_yticklabels(label_short, fontsize=8)
-        T_plus_1 = a.shape[1]
-        # x축 마지막 위치는 [REP] 토큰 (DuETT 관례)
-        xticks = list(range(0, T_plus_1 - 1, max(1, (T_plus_1 - 1) // 6))) + [T_plus_1 - 1]
-        xlabels = [str(x) for x in xticks[:-1]] + ["REP"]
-        ax.set_xticks(xticks); ax.set_xticklabels(xlabels, fontsize=8)
-        ax.set_xlabel("time bin (h)", fontsize=8)
+        axis_size = a.shape[1]
+        if uses_event_attention:
+            xticks = list(range(axis_size))
+            if ts_vars is not None and len(ts_vars) == axis_size:
+                xlabels = [str(v) for v in ts_vars]
+            else:
+                xlabels = [f"var_{j}" for j in xticks]
+            ax.set_xticks(xticks)
+            ax.set_xticklabels(xlabels, rotation=75, ha="right", fontsize=6)
+            ax.set_xlabel("clinical variable (full 24 h trajectory)", fontsize=8)
+        else:
+            # x축 마지막 위치는 [REP] 토큰 (DuETT 관례)
+            xticks = list(range(0, axis_size - 1, max(1, (axis_size - 1) // 6))) + [axis_size - 1]
+            xlabels = [str(x) for x in xticks[:-1]] + ["REP"]
+            ax.set_xticks(xticks); ax.set_xticklabels(xlabels, fontsize=8)
+            ax.set_xlabel("time bin (h)", fontsize=8)
         y_str = "|".join(f"{int(v)}" for v in y)
         ax.set_title(f"sample {i}  y=({y_str})", fontsize=9)
         fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
     for j in range(len(attns), len(axes)):
         axes[j].axis("off")
 
-    fig.suptitle("Per-pathology TS attention (row = pathology, col = time bin + REP)",
-                 fontsize=12)
+    axis_name = ("clinical variable trajectory"
+                 if uses_event_attention
+                 else "time bin + REP")
+    fig.suptitle(
+        f"Per-pathology TS attention (row = pathology, col = {axis_name})",
+        fontsize=12,
+    )
     plt.tight_layout()
     fig.savefig(outpath, dpi=120, bbox_inches="tight")
     plt.close(fig)
@@ -600,10 +634,21 @@ def main():
     viz_patch_attention(teacher, full_loader, device, processor, pathology_labels,
                         args.n_samples,
                         os.path.join(args.outdir, "patch_attention_overlay.png"))
-    # Fig 2 (ts_attn — 두 모드 공통)
-    viz_ts_attention(teacher, small_loader, device, pathology_labels,
+    # Fig 2 (TS attention)
+    label_to_idx = {lbl.lower(): i for i, lbl in enumerate(pathology_labels)}
+    require_names = [s.strip().lower() for s in args.ts_attn_require_pos.split(",") if s.strip()]
+    unknown = [n for n in require_names if n not in label_to_idx]
+    if unknown:
+        raise ValueError(f"--ts_attn_require_pos 에 알 수 없는 label: {unknown}. "
+                         f"사용 가능: {list(label_to_idx)}")
+    require_idx = tuple(label_to_idx[n] for n in require_names)
+    ts_attn_suffix = ("_" + "_".join(require_names)) if require_names else ""
+    ts_attn_loader = full_loader if require_idx else small_loader
+    viz_ts_attention(teacher, ts_attn_loader, device, pathology_labels,
                      args.n_samples,
-                     os.path.join(args.outdir, "ts_attention_heatmap.png"))
+                     os.path.join(args.outdir, f"ts_attention_heatmap{ts_attn_suffix}.png"),
+                     ts_vars=bundle.get("ts_vars"),
+                     require_pos_idx=require_idx)
     # Fig 3 (dual: 3 heatmap / single: 1 heatmap)
     viz_query_similarity(teacher, pathology_labels,
                          os.path.join(args.outdir, "query_similarity.png"),

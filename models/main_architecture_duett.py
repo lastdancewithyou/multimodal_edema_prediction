@@ -69,7 +69,8 @@ class DuettFeatureExtractor(DuettBase):
         time_embeddings = self.full_time_embedding(xs_times.unsqueeze(2))
         time_embeddings = torch.cat(
             (time_embeddings, self.full_rep_embedding.weight.T.unsqueeze(0).expand(xs_feats.shape[0], -1, -1)), dim=1)
-        
+
+        final_event_grid = None
         for event_transformer, time_transformer in zip(self.event_transformers, self.time_transformers):
             et_out_shape = (psi.shape[0], psi.shape[2], psi.shape[1], psi.shape[3])
             """
@@ -81,6 +82,9 @@ class DuettFeatureExtractor(DuettBase):
             """
             embeddings = psi.transpose(1, 2).flatten(2) + self.full_event_embedding.weight.unsqueeze(0)
             event_outs = event_transformer(embeddings).view(et_out_shape).transpose(1, 2) # Event transformer 통과 후 다시 원래 shape로
+
+            # time transformer FFN에 의해 변수별 차원이 섞이기 전에 변수 해석용으로 추출
+            final_event_grid = event_outs
             tt_out_shape = event_outs.shape
             """
             # Time Transformer: 시간 간 상호작용
@@ -92,7 +96,7 @@ class DuettFeatureExtractor(DuettBase):
             psi = time_transformer(embeddings).view(tt_out_shape) # 다시 [B, T+1, V+1, d] 형태로 reshape
 
         transformed = psi.flatten(2)  # [B, T+1, d]
-        return transformed, psi
+        return transformed, final_event_grid
 
 
 # Load a pretrained DuETT SSL/FT checkpoint as a feature extractor
@@ -400,7 +404,142 @@ class CXREncoder(nn.Module):
 #         return out
 
 
-# [4] PathologyPerceiver 모달리티별 분리
+# # [4] PathologyPerceiver 모달리티별 분리
+# class PatchDualPathologyPerceiver(nn.Module):
+#     def __init__(
+#             self,
+#             n_pathologies: int,
+#             d_ts: int,
+#             d_latent: int = 256,
+#             n_heads: int = 4,
+#             dropout: float = 0.1,
+#             head_hidden: int = 64,
+#             head_dropout: float = 0.1,
+#             # Old
+#             # dropout: float = 0.1,
+#             # head_hidden: int = 64,
+#             # head_dropout: float = 0.1,
+#             beta_init: float = 1.0,   # per-pathology correction scale의 초기값
+#         ):
+#         super().__init__()
+#         self.n_pathologies = n_pathologies
+
+#         self.d_latent = d_latent
+#         self.d_ts = d_ts
+
+#         # 별도 Query 구성
+#         # self.image_queries    = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
+#         # self.temporal_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
+
+#         # Shared Query는 일단 폐기
+#         self.pathology_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
+
+#         self.ts_proj = nn.Linear(d_ts, d_latent)
+#         self.img_cross = _PerceiverBlock(d_latent, n_heads, dropout)
+#         self.img_self  = _PerceiverBlock(d_latent, n_heads, dropout)
+#         self.ts_cross  = _PerceiverBlock(d_latent, n_heads, dropout)
+#         self.ts_self   = _PerceiverBlock(d_latent, n_heads, dropout)
+
+#         # ── OLD: concat MLP fusion (실험 위해 잠시 주석)
+#         # self.fusion = nn.Sequential(
+#         #     nn.Linear(2 * d_latent, 4 * d_latent),
+#         #     nn.GELU(),
+#         #     nn.Dropout(dropout),
+#         #     nn.Linear(4 * d_latent, d_latent),
+#         # )
+
+#         def _mk_head(): # logit 출력기
+#             return nn.Sequential(
+#                 nn.Linear(d_latent, head_hidden), nn.GELU(), nn.Dropout(head_dropout),
+#                 nn.Linear(head_hidden, 1),
+#             )
+
+#         # pathology별 heads
+#         # self.image_heads    = nn.ModuleList([_mk_head() for _ in range(n_pathologies)])
+#         # self.temporal_heads = nn.ModuleList([_mk_head() for _ in range(n_pathologies)])
+#         # self.fusion_heads   = nn.ModuleList([_mk_head() for _ in range(n_pathologies)])
+
+#         # 모달리티별 공통된 헤드로 질병을 분류하도록 테스트함.
+#         self.image_head = _mk_head()
+#         self.temporal_head = _mk_head()
+#         # self.fusion_head = _mk_head()   # ── OLD: fusion_head 대신 correction_head 사용
+
+#         # ── NEW: residual fusion — image logit을 anchor 로, TS 는 correction 만 담당.
+#         # fusion_logits = img_logits.detach() + beta * correction_head(T_tok)
+#         # detach 로 fusion loss 가 image branch 로 흘러 shortcut 학습되는 걸 차단.
+#         # image branch 는 image_head + auxiliary L_img 로 별도 학습됨.
+#         self.correction_head = nn.Sequential(
+#             nn.LayerNorm(d_latent),
+#             nn.Linear(d_latent, head_hidden),
+#             nn.GELU(),
+#             nn.Dropout(head_dropout),
+#             nn.Linear(head_hidden, 1, bias=False),
+#         )
+#         # 마지막 Linear zero-init → 초기 correction ≡ 0 → fusion == image-only 성능에서 출발.
+#         nn.init.zeros_(self.correction_head[-1].weight)
+
+#         # pathology 별 learnable scale. beta_init 을 0 에 가깝게 두어 초반 correction 영향 최소화.
+#         self.beta = nn.Parameter(torch.ones(n_pathologies))
+
+#         # Prevalence 차이를 허용하기 위해
+#         self.image_label_bias = nn.Parameter(torch.zeros(n_pathologies))
+#         self.temporal_label_bias = nn.Parameter(torch.zeros(n_pathologies))
+#         # self.fusion_label_bias = nn.Parameter(torch.zeros(n_pathologies))   # image_label_bias 를 상속
+
+#     def forward(self, ts_tokens, img_patches_proj, return_attn=False, ts_ablation="hourly_only"):
+#         B = ts_tokens.size(0)
+#         # img_q = self.image_queries.unsqueeze(0).expand(B, -1, -1)
+#         img_q = self.pathology_queries.unsqueeze(0).expand(B, -1, -1)
+
+#         I, img_attn = (self.img_cross(img_q, img_patches_proj, return_attn=True) if return_attn else (self.img_cross(img_q, img_patches_proj), None))
+#         I = self.img_self(I, I)
+
+#         ##########################################################################################
+#         if ts_ablation == "full":         ts_selected = ts_tokens
+#         elif ts_ablation == "hourly_only": ts_selected = ts_tokens[:, :-1, :]
+#         elif ts_ablation == "rep_only":    ts_selected = ts_tokens[:, -1:, :]
+#         else: raise ValueError(ts_ablation)
+#         ##########################################################################################
+
+#         ts_kv = self.ts_proj(ts_selected) # 어떤 시간에서 어떤 변수가 중요했는지가 ts_proj 선형결합에 의해 가려짐.
+#         # ts_q = self.temporal_queries.unsqueeze(0).expand(B, -1, -1)
+#         ts_q = self.pathology_queries.unsqueeze(0).expand(B, -1, -1)
+
+#         T_tok, ts_attn = (self.ts_cross(ts_q, ts_kv, return_attn=True) if return_attn else (self.ts_cross(ts_q, ts_kv), None))
+#         T_tok = self.ts_self(T_tok, T_tok)
+#         # F_tok = self.fusion(torch.cat([I, T_tok], dim=-1))   # ── OLD: concat MLP fusion
+#         # img_logits    = torch.stack([h(I[:, k]).squeeze(-1)     for k, h in enumerate(self.image_heads)],    dim=1)
+#         # ts_logits     = torch.stack([h(T_tok[:, k]).squeeze(-1) for k, h in enumerate(self.temporal_heads)], dim=1)
+#         # fusion_logits = torch.stack([h(F_tok[:, k]).squeeze(-1) for k, h in enumerate(self.fusion_heads)],   dim=1)
+
+#         # [B, K, d] → [B, K, 1] → [B, K]
+#         img_logits    = self.image_head(I).squeeze(-1) + self.image_label_bias.unsqueeze(0) # Prevalence Bias
+#         ts_logits     = self.temporal_head(T_tok).squeeze(-1) + self.temporal_label_bias.unsqueeze(0)
+#         # fusion_logits = self.fusion_head(F_tok).squeeze(-1) + self.fusion_label_bias.unsqueeze(0)  # ── OLD
+
+#         # ── NEW: residual fusion. image logit 을 anchor, TS 는 correction 만 담당.
+#         # detach → fusion loss 가 image branch 를 통해 학습되는 shortcut 을 차단.
+#         # correction_head 마지막 Linear zero-init -> 초기 fusion == image-only.
+#         ts_correction     = self.correction_head(T_tok).squeeze(-1)          # [B, K]  raw
+#         scaled_correction = self.beta.unsqueeze(0) * ts_correction           # [B, K]  β·raw
+#         fusion_logits     = img_logits.detach() + scaled_correction          # [B, K]
+
+#         # residual 모드에서는 token 레벨의 "fusion 표현" 이 없음. downstream (viz Fig4 등)
+#         # 호환을 위해 T_tok 을 fusion_tokens placeholder 로 노출 (ts panel 과 동일).
+#         out = {
+#             "img_logits":        img_logits,
+#             "ts_logits":         ts_logits,
+#             "fusion_logits":     fusion_logits,
+#             "img_tokens":        I,
+#             "ts_tokens":         T_tok,
+#             "fusion_tokens":     T_tok,
+#             "ts_correction":     ts_correction,
+#             "scaled_correction": scaled_correction,
+#         }
+#         if return_attn: out["img_attn"] = img_attn; out["ts_attn"] = ts_attn
+#         return out
+
+
 class PatchDualPathologyPerceiver(nn.Module):
     def __init__(
             self,
@@ -411,51 +550,66 @@ class PatchDualPathologyPerceiver(nn.Module):
             dropout: float = 0.1,
             head_hidden: int = 64,
             head_dropout: float = 0.1,
-            # beta_init: float = 1.0,   # per-pathology correction scale의 초기값
+            n_timesteps: int = 24,
+            d_event_embedding: int = None,
         ):
         super().__init__()
+        if n_timesteps <= 0:
+            raise ValueError(f"n_timesteps must be positive, got {n_timesteps}")
+
         self.n_pathologies = n_pathologies
         self.d_latent = d_latent
+        self.d_ts = d_ts
+        self.n_timesteps = n_timesteps
 
-        # self.image_queries    = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
-        # self.temporal_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
+        # 이미지와 시계열이 각자의 단독 loss로 충분히 학습되도록 query를 분리한다.
+        # 두 query는 같은 latent 차원이므로 후속 UMAP/코사인 비교도 가능하다.
+        self.image_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
+        self.temporal_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
 
-        self.pathology_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
-
-        self.ts_proj = nn.Linear(d_ts, d_latent)
         self.img_cross = _PerceiverBlock(d_latent, n_heads, dropout)
         self.img_self  = _PerceiverBlock(d_latent, n_heads, dropout)
-        self.ts_cross  = _PerceiverBlock(d_latent, n_heads, dropout)
         self.ts_self   = _PerceiverBlock(d_latent, n_heads, dropout)
+        # A2: correction 입력을 T_tok 이 image tokens (I.detach()) 에 cross-attention 한 결과로 구성.
+        # T_tok 이 query 로서 각 pathology 마다 image 표현의 어느 부분이 residual 예측에 관련 있는지 학습.
+        self.correction_cross = _PerceiverBlock(d_latent, n_heads, dropout)
 
-        # ── OLD: concat MLP fusion (실험 위해 잠시 주석)
-        # self.fusion = nn.Sequential(
-        #     nn.Linear(2 * d_latent, 4 * d_latent),
-        #     nn.GELU(),
-        #     nn.Dropout(dropout),
-        #     nn.Linear(4 * d_latent, d_latent),
-        # )
+        if d_event_embedding is None:
+            raise ValueError(
+                "d_event_embedding is required for PatchDualPathologyPerceiver; "
+                "pass backbone.d_embedding"
+            )
+        if d_event_embedding <= 0:
+            raise ValueError("d_event_embedding must be positive")
+        self.d_event_embedding = d_event_embedding
+        self.d_event_trajectory = n_timesteps * d_event_embedding
 
-        def _mk_head(): # logit 출력기
+        # Query만 trajectory 차원으로 보낸다. Variable token 자체는 선택 전에
+        # 작은 차원으로 압축하지 않아 24시간 순서/추세 정보를 보존한다.
+        self.event_query_proj = nn.Linear(
+            d_latent, self.d_event_trajectory, bias=False
+        )
+        self.event_query_norm = nn.LayerNorm(self.d_event_trajectory)
+        self.event_key_norm = nn.LayerNorm(self.d_event_trajectory)
+        self.event_out_proj = nn.Sequential(
+            nn.LayerNorm(self.d_event_trajectory),
+            nn.Linear(self.d_event_trajectory, d_latent),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+        def _mk_head():
             return nn.Sequential(
                 nn.Linear(d_latent, head_hidden), nn.GELU(), nn.Dropout(head_dropout),
                 nn.Linear(head_hidden, 1),
             )
 
-        # pathology별 heads
-        # self.image_heads    = nn.ModuleList([_mk_head() for _ in range(n_pathologies)])
-        # self.temporal_heads = nn.ModuleList([_mk_head() for _ in range(n_pathologies)])
-        # self.fusion_heads   = nn.ModuleList([_mk_head() for _ in range(n_pathologies)])
-
-        # 모달리티별 공통된 헤드로 질병을 분류하도록 테스트함.
         self.image_head = _mk_head()
         self.temporal_head = _mk_head()
-        # self.fusion_head = _mk_head()   # ── OLD: fusion_head 대신 correction_head 사용
 
-        # ── NEW: residual fusion — image logit을 anchor 로, TS 는 correction 만 담당.
-        # fusion_logits = img_logits.detach() + beta * correction_head(T_tok)
-        # detach 로 fusion loss 가 image branch 로 흘러 shortcut 학습되는 걸 차단.
-        # image branch 는 image_head + auxiliary L_img 로 별도 학습됨.
+        # Image prediction is the anchor; TS learns a residual correction.
+        # A2: correction_cross 가 T_tok 을 query 로 I.detach() 에 attention 해서 d_latent 표현을 뽑아냄.
+        # correction_head 의 input dim 은 d_latent 로 유지 (A1 의 concat 아님).
         self.correction_head = nn.Sequential(
             nn.LayerNorm(d_latent),
             nn.Linear(d_latent, head_hidden),
@@ -463,59 +617,86 @@ class PatchDualPathologyPerceiver(nn.Module):
             nn.Dropout(head_dropout),
             nn.Linear(head_hidden, 1, bias=False),
         )
-        # 마지막 Linear zero-init → 초기 correction ≡ 0 → fusion == image-only 성능에서 출발.
-        nn.init.zeros_(self.correction_head[-1].weight)
+        # nn.init.zeros_(self.correction_head[-1].weight)
 
-        # pathology 별 learnable scale. beta_init 을 0 에 가깝게 두어 초반 correction 영향 최소화.
+        # zero init 완화
+        nn.init.normal_(self.correction_head[-1].weight, std=0.01)
+
         self.beta = nn.Parameter(torch.ones(n_pathologies))
-
-        # Prevalence 차이를 허용하기 위해
         self.image_label_bias = nn.Parameter(torch.zeros(n_pathologies))
         self.temporal_label_bias = nn.Parameter(torch.zeros(n_pathologies))
-        # self.fusion_label_bias = nn.Parameter(torch.zeros(n_pathologies))   # image_label_bias 를 상속
 
-    def forward(self, ts_tokens, img_patches_proj, return_attn=False, ts_ablation="hourly_only"):
-        B = ts_tokens.size(0)
-        # img_q = self.image_queries.unsqueeze(0).expand(B, -1, -1)
-        img_q = self.pathology_queries.unsqueeze(0).expand(B, -1, -1)
+    def _read_event_trajectories(self, ts_event_grid, return_attn=False):
+        """Read DuETT event-transformer variables as trajectory tokens.
 
-        I, img_attn = (self.img_cross(img_q, img_patches_proj, return_attn=True)
-                       if return_attn else (self.img_cross(img_q, img_patches_proj), None))
+        Args:
+            ts_event_grid: pre-time-transformer event output with shape
+                ``[B, T+1, V+1, E]``. The final time/event slots are REP/static.
+
+        Returns:
+            Pathology tokens ``[B, K, d_latent]`` and optional variable
+            attention ``[B, K, V]``.
+        """
+        if ts_event_grid.ndim != 4:
+            raise ValueError(
+                f"ts_event_grid must be rank 4, got shape={tuple(ts_event_grid.shape)}"
+            )
+        B, n_time_tokens, n_grid_events, embedding_dim = ts_event_grid.shape
+        expected_time_tokens = self.n_timesteps + 1
+        if n_time_tokens != expected_time_tokens:
+            raise ValueError(
+                f"event readout expected {expected_time_tokens} DuETT time tokens "
+                f"({self.n_timesteps} hourly + REP), got {n_time_tokens}"
+            )
+        if n_grid_events < 2:
+            raise ValueError("event grid must contain dynamic events and a static slot")
+        if embedding_dim != self.d_event_embedding:
+            raise ValueError(
+                f"expected event embedding dim {self.d_event_embedding}, "
+                f"got {embedding_dim}"
+            )
+        n_dynamic_events = n_grid_events - 1
+        dynamic_grid = ts_event_grid[:, :-1, :-1, :]  # remove REP and static slots
+        event_tokens = dynamic_grid.transpose(1, 2).contiguous().reshape(
+            B, n_dynamic_events, self.d_event_trajectory
+        )  # [B, V, T*E]
+
+        temporal_q = self.event_query_proj(self.temporal_queries)  # [K, T*E]
+        q = self.event_query_norm(temporal_q)
+        k = self.event_key_norm(event_tokens)
+        scores = torch.einsum("kd,bvd->bkv", q, k)
+        scores = scores * (self.d_event_trajectory ** -0.5)
+        event_attn = scores.softmax(dim=-1)
+
+        # Attention weights choose variables; the values remain the uncompressed
+        # full trajectories and are projected only after selection/aggregation.
+        summary = torch.einsum("bkv,bvd->bkd", event_attn, event_tokens)
+        temporal_tokens = self.event_out_proj(summary)
+        temporal_tokens = self.ts_self(temporal_tokens, temporal_tokens)
+        return temporal_tokens, event_attn if return_attn else None
+
+    def forward(self, ts_event_grid, img_patches_proj, return_attn=False):
+        B = ts_event_grid.size(0)
+        img_q = self.image_queries.unsqueeze(0).expand(B, -1, -1)
+
+        I, img_attn = (self.img_cross(img_q, img_patches_proj, return_attn=True) if return_attn else (self.img_cross(img_q, img_patches_proj), None))
         I = self.img_self(I, I)
 
-        ##########################################################################################
-        if ts_ablation == "full":         ts_selected = ts_tokens
-        elif ts_ablation == "hourly_only": ts_selected = ts_tokens[:, :-1, :]
-        elif ts_ablation == "rep_only":    ts_selected = ts_tokens[:, -1:, :]
-        else: raise ValueError(ts_ablation)
-        ##########################################################################################
+        T_tok, event_attn = self._read_event_trajectories(
+            ts_event_grid, return_attn
+        )
 
-        ts_kv = self.ts_proj(ts_selected)
-        # ts_q = self.temporal_queries.unsqueeze(0).expand(B, -1, -1)
-        ts_q = self.pathology_queries.unsqueeze(0).expand(B, -1, -1)
-
-        T_tok, ts_attn = (self.ts_cross(ts_q, ts_kv, return_attn=True)
-                          if return_attn else (self.ts_cross(ts_q, ts_kv), None))
-        T_tok = self.ts_self(T_tok, T_tok)
-        # F_tok = self.fusion(torch.cat([I, T_tok], dim=-1))   # ── OLD: concat MLP fusion
-        # img_logits    = torch.stack([h(I[:, k]).squeeze(-1)     for k, h in enumerate(self.image_heads)],    dim=1)
-        # ts_logits     = torch.stack([h(T_tok[:, k]).squeeze(-1) for k, h in enumerate(self.temporal_heads)], dim=1)
-        # fusion_logits = torch.stack([h(F_tok[:, k]).squeeze(-1) for k, h in enumerate(self.fusion_heads)],   dim=1)
-
-        # [B, K, d] → [B, K, 1] → [B, K]
-        img_logits    = self.image_head(I).squeeze(-1) + self.image_label_bias.unsqueeze(0) # Prevalence Bias
+        img_logits    = self.image_head(I).squeeze(-1) + self.image_label_bias.unsqueeze(0)
         ts_logits     = self.temporal_head(T_tok).squeeze(-1) + self.temporal_label_bias.unsqueeze(0)
-        # fusion_logits = self.fusion_head(F_tok).squeeze(-1) + self.fusion_label_bias.unsqueeze(0)  # ── OLD
 
-        # ── NEW: residual fusion. image logit 을 anchor, TS 는 correction 만 담당.
-        # detach → fusion loss 가 image branch 를 통해 학습되는 shortcut 을 차단.
-        # correction_head 마지막 Linear zero-init → 초기 fusion == image-only.
-        ts_correction     = self.correction_head(T_tok).squeeze(-1)          # [B, K]  raw
-        scaled_correction = self.beta.unsqueeze(0) * ts_correction           # [B, K]  β·raw
-        fusion_logits     = img_logits.detach() + scaled_correction          # [B, K]
+        # A2: T_tok 을 query, I.detach() 를 key/value 로 하는 cross-attention.
+        # 각 pathology 마다 image 표현의 어느 부분이 residual 예측에 관련 있는지 attention 이 학습.
+        # I.detach() 로 fusion loss gradient 가 image branch 로 흐르는 것을 차단 (anchor 유지).
+        correction_input  = self.correction_cross(T_tok, I.detach())  # [B, K, d_latent]
+        ts_correction     = self.correction_head(correction_input).squeeze(-1)
+        scaled_correction = self.beta.unsqueeze(0) * ts_correction
+        fusion_logits     = img_logits.detach() + scaled_correction
 
-        # residual 모드에서는 token 레벨의 "fusion 표현" 이 없음. downstream (viz Fig4 등)
-        # 호환을 위해 T_tok 을 fusion_tokens placeholder 로 노출 (ts panel 과 동일).
         out = {
             "img_logits":        img_logits,
             "ts_logits":         ts_logits,
@@ -526,8 +707,11 @@ class PatchDualPathologyPerceiver(nn.Module):
             "ts_correction":     ts_correction,
             "scaled_correction": scaled_correction,
         }
-        if return_attn: out["img_attn"] = img_attn; out["ts_attn"] = ts_attn
+        if return_attn:
+            out["img_attn"] = img_attn
+            out["event_attn"] = event_attn
         return out
+
 
 
 # ─── NEW: Pathology-wise residual fusion ─────────────────────────────────────
@@ -654,6 +838,217 @@ class _PerceiverBlock(nn.Module):
 # =============================================================================
 # Teacher / Student
 # =============================================================================
+# Old
+# class TeacherModel(nn.Module):
+#     def __init__(
+#         self,
+#         duett_backbone: DuettFeatureExtractor,
+#         cxr_encoder: CXREncoder,
+#         perceiver,  # TemporalPerceiver / PathologyPerceiver / DualPathologyPerceiver
+#         head_hidden: int = 128,
+#         head_dropout: float = 0.1,
+#         cxr_return_patches: bool = True,
+#         d_img: int = 768,
+#         use_aux_cxr: bool = True,
+#         aux_head_hidden: int = 128,
+#         pathology_mode: bool = False,
+#         dual_pathology_mode: bool = False,
+#         patch_dual_pathology_mode: bool = False,
+#         pretrained_cxr_head_ckpt: Optional[str] = None,
+#         pathology_labels: Optional[tuple] = None,
+#     ):
+#         super().__init__()
+#         n_modes = sum([pathology_mode, dual_pathology_mode, patch_dual_pathology_mode])
+#         if n_modes > 1:
+#             raise ValueError("pathology_mode / dual_pathology_mode / patch_dual_pathology_mode "
+#                              "중 최대 하나만 True 이어야 함.")
+
+#         self.duett = duett_backbone
+#         self.cxr = cxr_encoder
+#         self.perceiver = perceiver
+#         self.cxr_return_patches = cxr_return_patches
+#         self.pathology_mode = pathology_mode
+#         self.dual_pathology_mode = dual_pathology_mode
+#         self.patch_dual_pathology_mode = patch_dual_pathology_mode
+
+#         d = perceiver.d_latent
+#         # img_proj를 TeacherModel로 옮겨옴 → main/aux head가 공유
+#         self.img_proj = nn.Linear(d_img, d)
+
+#         if pathology_mode or dual_pathology_mode or patch_dual_pathology_mode:
+#             # Query-based perceiver 모드: 별도 main head/aux CXR head 없음.
+#             # main_logit은 perceiver 출력의 index 0 (Edema query)에서 뽑음.
+#             self.head = None
+#             self.aux_cxr_head = None
+#             self.use_aux_cxr = False
+#         else:
+#             self.head = nn.Sequential(
+#                 nn.Linear(d, head_hidden), nn.GELU(), nn.Dropout(head_dropout),
+#                 nn.Linear(head_hidden, 1),
+#             )
+#             self.use_aux_cxr = use_aux_cxr
+#             if use_aux_cxr:
+#                 self.aux_cxr_head = nn.Sequential(
+#                     nn.Linear(d, aux_head_hidden), nn.GELU(), nn.Dropout(head_dropout),
+#                     nn.Linear(aux_head_hidden, 1),
+#                 )
+
+#         # ─── NEW dual: frozen pretrained CXR head + keep_indices ────────────
+#         if dual_pathology_mode:
+#             if pretrained_cxr_head_ckpt is None or pathology_labels is None:
+#                 raise ValueError("dual_pathology_mode requires pretrained_cxr_head_ckpt AND pathology_labels")
+#             state = torch.load(pretrained_cxr_head_ckpt, map_location="cpu", weights_only=False)
+#             num_pretrained = int(state["num_classes"])
+#             pretrained_labels = list(state["label_cols"])
+#             missing = [lbl for lbl in pathology_labels if lbl not in pretrained_labels]
+#             if missing:
+#                 raise ValueError(f"pretrained CXR head에 없는 pathology_labels: {missing}. "
+#                                  f"pretrained labels: {pretrained_labels}")
+#             keep_idx = [pretrained_labels.index(lbl) for lbl in pathology_labels]
+
+#             self.pretrained_cxr_head = nn.Linear(d_img, num_pretrained)
+#             # ckpt classifier_state_dict의 key는 'Sequential[1] = Linear'이므로 1.weight/1.bias
+#             clf_sd = state["classifier_state_dict"]
+#             self.pretrained_cxr_head.load_state_dict({
+#                 "weight": clf_sd["1.weight"],
+#                 "bias":   clf_sd["1.bias"],
+#             })
+#             for p in self.pretrained_cxr_head.parameters():
+#                 p.requires_grad = False
+#             self.register_buffer("cxr_head_keep_idx", torch.tensor(keep_idx, dtype=torch.long))
+#             print(f"[keep_idx debug] pathology_labels={pathology_labels}, "
+#                 f"pretrained_labels={pretrained_labels}, keep_idx={keep_idx.tolist() if hasattr(keep_idx,'tolist') else keep_idx}")
+
+
+
+#     def forward(self,
+#                 x_ts_list, x_static_list, bin_ends_list,
+#                 pixel_values: torch.Tensor,
+#                 batch_size: Optional[int] = None,
+#                 return_attn: bool = False):
+#         """Returns:
+#             - dual_pathology_mode=True : dict(main_logit, img_logits, ts_logits, fusion_logits[, tokens, attn])
+#             - pathology_mode=True      : dict(main_logit, stage2_logits, stage4_logits[, tokens, attn])
+#             - use_aux_cxr=True         : tuple(main_logit, aux_logit)  (legacy)
+#             - else                     : Tensor main_logit             (legacy)
+
+#         return_attn=True는 pathology / dual_pathology 모드 전용 (viz용 inference).
+#         """
+
+#         if batch_size is None:
+#             batch_size = pixel_values.shape[0]
+
+#         x = (x_ts_list, x_static_list, bin_ends_list)
+#         duett_in = self.duett.feats_to_input(x, batch_size)
+
+#         # 현재의 pathology query는 24시간 중 언제가 중요한가만 직접 선택함.
+#         ts_tokens, ts_grid = self.duett.encode(duett_in)   # [B, T+1, D]
+
+#         # ts_tokens 말고 grid를 쓰는 방식을 추후 고안
+#         dynamic_grid = ts_grid[:, :-1, :-1, :] # [REP], static token 제거 ([B, 24, V, D])
+
+#         # grid cross를 만들어야 할 듯? (Q: pathology queries, K,V: grid)
+#         # -> [B, K, 24V]
+
+
+#         if self.patch_dual_pathology_mode:
+#             img_cls, img_patches = self.cxr(pixel_values)
+#             img_patches_proj = self.img_proj(img_patches)
+#             out = self.perceiver(ts_tokens, img_patches_proj, return_attn=return_attn)            
+
+#             # 7 by 7 spatial pooling 
+#             # h = w = int(N ** 0.5)                           # 37 → 37×37
+#             # img_spatial = img_patches.transpose(1, 2).reshape(B, D, h, w)
+#             # img_pooled  = F.adaptive_avg_pool2d(img_spatial, (7, 7))
+#             # img_tokens  = img_pooled.flatten(2).transpose(1, 2)         # [B, 49, 768]
+#             # img_patches_proj = self.img_proj(img_tokens)                # [B, 49, D]
+#             # out = self.perceiver(ts_tokens, img_patches_proj, return_attn=return_attn)
+            
+#             result = {
+#                 "main_logit":        out["fusion_logits"][:, 0],
+#                 "img_logits":        out["img_logits"],
+#                 "ts_logits":         out["ts_logits"],
+#                 "fusion_logits":     out["fusion_logits"],
+#                 # residual fusion 진단용 (evaluator가 사용). 항상 노출.
+#                 "ts_correction":     out["ts_correction"],
+#                 "scaled_correction": out["scaled_correction"],
+#             }
+#             if return_attn:
+#                 result["img_tokens"]    = out["img_tokens"]
+#                 result["ts_tokens"]     = out["ts_tokens"]
+#                 result["fusion_tokens"] = out["fusion_tokens"]
+#                 result["img_attn"]      = out["img_attn"]
+#                 result["ts_attn"]       = out["ts_attn"]
+#             return result
+
+#         # ─── NEW dual: CLS-only + frozen pretrained head + residual fusion ───
+#         if self.dual_pathology_mode:
+#             cls = self.cxr(pixel_values)
+#             if isinstance(cls, tuple):    # cxr_return_patches=True 설정이라도 CLS만 사용
+#                 cls = cls[0]
+#             with torch.no_grad():
+#                 pretrained_logits = self.pretrained_cxr_head(cls)             # [B, C_pretrain]
+#             img_logits = pretrained_logits[:, self.cxr_head_keep_idx]         # [B, K]
+#             out = self.perceiver(ts_tokens, img_logits, return_attn=return_attn)
+#             result = {
+#                 "main_logit":    out["fusion_logits"][:, 0],
+#                 "img_logits":    out["img_logits"],
+#                 "ts_logits":     out["ts_logits"],
+#                 "fusion_logits": out["fusion_logits"],
+#             }
+#             if return_attn:
+#                 result["ts_tokens"] = out["ts_tokens"]
+#                 result["ts_attn"]   = out["ts_attn"]
+#                 result["residuals"] = out["residuals"]
+#             return result
+
+#         if self.cxr_return_patches:
+#             img_cls, img_patches = self.cxr(pixel_values)
+
+#             B, N, D = img_patches.shape
+#             h = w = int(N ** 0.5)  # 37
+
+#             # patch → 2D spatial → adaptive avg pool → token sequence
+#             img_spatial = img_patches.transpose(1, 2).reshape(B, D, h, w)    # [B, 768, 37, 37]
+#             img_pooled  = F.adaptive_avg_pool2d(img_spatial, (7, 7))         # [B, 768, 7, 7]
+#             img_tokens  = img_pooled.flatten(2).transpose(1, 2)              # [B, 49, 768]
+
+#             if self.pathology_mode:
+#                 # 4 pathology queries × 7×7=49 patches (CLS 미사용)
+#                 img_patches_proj = self.img_proj(img_tokens)                 # [B, 49, D]
+#                 out = self.perceiver(ts_tokens, img_patches_proj, return_attn=return_attn)
+#                 result = {
+#                     "main_logit":    out["stage4_logits"][:, 0],  # Edema (index 0)
+#                     "stage2_logits": out["stage2_logits"],        # [B, K]
+#                     "stage4_logits": out["stage4_logits"],        # [B, K]
+#                 }
+#                 if return_attn:
+#                     result["stage2_tokens"] = out["stage2_tokens"]
+#                     result["stage4_tokens"] = out["stage4_tokens"]
+#                     result["img_attn"] = out["img_attn"]           # [B, K, 49]
+#                     result["ts_attn"]  = out["ts_attn"]            # [B, K, T+1]
+#                 return result
+
+#             img_kv = torch.cat([img_cls.unsqueeze(1), img_tokens], dim=1)    # [B, 50, 768]
+
+#             img_kv_proj = self.img_proj(img_kv)                          # [B, 50, D]
+
+#             fused = self.perceiver(ts_tokens, img_kv_proj)
+
+#             main_logit = self.head(fused).squeeze(-1)                        # [B]
+
+#             if self.use_aux_cxr:
+#                 cxr_summary = img_kv_proj[:, 0]                              # [B, D]  CLS 위치
+#                 aux_logit = self.aux_cxr_head(cxr_summary).squeeze(-1)       # [B]
+#                 return main_logit, aux_logit
+#             return main_logit
+
+#         else: 
+#             img_cls = self.cxr(pixel_values)
+#             fused = self.perceiver(ts_tokens, img_cls)  # [B, d_latent]
+#             logit = self.head(fused).squeeze(-1)      # [B]
+#             return logit
+
 class TeacherModel(nn.Module):
     def __init__(
         self,
@@ -755,19 +1150,17 @@ class TeacherModel(nn.Module):
 
         x = (x_ts_list, x_static_list, bin_ends_list)
         duett_in = self.duett.feats_to_input(x, batch_size)
-        ts_tokens, ts_grid = self.duett.encode(duett_in)   # [B, T+1, D]
-
-        # ts_tokens 말고 grid를 쓰는 방식을 추후 고안
-        dynamic_grid = ts_grid[:, :-1, :-1, :] # [REP], static token 제거 ([B, 24, V, D])
-
-        # grid cross를 만들어야 할 듯? (Q: pathology queries, K,V: grid)
-        # -> [B, K, 24V]
+        ts_tokens, ts_event_grid = self.duett.encode(duett_in)   # [B, T+1, D]
 
 
         if self.patch_dual_pathology_mode:
             img_cls, img_patches = self.cxr(pixel_values)
             img_patches_proj = self.img_proj(img_patches)
-            out = self.perceiver(ts_tokens, img_patches_proj, return_attn=return_attn)            
+            out = self.perceiver(
+                ts_event_grid,
+                img_patches_proj,
+                return_attn=return_attn,
+            )
 
             # 7 by 7 spatial pooling 
             # h = w = int(N ** 0.5)                           # 37 → 37×37
@@ -791,7 +1184,7 @@ class TeacherModel(nn.Module):
                 result["ts_tokens"]     = out["ts_tokens"]
                 result["fusion_tokens"] = out["fusion_tokens"]
                 result["img_attn"]      = out["img_attn"]
-                result["ts_attn"]       = out["ts_attn"]
+                result["event_attn"]    = out["event_attn"]
             return result
 
         # ─── NEW dual: CLS-only + frozen pretrained head + residual fusion ───

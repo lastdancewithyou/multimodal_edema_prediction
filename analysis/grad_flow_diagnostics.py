@@ -67,21 +67,26 @@ def _unwrap_model(model: torch.nn.Module, accelerator=None) -> torch.nn.Module:
     return model
 
 
-def _find_pathology_queries(model: torch.nn.Module) -> Tuple[str, Tensor]:
-    """Find the single shared ``pathology_queries`` parameter."""
-    matches = [
-        (name, parameter)
-        for name, parameter in model.named_parameters()
-        if name.endswith("pathology_queries")
-    ]
-    if len(matches) != 1:
-        names = [name for name, _ in matches]
-        raise RuntimeError(
-            "Expected exactly one parameter ending in 'pathology_queries', "
-            f"but found {len(matches)}: {names}. "
-            "This diagnostic is intended for the shared-query model."
-        )
-    return matches[0]
+def _find_pathology_query_banks(
+    model: torch.nn.Module,
+) -> Tuple[Tuple[str, ...], Tuple[Tensor, ...]]:
+    """Find independent modality queries or the legacy shared query."""
+    named = dict(model.named_parameters())
+    image = [(n, p) for n, p in named.items() if n.endswith("image_queries")]
+    temporal = [(n, p) for n, p in named.items() if n.endswith("temporal_queries")]
+    if len(image) == 1 and len(temporal) == 1:
+        pairs = (image[0], temporal[0])
+        return tuple(n for n, _ in pairs), tuple(p for _, p in pairs)
+
+    shared = [(n, p) for n, p in named.items() if n.endswith("pathology_queries")]
+    if len(shared) == 1:
+        return (shared[0][0],), (shared[0][1],)
+
+    raise RuntimeError(
+        "Expected image_queries + temporal_queries, or one legacy "
+        f"pathology_queries; found image={len(image)}, temporal={len(temporal)}, "
+        f"shared={len(shared)}"
+    )
 
 
 def _per_pathology_bce(
@@ -261,11 +266,16 @@ def run_dual_gradient_diagnostics(
         raise ValueError("max_batches must be positive")
 
     model = _unwrap_model(teacher, accelerator)
-    query_name, prototypes = _find_pathology_queries(model)
-    if not prototypes.requires_grad:
-        raise RuntimeError(f"{query_name} does not require gradients")
+    query_names, query_parameters = _find_pathology_query_banks(model)
+    for query_name, parameter in zip(query_names, query_parameters):
+        if not parameter.requires_grad:
+            raise RuntimeError(f"{query_name} does not require gradients")
 
-    n_labels, d_model = prototypes.shape
+    n_labels, d_model = query_parameters[0].shape
+    if any(parameter.shape != (n_labels, d_model) for parameter in query_parameters):
+        raise RuntimeError("All pathology query banks must have the same [K, D] shape")
+    n_query_banks = len(query_parameters)
+    query_shape = (n_query_banks, n_labels, d_model)
     if label_names is None:
         label_names = [f"label_{k}" for k in range(n_labels)]
     if len(label_names) != n_labels:
@@ -275,12 +285,12 @@ def run_dual_gradient_diagnostics(
 
     branch_names = ("img", "ts", "fus")
     grad_sums = {
-        name: torch.zeros_like(prototypes, dtype=torch.float32, device=device)
+        name: torch.zeros(query_shape, dtype=torch.float32, device=device)
         for name in branch_names
     }
     per_label_grad_sums = {
         name: torch.zeros(
-            n_labels, n_labels, d_model, dtype=torch.float32, device=device
+            n_labels, *query_shape, dtype=torch.float32, device=device
         )
         for name in branch_names
     }
@@ -351,7 +361,9 @@ def run_dual_gradient_diagnostics(
                 )
 
                 batch_grads = {
-                    name: _grad(losses[name], prototypes)
+                    name: torch.stack(
+                        _grads(losses[name], query_parameters), dim=0
+                    )
                     for name in branch_names
                 }
                 for name in branch_names:
@@ -370,8 +382,8 @@ def run_dual_gradient_diagnostics(
                         ("fus", "fus_per"),
                     ):
                         label_loss = label_weights[k] * losses[per_key][k]
-                        per_label_grad_sums[name][k] += _grad(
-                            label_loss, prototypes
+                        per_label_grad_sums[name][k] += torch.stack(
+                            _grads(label_loss, query_parameters), dim=0
                         )
 
                 img_tokens = output["img_tokens"]
@@ -493,8 +505,11 @@ def run_dual_gradient_diagnostics(
             + alphas["ts"] * ts_grad
             + alphas["fus"] * fus_grad
         )
+        # Independent model: image supervision owns bank 0; TS and residual
+        # fusion own the temporal bank. Legacy shared-query models use bank 0.
+        own_bank = {"img": 0, "ts": n_query_banks - 1, "fus": n_query_banks - 1}
         own_row_norm = {
-            name: _float(_norm(mean_label_grads[name][k, k]))
+            name: _float(_norm(mean_label_grads[name][k, own_bank[name], k]))
             for name in branch_names
         }
         full_norm = {
@@ -539,19 +554,27 @@ def run_dual_gradient_diagnostics(
     # cross-modal coordinates as semantically aligned.
     with torch.no_grad():
         perceiver = model.perceiver
-        raw_gram = _cosine_matrix(prototypes.detach())
+        image_prototypes = query_parameters[0].detach()
+        temporal_prototypes = query_parameters[-1].detach()
+        raw_gram = _cosine_matrix(temporal_prototypes)
         img_effective = _effective_queries(
-            perceiver.img_cross, prototypes.detach()
+            perceiver.img_cross, image_prototypes
         )
-        ts_effective = _effective_queries(
-            perceiver.ts_cross, prototypes.detach()
-        )
+        if hasattr(perceiver, "event_query_proj"):
+            ts_effective = perceiver.event_query_norm(
+                perceiver.event_query_proj(temporal_prototypes)
+            )
+        else:
+            ts_effective = _effective_queries(
+                perceiver.ts_cross, temporal_prototypes
+            )
         img_gram = _cosine_matrix(img_effective)
         ts_gram = _cosine_matrix(ts_effective)
         geometry_gap = torch.linalg.vector_norm(img_gram - ts_gram) / n_labels
 
     report: Dict[str, Any] = {
-        "query_parameter": query_name,
+        "query_parameter": "+".join(query_names),
+        "query_layout": "independent" if n_query_banks == 2 else "shared",
         "batches": int(round(_float(batch_count))),
         "samples": int(round(_float(sample_count))),
         "branch": branch_report,
@@ -574,8 +597,9 @@ def run_dual_gradient_diagnostics(
             "prototype_norms": [
                 _float(value)
                 for value in torch.linalg.vector_norm(
-                    prototypes.detach().float(), dim=-1
-                )
+                    torch.stack([p.detach().float() for p in query_parameters]),
+                    dim=-1,
+                ).flatten()
             ],
             "raw_cosine": raw_gram.detach().cpu().tolist(),
             "image_effective_cosine": img_gram.detach().cpu().tolist(),
@@ -591,6 +615,7 @@ def format_gradient_diagnostics(report: Mapping[str, Any]) -> str:
     lines = [
         (
             f"[grad-diag] parameter={report['query_parameter']} "
+            f"layout={report.get('query_layout', 'shared')} "
             f"batches={report['batches']} samples={report['samples']}"
         ),
         "",
@@ -608,6 +633,12 @@ def format_gradient_diagnostics(report: Mapping[str, Any]) -> str:
 
     cosine = report["pairwise_gradient_cosine"]
     sensitivity = report["fusion_token_sensitivity"]
+    if report.get("query_layout") == "independent":
+        lines.extend([
+            "",
+            "img–ts query-gradient cosine is expected to be 0: the modality "
+            "queries occupy disjoint parameter banks.",
+        ])
     lines.extend(
         [
             "",

@@ -95,7 +95,8 @@ def _make_param_groups(model, args):
         elif "correction_head" in name or name.endswith(".beta") or name == "beta":
             # beta 는 correction_head 와 함께 correction group 으로 (correction_lr_mult 공유).
             correction.append(p)
-        elif name.endswith("pathology_queries"):
+        elif name.endswith("_queries"):
+            # pathology_queries (single) / image_queries, temporal_queries (dual_patch)
             queries.append(p)
         else:
             rest.append(p)
@@ -307,6 +308,8 @@ def train_teacher(args):
             d_latent=args.d_latent,
             n_heads=args.n_perceiver_heads,
             dropout=args.perceiver_dropout,
+            n_timesteps=args.n_timesteps,
+            d_event_embedding=backbone.d_embedding,
         )
         accelerator.print(f"[teacher] PatchDualPathologyPerceiver: K={len(pathology_labels_tuple)}  "
                           f"labels={pathology_labels_tuple}  (patches → cross-attn)")
@@ -388,7 +391,7 @@ def train_teacher(args):
         label_weights = torch.tensor(
             [float(w) for w in args.label_weights.split(",")], dtype=torch.float32)
         if label_weights.numel() != len(pathology_labels_tuple):
-            raise ValueError(f"label_weights len ({label_weights.numel()}) != "
+            raise ValueError(f"label_weights len ({label_weights.numel()}) `!= "
                              f"pathology_labels len ({len(pathology_labels_tuple)})")
         # pos_weight는 unimodal(CXR/TS) probe들과 통일하기 위해 사용하지 않음.
         # 파이프라인 전체가 동일 loss config여야 fusion 이득이 순수 intervention 효과로 해석됨.
@@ -455,10 +458,12 @@ def train_teacher(args):
             if uses_dual_loss and args.lp_only_correction:
                 out = train_teacher_dual_pathology_lp_batch(
                     batch, teacher, dual_loss_fn, optimizer, device, accelerator,
-                    beta_l2=args.lp_beta_l2, corr_l2=args.lp_corr_l2)
+                    beta_l2=args.lp_beta_l2, corr_l2=args.lp_corr_l2,
+                    aux_residual_alpha=args.aux_residual_alpha)
             elif uses_dual_loss:
                 out = train_teacher_dual_pathology_batch(
-                    batch, teacher, dual_loss_fn, optimizer, device, accelerator)
+                    batch, teacher, dual_loss_fn, optimizer, device, accelerator,
+                    aux_residual_alpha=args.aux_residual_alpha)
             elif is_pathology:
                 out = train_teacher_pathology_batch(
                     batch, teacher, path_loss_fn, optimizer, device, accelerator)
@@ -501,6 +506,10 @@ def train_teacher(args):
                     log["train/img_loss"] = avg_img
                     log["train/ts_loss"]  = avg_ts
                     log["train/fus_loss"] = avg_fus
+                    if args.aux_residual_alpha > 0.0:
+                        aux_res = float(out.get("aux_residual", 0.0))
+                        parts.append(f"aux_res={aux_res:.4f}")
+                        log["train/aux_residual_loss"] = aux_res
                     # LP regularizer 계측 (마지막 batch 값 그대로 — 스무딩 없이 최신치를 보여 β/correction magnitude 변화 감지)
                     if args.lp_only_correction:
                         reg_b = float(out.get("reg_beta_l2", 0.0))
@@ -537,7 +546,7 @@ def train_teacher(args):
                                              query_ref=query_ref)
             val_m = {"auroc": val_p["main_auroc"], "auprc": val_p["main_auprc"], "n": val_p["n"]}
             if accelerator.is_main_process:
-                print(f"[teacher ep{epoch}] main(Edema fusion) "
+                print(f"[teacher ep{epoch}] Val main(Edema fusion) "
                       f"AUROC={val_m['auroc']:.4f} AUPRC={val_m['auprc']:.4f} n={val_m['n']}")
                 print(format_dual_pathology_gap_table(val_p))
                 log_val = {
