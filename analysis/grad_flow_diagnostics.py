@@ -782,11 +782,16 @@ def main():
     if mode != "dual_patch":
         raise RuntimeError(f"perceiver_type={mode} 은 지원하지 않음. dual_patch 만 대상.")
 
-    label_weights = torch.tensor(
-        [float(w) for w in ck_args.label_weights.split(",")], dtype=torch.float32)
-    if label_weights.numel() != len(pathology_labels):
-        raise ValueError(f"label_weights len ({label_weights.numel()}) != "
-                         f"pathology_labels len ({len(pathology_labels)})")
+    # 새 ckpt 는 label_weights 를 args 에 저장하지 않음 → uniform 으로 fallback.
+    raw_lw = getattr(ck_args, "label_weights", None)
+    if raw_lw:
+        label_weights = torch.tensor(
+            [float(w) for w in raw_lw.split(",")], dtype=torch.float32)
+        if label_weights.numel() != len(pathology_labels):
+            raise ValueError(f"label_weights len ({label_weights.numel()}) != "
+                             f"pathology_labels len ({len(pathology_labels)})")
+    else:
+        label_weights = torch.ones(len(pathology_labels), dtype=torch.float32)
     loss_fn = DualPathologyLoss(
         label_weights=label_weights,
         pos_weight=None,

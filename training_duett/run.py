@@ -84,9 +84,9 @@ def _add_common(p: argparse.ArgumentParser):
                    help="head/perceiver/proj 등 신규 파라미터의 base lr")
     p.add_argument("--backbone_lr_mult", type=float, default=0.2,
                    help="pretrained backbone(DuETT/CXR) lr = args.lr × 이 값")
-    p.add_argument("--correction_lr_mult", type=float, default=5.0,
+    p.add_argument("--correction_lr_mult", type=float, default=1.0,
                    help="dual_patch residual mode: correction_head lr = args.lr × 이 값. "
-                        "correction_head 는 늦게 살아나야 하므로 base lr 보다 크게.")
+                        "원점 baseline에서는 다른 신규 모듈과 같은 1.0을 사용.")
     p.add_argument("--query_lr_mult",   type=float, default=0.2,
                    help="dual_patch residual mode: shared pathology_queries lr = args.lr × 이 값. "
                         "queries 는 image/ts branches 와 attention 공유하므로 천천히 이동.")
@@ -130,9 +130,6 @@ def _add_common(p: argparse.ArgumentParser):
                         "dual_patch: PatchDualPathologyPerceiver (patches × pathology query "
                         "cross-attention; pretrained head 불필요)")
 
-    p.add_argument("--label_weights",   type=str, default="1.0,1.0,1.0,1.0",
-                   help="comma-separated per-pathology loss weight "
-                        "(개수 = DEFAULT_PATHOLOGY_LABELS 개수)")
     # Single (PathologyPerceiver) 전용 loss alpha
     p.add_argument("--aux_stage2_alpha", type=float, default=1.0,
                    help="[single] image-only aux (stage2) 전체 가중치")
@@ -147,8 +144,9 @@ def _add_common(p: argparse.ArgumentParser):
     p.add_argument("--aux_fus_alpha",   type=float, default=1.0,
                    help="[dual] fusion branch loss 가중치 (main task)")
     p.add_argument("--aux_residual_alpha", type=float, default=0.0,
-                   help="[dual_patch] Correction 이 image residual (y − sigmoid(img_logit.detach())) 을 "
-                        "직접 예측하도록 강제하는 MSE aux loss weight. 0 이면 비활성. "
+                   help="[dual_patch] Correction 이 image anchor + correction 을 통과한 확률을 "
+                        "smoothed label 에 맞추도록 하는 KL divergence aux loss weight. 0 이면 비활성. "
+                        "gradient 는 scaled_correction 만 통과 (img_logit 은 detach). "
                         "fusion loss 만으로 correction 방향 학습이 실패할 때 사용.")
     p.add_argument("--pretrained_cxr_head_ckpt", type=str,
                    default=REPO_DEFAULTS["pretrained_cxr_head_ckpt"],

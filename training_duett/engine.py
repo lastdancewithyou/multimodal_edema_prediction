@@ -147,13 +147,21 @@ def train_teacher_dual_pathology_batch(batch, teacher, path_loss_fn, optimizer, 
     total = losses["total"]
     aux_residual_loss = torch.zeros((), device=device)
     if aux_residual_alpha > 0.0 and "scaled_correction" in out:
-        img_prob = torch.sigmoid(out["img_logits"].detach())
-        aux_target = (b["y_multi"].float() - img_prob).detach()
+        # KL(Bernoulli(y_smooth) || Bernoulli(sigmoid(img_logit.detach() + scaled_correction)))
+        # scaled_correction 을 통해서만 gradient 가 흐르도록 img_logit 은 detach.
+        # Label smoothing 으로 log(0) 방지 + 극단 확률 대응.
+        eps = 0.05
+        y = b["y_multi"].float()
+        y_smooth = y * (1.0 - eps) + (1.0 - y) * eps
+        anchor = out["img_logits"].detach()
+        p_corr = torch.sigmoid(anchor + out["scaled_correction"]).clamp(min=1e-6, max=1.0 - 1e-6)
+        kl = (
+            y_smooth * (torch.log(y_smooth) - torch.log(p_corr)) +
+            (1.0 - y_smooth) * (torch.log(1.0 - y_smooth) - torch.log(1.0 - p_corr))
+        )
         mask = b["y_multi_mask"].float()
         denom = mask.sum().clamp(min=1.0)
-        aux_residual_loss = (
-            ((out["scaled_correction"] - aux_target) ** 2) * mask
-        ).sum() / denom
+        aux_residual_loss = (kl * mask).sum() / denom
         total = total + aux_residual_alpha * aux_residual_loss
 
     optimizer.zero_grad()
@@ -214,13 +222,18 @@ def train_teacher_dual_pathology_lp_batch(batch, teacher, path_loss_fn, optimize
     if corr_l2 > 0.0:
         reg_corr = corr_l2 * (out["scaled_correction"] ** 2).mean()
     if aux_residual_alpha > 0.0 and "scaled_correction" in out:
-        img_prob = torch.sigmoid(out["img_logits"].detach())
-        aux_target = (b["y_multi"].float() - img_prob).detach()
+        eps = 0.05
+        y = b["y_multi"].float()
+        y_smooth = y * (1.0 - eps) + (1.0 - y) * eps
+        anchor = out["img_logits"].detach()
+        p_corr = torch.sigmoid(anchor + out["scaled_correction"]).clamp(min=1e-6, max=1.0 - 1e-6)
+        kl = (
+            y_smooth * (torch.log(y_smooth) - torch.log(p_corr)) +
+            (1.0 - y_smooth) * (torch.log(1.0 - y_smooth) - torch.log(1.0 - p_corr))
+        )
         mask = b["y_multi_mask"].float()
         denom = mask.sum().clamp(min=1.0)
-        aux_residual_loss = (
-            ((out["scaled_correction"] - aux_target) ** 2) * mask
-        ).sum() / denom
+        aux_residual_loss = (kl * mask).sum() / denom
     total = losses["total"] + reg_beta + reg_corr + aux_residual_alpha * aux_residual_loss
 
     optimizer.zero_grad()

@@ -4,15 +4,15 @@ set -e
 CUDA_VISIBLE_DEVICES=0 accelerate launch \
   --config_file /home/DAHS1/.cache/huggingface/accelerate/config_single_gpu_0.yaml \
   main_train_teacher_duett.py \
-  --eval_train_batches 100 \
+  --eval_train_batches 50 \
   --perceiver_type dual_patch \
   --freeze_duett \
   --aux_img_alpha 0.5 \
   --aux_ts_alpha 0.5 \
   --aux_fus_alpha 1.0 \
   --query_lr_mult 0.5 \
-  --correction_lr_mult 8.0 \
-  --aux_residual_alpha 0.5 \
+  --correction_lr_mult 1.0 \
+  --aux_residual_alpha 0.0 \
   --wandb_disabled
 
   # alpha 0.0_0.5_1.0

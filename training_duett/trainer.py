@@ -79,11 +79,11 @@ def _make_param_groups(model, args):
 
         backbone(DuETT / CXR)           : args.lr × backbone_lr_mult (기본 0.2)
         pathology_queries (shared query): args.lr × query_lr_mult    (기본 0.2)
-        correction_head                 : args.lr × correction_lr_mult (기본 5.0)
+        correction_head                 : args.lr × correction_lr_mult (기본 1.0)
         rest (head/perceiver/proj/...)  : args.lr
 
     query 는 image/ts branch 가 공유하므로 급격히 흔들리면 두 branch 모두 손상 → 낮은 LR.
-    correction_head 는 zero-init 라 초기에 gradient 신호가 미미 → 높은 LR 로 빠르게 살림.
+    correction_head 는 zero-init지만 원점 baseline에서는 별도 LR 증폭 없이 학습한다.
     """
     backbone_prefixes = ("duett.", "cxr.")
     backbone, correction, queries, rest = [], [], [], []
@@ -101,7 +101,7 @@ def _make_param_groups(model, args):
         else:
             rest.append(p)
 
-    corr_mult  = float(getattr(args, "correction_lr_mult", 5.0))
+    corr_mult  = float(getattr(args, "correction_lr_mult", 1.0))
     query_mult = float(getattr(args, "query_lr_mult", 0.2))
 
     groups = []
@@ -308,11 +308,10 @@ def train_teacher(args):
             d_latent=args.d_latent,
             n_heads=args.n_perceiver_heads,
             dropout=args.perceiver_dropout,
-            n_timesteps=args.n_timesteps,
-            d_event_embedding=backbone.d_embedding,
         )
         accelerator.print(f"[teacher] PatchDualPathologyPerceiver: K={len(pathology_labels_tuple)}  "
-                          f"labels={pathology_labels_tuple}  (patches → cross-attn)")
+                          f"labels={pathology_labels_tuple}  "
+                          "(image patches + DuETT hourly tokens → cross-attn)")
     elif is_pathology:
         if PathologyPerceiver is None:
             raise ImportError("PathologyPerceiver is commented out in models/main_architecture_duett.py. "
@@ -388,15 +387,8 @@ def train_teacher(args):
     dual_loss_fn = None       # dual   (DualPathologyLoss)
     loss_fn = None            # legacy (BCEWithLogitsLoss)
     if is_query_based:
-        label_weights = torch.tensor(
-            [float(w) for w in args.label_weights.split(",")], dtype=torch.float32)
-        if label_weights.numel() != len(pathology_labels_tuple):
-            raise ValueError(f"label_weights len ({label_weights.numel()}) `!= "
-                             f"pathology_labels len ({len(pathology_labels_tuple)})")
-        # pos_weight는 unimodal(CXR/TS) probe들과 통일하기 위해 사용하지 않음.
-        # 파이프라인 전체가 동일 loss config여야 fusion 이득이 순수 intervention 효과로 해석됨.
-        accelerator.print(f"[teacher] pathology label_weights = {label_weights.tolist()}  "
-                          f"(pos_weight OFF — unimodal probes와 통일)")
+        # Uniform per-pathology weighting. pos_weight 도 unimodal probe 와 통일하기 위해 사용하지 않음.
+        label_weights = torch.ones(len(pathology_labels_tuple), dtype=torch.float32)
         if uses_dual_loss:
             dual_loss_fn = DualPathologyLoss(
                 label_weights=label_weights,
@@ -546,7 +538,7 @@ def train_teacher(args):
                                              query_ref=query_ref)
             val_m = {"auroc": val_p["main_auroc"], "auprc": val_p["main_auprc"], "n": val_p["n"]}
             if accelerator.is_main_process:
-                print(f"[teacher ep{epoch}] Val main(Edema fusion) "
+                print(f"[teacher ep{epoch}] Val macro (fusion, all pathologies) "
                       f"AUROC={val_m['auroc']:.4f} AUPRC={val_m['auprc']:.4f} n={val_m['n']}")
                 print(format_dual_pathology_gap_table(val_p))
                 log_val = {
@@ -576,7 +568,7 @@ def train_teacher(args):
             val_p = evaluate_pathology(teacher, val_loader, device, pathology_labels_tuple)
             val_m = {"auroc": val_p["main_auroc"], "auprc": val_p["main_auprc"], "n": val_p["n"]}
             if accelerator.is_main_process:
-                print(f"[teacher ep{epoch}] main(Edema stage4) "
+                print(f"[teacher ep{epoch}] Val macro (stage4, all pathologies) "
                       f"AUROC={val_m['auroc']:.4f} AUPRC={val_m['auprc']:.4f} n={val_m['n']}")
                 print(format_pathology_gap_table(val_p))
                 log_val = {
@@ -635,7 +627,7 @@ def train_teacher(args):
                 train_p = evaluate_dual_pathology(teacher, train_eval_loader, device, pathology_labels_tuple,
                                                    query_ref=query_ref)
                 if accelerator.is_main_process:
-                    print(f"[teacher ep{epoch}] TRAIN main(Edema fusion) "
+                    print(f"[teacher ep{epoch}] TRAIN macro (fusion, all pathologies) "
                           f"AUROC={train_p['main_auroc']:.4f} AUPRC={train_p['main_auprc']:.4f} "
                           f"n={train_p['n']}")
                     print(format_dual_pathology_gap_table(train_p))
@@ -656,7 +648,7 @@ def train_teacher(args):
             elif is_pathology:
                 train_p = evaluate_pathology(teacher, train_eval_loader, device, pathology_labels_tuple)
                 if accelerator.is_main_process:
-                    print(f"[teacher ep{epoch}] TRAIN main(Edema stage4) "
+                    print(f"[teacher ep{epoch}] TRAIN macro (stage4, all pathologies) "
                           f"AUROC={train_p['main_auroc']:.4f} AUPRC={train_p['main_auprc']:.4f} "
                           f"n={train_p['n']}")
                     print(format_pathology_gap_table(train_p))
@@ -712,7 +704,7 @@ def train_teacher(args):
             except Exception as exc:  # 진단은 학습에 영향 없어야 함
                 accelerator.print(f"[teacher] grad_diag skipped: {exc}")
 
-        # Early stopping (모든 rank에서 동일하게 판단해야 hang 안 남)
+        # Early stopping
         improved_t = torch.tensor(int(improved), device=device)
         if accelerator.num_processes > 1:
             from accelerate.utils import broadcast
@@ -731,8 +723,8 @@ def train_teacher(args):
         test_p = evaluate_dual_pathology(teacher, test_loader, device, pathology_labels_tuple,
                                           query_ref=query_ref)
         if accelerator.is_main_process:
-            print(f"[teacher] test main(Edema fusion) AUROC={test_p['main_auroc']:.4f}  "
-                  f"AUPRC={test_p['main_auprc']:.4f}")
+            print(f"[teacher] test macro (fusion, all pathologies) "
+                  f"AUROC={test_p['main_auroc']:.4f}  AUPRC={test_p['main_auprc']:.4f}")
             print(format_dual_pathology_gap_table(test_p))
             test_log = {"test/auroc": test_p["main_auroc"], "test/auprc": test_p["main_auprc"]}
             for r in test_p["per_label"]:
@@ -749,8 +741,8 @@ def train_teacher(args):
     elif is_pathology:
         test_p = evaluate_pathology(teacher, test_loader, device, pathology_labels_tuple)
         if accelerator.is_main_process:
-            print(f"[teacher] test main(Edema stage4) AUROC={test_p['main_auroc']:.4f}  "
-                  f"AUPRC={test_p['main_auprc']:.4f}")
+            print(f"[teacher] test macro (stage4, all pathologies) "
+                  f"AUROC={test_p['main_auroc']:.4f}  AUPRC={test_p['main_auprc']:.4f}")
             print(format_pathology_gap_table(test_p))
             test_log = {"test/auroc": test_p["main_auroc"], "test/auprc": test_p["main_auprc"]}
             for r in test_p["per_label"]:

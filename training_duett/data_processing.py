@@ -24,16 +24,12 @@ DEFAULT_PATHOLOGY_LABELS = (
     "label_cardiomegaly",
     "label_effusion",
     "label_pneumonia",
+    "label_atelectasis",
+    "label_opacity",
+    "label_consolidation",
 )
 
 
-# =============================================================================
-# Pretrained CXR head alignment
-# =============================================================================
-# 멀티모달 subject split을 pretrained CXR head의 subject split에 정합시키기 위한
-# 참조. 이 두 값이 cxr_linear_training.ipynb에서 사용된 값과 정확히 일치해야
-# subject-disjoint 정합이 성립.
-# 나중에 pretrained head를 다른 데이터로 재학습하면 여기만 갱신하면 됨.
 PRETRAIN_CXR_FTR_PATH = "/home/DAHS1/gangmin/my_research/clinical_multimodal_learning/data/full_data/subject_data/final_cxr_df_20260713.ftr"
 PRETRAIN_LABEL_COLS = [
     "label_cardiomegaly", "label_pneumonia", "label_atelectasis",

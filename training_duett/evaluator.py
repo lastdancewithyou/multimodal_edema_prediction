@@ -145,11 +145,17 @@ def evaluate_pathology(model, loader, device, pathology_labels: tuple[str, ...])
             "stage2_auprc": r2, "stage4_auprc": r4, "gap_auprc": r4 - r2,
         })
 
+    import math
+    def _macro(key):
+        vals = [r[key] for r in per_label
+                if not (isinstance(r[key], float) and math.isnan(r[key]))]
+        return sum(vals) / len(vals) if vals else float("nan")
+
     return {
         "labels":     list(pathology_labels),
         "n":          int(len(y)),
-        "main_auroc": per_label[0]["stage4_auroc"],   # Edema stage4 = main task
-        "main_auprc": per_label[0]["stage4_auprc"],
+        "main_auroc": _macro("stage4_auroc"),   # macro-mean across all pathologies
+        "main_auprc": _macro("stage4_auprc"),
         "per_label":  per_label,
     }
 
@@ -239,29 +245,31 @@ def evaluate_dual_pathology(model, loader, device, pathology_labels: tuple[str, 
     mk  = torch.cat(mask_all).float().numpy()
     corr = torch.cat(corr_all).float().numpy() if has_correction else None
 
-    # perceiver 에서 beta / current query 추출 (available 하면)
+    # perceiver 에서 beta / current query 추출
     unwrapped = model.module if hasattr(model, "module") else model
     perceiver = getattr(unwrapped, "perceiver", None)
     beta_vec = None
     if perceiver is not None and hasattr(perceiver, "beta"):
         beta_vec = perceiver.beta.detach().float().cpu().numpy()
-    query_cos_vec = None
-    if (query_ref is not None and perceiver is not None
-            and hasattr(perceiver, "temporal_queries")):
-        cur = perceiver.temporal_queries.detach().float()
-        ref = query_ref.detach().float().to(cur.device)
-        if cur.shape == ref.shape:
-            query_cos_vec = F.cosine_similarity(cur, ref, dim=-1).cpu().numpy()
-    modal_query_cos_vec = None
-    if (perceiver is not None
-            and hasattr(perceiver, "image_queries")
-            and hasattr(perceiver, "temporal_queries")):
-        img_q = perceiver.image_queries.detach().float()
-        ts_q = perceiver.temporal_queries.detach().float()
-        if img_q.shape == ts_q.shape:
-            modal_query_cos_vec = F.cosine_similarity(
-                img_q, ts_q, dim=-1
-            ).cpu().numpy()
+
+    # Cosine similarity between current temporal_queries and query_ref
+    # query_cos_vec = None
+    # if (query_ref is not None and perceiver is not None
+    #         and hasattr(perceiver, "temporal_queries")):
+    #     cur = perceiver.temporal_queries.detach().float()
+    #     ref = query_ref.detach().float().to(cur.device)
+    #     if cur.shape == ref.shape:
+    #         query_cos_vec = F.cosine_similarity(cur, ref, dim=-1).cpu().numpy()
+    # modal_query_cos_vec = None
+    # if (perceiver is not None
+    #         and hasattr(perceiver, "image_queries")
+    #         and hasattr(perceiver, "temporal_queries")):
+    #     img_q = perceiver.image_queries.detach().float()
+    #     ts_q = perceiver.temporal_queries.detach().float()
+    #     if img_q.shape == ts_q.shape:
+    #         modal_query_cos_vec = F.cosine_similarity(
+    #             img_q, ts_q, dim=-1
+    #         ).cpu().numpy()
 
     K = len(pathology_labels)
     per_label = []
@@ -290,9 +298,8 @@ def evaluate_dual_pathology(model, loader, device, pathology_labels: tuple[str, 
             corr_r = float("nan")
 
         beta_k     = float(beta_vec[k])      if beta_vec      is not None else float("nan")
-        q_cos_k    = float(query_cos_vec[k]) if query_cos_vec is not None else float("nan")
-        modal_q_cos_k = (float(modal_query_cos_vec[k])
-                         if modal_query_cos_vec is not None else float("nan"))
+        # q_cos_k    = float(query_cos_vec[k]) if query_cos_vec is not None else float("nan")
+        # modal_q_cos_k = (float(modal_query_cos_vec[k]) if modal_query_cos_vec is not None else float("nan"))
 
         per_label.append({
             "name":         pathology_labels[k],
@@ -309,15 +316,21 @@ def evaluate_dual_pathology(model, loader, device, pathology_labels: tuple[str, 
             "mean_abs_corr": mean_abs_corr,           # residual 사용량
             "corr_residual": corr_r,                  # 방향성 (양수=오류 수정 방향)
             "beta":         beta_k,
-            "query_cos":    q_cos_k,
-            "modal_query_cos": modal_q_cos_k,
+            # "query_cos":    q_cos_k,
+            # "modal_query_cos": modal_q_cos_k,
         })
+
+    import math
+    def _macro(key):
+        vals = [r[key] for r in per_label
+                if not (isinstance(r[key], float) and math.isnan(r[key]))]
+        return sum(vals) / len(vals) if vals else float("nan")
 
     return {
         "labels":     list(pathology_labels),
         "n":          int(len(y)),
-        "main_auroc": per_label[0]["fus_auroc"],
-        "main_auprc": per_label[0]["fus_auprc"],
+        "main_auroc": _macro("fus_auroc"),   # macro-mean of fusion AUROC across all pathologies
+        "main_auprc": _macro("fus_auprc"),   # macro-mean of fusion AUPRC across all pathologies
         "per_label":  per_label,
     }
 
@@ -335,29 +348,44 @@ def _fmt(v, spec="7.3f"):
 
 
 def format_dual_pathology_gap_table(result: dict) -> str:
-    """Residual fusion 종합 지표 표.
-
-    label  imgROC  tsROC  fusROC  gain   imgPR  fusPR  dBCE  |corr|  corr_r  beta  q_cos
+    """Residual fusion 종합 지표 표. mAP = per-pathology AUPRC (= AP).
+    맨 아래 줄에 macro-mean (img/ts/fus mAP) 추가.
     """
     header = (
         f"{'label':<12s} "
         f"{'imgROC':>7s} {'tsROC':>7s} {'fusROC':>7s} {'gain':>7s}  "
-        f"{'imgPRC':>6s} {'fusPRC':>6s}  "
+        f"{'imgAP':>6s} {'tsAP':>6s} {'fusAP':>6s}  "
         f"{'dBCE':>7s}  "
         f"{'|corr|':>7s} {'corr_r':>7s}  "
-        f"{'beta':>6s} {'q_cos':>6s} {'i-t_cos':>7s}"
+        f"{'beta':>6s}"
     )
     lines = [header, "-" * len(header)]
-    for r in result["per_label"]:
+    per = result["per_label"]
+    for r in per:
         short = r["name"].replace("label_", "")
         lines.append(
             f"{short:<12s} "
             f"{_fmt(r['img_auroc'], '7.3f')} {_fmt(r['ts_auroc'], '7.3f')} "
             f"{_fmt(r['fus_auroc'], '7.3f')} {_fmt(r['gap_i2f'], '+7.3f')}  "
-            f"{_fmt(r['img_auprc'], '6.3f')} {_fmt(r['fus_auprc'], '6.3f')}  "
+            f"{_fmt(r['img_auprc'], '6.3f')} {_fmt(r['ts_auprc'], '6.3f')} "
+            f"{_fmt(r['fus_auprc'], '6.3f')}  "
             f"{_fmt(r['delta_bce'], '+7.4f')}  "
             f"{_fmt(r['mean_abs_corr'], '7.4f')} {_fmt(r['corr_residual'], '+7.3f')}  "
-            f"{_fmt(r['beta'], '6.3f')} {_fmt(r['query_cos'], '6.3f')} "
-            f"{_fmt(r['modal_query_cos'], '7.3f')}"
+            f"{_fmt(r['beta'], '6.3f')}"
         )
+
+    # macro-mean mAP (NaN 제외)
+    def _mean(key):
+        vals = [r[key] for r in per if not (isinstance(r[key], float)
+                                            and (r[key] != r[key]))]  # NaN 필터
+        return sum(vals) / len(vals) if vals else float("nan")
+    img_map = _mean("img_auprc")
+    ts_map  = _mean("ts_auprc")
+    fus_map = _mean("fus_auprc")
+    lines.append("-" * len(header))
+    lines.append(
+        f"{'mAP (macro)':<12s} "
+        f"{'':>7s} {'':>7s} {'':>7s} {'':>7s}  "
+        f"{_fmt(img_map, '6.3f')} {_fmt(ts_map, '6.3f')} {_fmt(fus_map, '6.3f')}"
+    )
     return "\n".join(lines)

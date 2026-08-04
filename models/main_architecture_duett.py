@@ -29,15 +29,13 @@ class DuettFeatureExtractor(DuettBase):
         return self.d_embedding * (self.d_time_series_num + 1)
 
     def encode(self, x):
-        xs_static, xs_feats, xs_times, n_timesteps = x
+        xs_static, xs_feats, xs_times, _ = x # _: n_timesteps
         n_vars = xs_feats.shape[2] // 2
 
         if self.predict_events:
             event_mask_inds = xs_feats[:, :, n_vars:n_vars * 2] == -1
             event_mask_inds = torch.cat(
-                (event_mask_inds,
-                 torch.zeros(xs_feats.shape[:2] + (1,), device=xs_feats.device, dtype=torch.bool)),
-                dim=2)
+                (event_mask_inds, torch.zeros(xs_feats.shape[:2] + (1,), device=xs_feats.device, dtype=torch.bool)), dim=2)
             event_mask_inds = torch.cat((event_mask_inds, event_mask_inds[:, :1, :]), dim=1)
 
         n_obs_inds = xs_feats[:, :, n_vars:n_vars * 2].to(int).clip(0, self.n_obs_embedding.num_embeddings - 1)
@@ -70,7 +68,6 @@ class DuettFeatureExtractor(DuettBase):
         time_embeddings = torch.cat(
             (time_embeddings, self.full_rep_embedding.weight.T.unsqueeze(0).expand(xs_feats.shape[0], -1, -1)), dim=1)
 
-        final_event_grid = None
         for event_transformer, time_transformer in zip(self.event_transformers, self.time_transformers):
             et_out_shape = (psi.shape[0], psi.shape[2], psi.shape[1], psi.shape[3])
             """
@@ -83,8 +80,6 @@ class DuettFeatureExtractor(DuettBase):
             embeddings = psi.transpose(1, 2).flatten(2) + self.full_event_embedding.weight.unsqueeze(0)
             event_outs = event_transformer(embeddings).view(et_out_shape).transpose(1, 2) # Event transformer 통과 후 다시 원래 shape로
 
-            # time transformer FFN에 의해 변수별 차원이 섞이기 전에 변수 해석용으로 추출
-            final_event_grid = event_outs
             tt_out_shape = event_outs.shape
             """
             # Time Transformer: 시간 간 상호작용
@@ -96,7 +91,7 @@ class DuettFeatureExtractor(DuettBase):
             psi = time_transformer(embeddings).view(tt_out_shape) # 다시 [B, T+1, V+1, d] 형태로 reshape
 
         transformed = psi.flatten(2)  # [B, T+1, d]
-        return transformed, final_event_grid
+        return transformed
 
 
 # Load a pretrained DuETT SSL/FT checkpoint as a feature extractor
@@ -541,6 +536,13 @@ class CXREncoder(nn.Module):
 
 
 class PatchDualPathologyPerceiver(nn.Module):
+    """Pathology-query model using DuETT's 24 hourly contextual tokens.
+
+    ``ts_tokens`` is the ``transformed`` output of :meth:`DuettFeatureExtractor.encode`:
+    each token represents one hour after DuETT has contextualized all variables.
+    Pathology queries therefore select *hours*, not individual variable slots.
+    """
+
     def __init__(
             self,
             n_pathologies: int,
@@ -550,53 +552,22 @@ class PatchDualPathologyPerceiver(nn.Module):
             dropout: float = 0.1,
             head_hidden: int = 64,
             head_dropout: float = 0.1,
-            n_timesteps: int = 24,
-            d_event_embedding: int = None,
         ):
         super().__init__()
-        if n_timesteps <= 0:
-            raise ValueError(f"n_timesteps must be positive, got {n_timesteps}")
-
         self.n_pathologies = n_pathologies
         self.d_latent = d_latent
         self.d_ts = d_ts
-        self.n_timesteps = n_timesteps
 
-        # 이미지와 시계열이 각자의 단독 loss로 충분히 학습되도록 query를 분리한다.
-        # 두 query는 같은 latent 차원이므로 후속 UMAP/코사인 비교도 가능하다.
-        self.image_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
-        self.temporal_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
+        # self.image_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02 )
+        # self.temporal_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
 
+        self.shared_queries = nn.Parameter(torch.randn(n_pathologies, d_latent) * 0.02)
+
+        self.ts_proj = nn.Linear(d_ts, d_latent)
         self.img_cross = _PerceiverBlock(d_latent, n_heads, dropout)
         self.img_self  = _PerceiverBlock(d_latent, n_heads, dropout)
+        self.ts_cross  = _PerceiverBlock(d_latent, n_heads, dropout)
         self.ts_self   = _PerceiverBlock(d_latent, n_heads, dropout)
-        # A2: correction 입력을 T_tok 이 image tokens (I.detach()) 에 cross-attention 한 결과로 구성.
-        # T_tok 이 query 로서 각 pathology 마다 image 표현의 어느 부분이 residual 예측에 관련 있는지 학습.
-        self.correction_cross = _PerceiverBlock(d_latent, n_heads, dropout)
-
-        if d_event_embedding is None:
-            raise ValueError(
-                "d_event_embedding is required for PatchDualPathologyPerceiver; "
-                "pass backbone.d_embedding"
-            )
-        if d_event_embedding <= 0:
-            raise ValueError("d_event_embedding must be positive")
-        self.d_event_embedding = d_event_embedding
-        self.d_event_trajectory = n_timesteps * d_event_embedding
-
-        # Query만 trajectory 차원으로 보낸다. Variable token 자체는 선택 전에
-        # 작은 차원으로 압축하지 않아 24시간 순서/추세 정보를 보존한다.
-        self.event_query_proj = nn.Linear(
-            d_latent, self.d_event_trajectory, bias=False
-        )
-        self.event_query_norm = nn.LayerNorm(self.d_event_trajectory)
-        self.event_key_norm = nn.LayerNorm(self.d_event_trajectory)
-        self.event_out_proj = nn.Sequential(
-            nn.LayerNorm(self.d_event_trajectory),
-            nn.Linear(self.d_event_trajectory, d_latent),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
 
         def _mk_head():
             return nn.Sequential(
@@ -607,9 +578,7 @@ class PatchDualPathologyPerceiver(nn.Module):
         self.image_head = _mk_head()
         self.temporal_head = _mk_head()
 
-        # Image prediction is the anchor; TS learns a residual correction.
-        # A2: correction_cross 가 T_tok 을 query 로 I.detach() 에 attention 해서 d_latent 표현을 뽑아냄.
-        # correction_head 의 input dim 은 d_latent 로 유지 (A1 의 concat 아님).
+        # Image prediction is the anchor; the TS pathology token predicts only a residual correction.
         self.correction_head = nn.Sequential(
             nn.LayerNorm(d_latent),
             nn.Linear(d_latent, head_hidden),
@@ -617,83 +586,55 @@ class PatchDualPathologyPerceiver(nn.Module):
             nn.Dropout(head_dropout),
             nn.Linear(head_hidden, 1, bias=False),
         )
-        # nn.init.zeros_(self.correction_head[-1].weight)
-
-        # zero init 완화
-        nn.init.normal_(self.correction_head[-1].weight, std=0.01)
+        nn.init.zeros_(self.correction_head[-1].weight)
 
         self.beta = nn.Parameter(torch.ones(n_pathologies))
         self.image_label_bias = nn.Parameter(torch.zeros(n_pathologies))
         self.temporal_label_bias = nn.Parameter(torch.zeros(n_pathologies))
 
-    def _read_event_trajectories(self, ts_event_grid, return_attn=False):
-        """Read DuETT event-transformer variables as trajectory tokens.
-
-        Args:
-            ts_event_grid: pre-time-transformer event output with shape
-                ``[B, T+1, V+1, E]``. The final time/event slots are REP/static.
-
-        Returns:
-            Pathology tokens ``[B, K, d_latent]`` and optional variable
-            attention ``[B, K, V]``.
-        """
-        if ts_event_grid.ndim != 4:
+    def forward(self, ts_tokens, img_patches_proj, return_attn=False,
+                ts_ablation="hourly_only"):
+        if ts_tokens.ndim != 3:
             raise ValueError(
-                f"ts_event_grid must be rank 4, got shape={tuple(ts_event_grid.shape)}"
+                f"ts_tokens must be [B, T+1, d_ts], got {tuple(ts_tokens.shape)}"
             )
-        B, n_time_tokens, n_grid_events, embedding_dim = ts_event_grid.shape
-        expected_time_tokens = self.n_timesteps + 1
-        if n_time_tokens != expected_time_tokens:
+        B = ts_tokens.size(0)
+
+        img_q = self.shared_queries.unsqueeze(0).expand(B, -1, -1)
+        ts_q  = self.shared_queries.unsqueeze(0).expand(B, -1, -1)
+
+        # img_q = self.image_queries.unsqueeze(0).expand(B, -1, -1)
+        # ts_q  = self.temporal_queries.unsqueeze(0).expand(B, -1, -1)
+
+        if ts_ablation == "full":
+            ts_selected = ts_tokens
+        elif ts_ablation == "hourly_only":
+            ts_selected = ts_tokens[:, :-1, :]
+        elif ts_ablation == "rep_only":
+            ts_selected = ts_tokens[:, -1:, :]
+        else:
             raise ValueError(
-                f"event readout expected {expected_time_tokens} DuETT time tokens "
-                f"({self.n_timesteps} hourly + REP), got {n_time_tokens}"
+                f"unknown ts_ablation={ts_ablation!r}; expected one of "
+                "{'full', 'hourly_only', 'rep_only'}"
             )
-        if n_grid_events < 2:
-            raise ValueError("event grid must contain dynamic events and a static slot")
-        if embedding_dim != self.d_event_embedding:
-            raise ValueError(
-                f"expected event embedding dim {self.d_event_embedding}, "
-                f"got {embedding_dim}"
-            )
-        n_dynamic_events = n_grid_events - 1
-        dynamic_grid = ts_event_grid[:, :-1, :-1, :]  # remove REP and static slots
-        event_tokens = dynamic_grid.transpose(1, 2).contiguous().reshape(
-            B, n_dynamic_events, self.d_event_trajectory
-        )  # [B, V, T*E]
+        ts_kv = self.ts_proj(ts_selected)
 
-        temporal_q = self.event_query_proj(self.temporal_queries)  # [K, T*E]
-        q = self.event_query_norm(temporal_q)
-        k = self.event_key_norm(event_tokens)
-        scores = torch.einsum("kd,bvd->bkv", q, k)
-        scores = scores * (self.d_event_trajectory ** -0.5)
-        event_attn = scores.softmax(dim=-1)
-
-        # Attention weights choose variables; the values remain the uncompressed
-        # full trajectories and are projected only after selection/aggregation.
-        summary = torch.einsum("bkv,bvd->bkd", event_attn, event_tokens)
-        temporal_tokens = self.event_out_proj(summary)
-        temporal_tokens = self.ts_self(temporal_tokens, temporal_tokens)
-        return temporal_tokens, event_attn if return_attn else None
-
-    def forward(self, ts_event_grid, img_patches_proj, return_attn=False):
-        B = ts_event_grid.size(0)
-        img_q = self.image_queries.unsqueeze(0).expand(B, -1, -1)
-
-        I, img_attn = (self.img_cross(img_q, img_patches_proj, return_attn=True) if return_attn else (self.img_cross(img_q, img_patches_proj), None))
-        I = self.img_self(I, I)
-
-        T_tok, event_attn = self._read_event_trajectories(
-            ts_event_grid, return_attn
+        I, img_attn = (
+            self.img_cross(img_q, img_patches_proj, return_attn=True)
+            if return_attn else (self.img_cross(img_q, img_patches_proj), None)
         )
+        I = self.img_self(I, I) # self-attention
+
+        T_tok, ts_attn = (
+            self.ts_cross(ts_q, ts_kv, return_attn=True)
+            if return_attn else (self.ts_cross(ts_q, ts_kv), None)
+        )
+        T_tok = self.ts_self(T_tok, T_tok) # self-attention
 
         img_logits    = self.image_head(I).squeeze(-1) + self.image_label_bias.unsqueeze(0)
         ts_logits     = self.temporal_head(T_tok).squeeze(-1) + self.temporal_label_bias.unsqueeze(0)
 
-        # A2: T_tok 을 query, I.detach() 를 key/value 로 하는 cross-attention.
-        # 각 pathology 마다 image 표현의 어느 부분이 residual 예측에 관련 있는지 attention 이 학습.
-        # I.detach() 로 fusion loss gradient 가 image branch 로 흐르는 것을 차단 (anchor 유지).
-        correction_input  = self.correction_cross(T_tok, I.detach())  # [B, K, d_latent]
-        ts_correction     = self.correction_head(correction_input).squeeze(-1)
+        ts_correction     = self.correction_head(T_tok).squeeze(-1)
         scaled_correction = self.beta.unsqueeze(0) * ts_correction
         fusion_logits     = img_logits.detach() + scaled_correction
 
@@ -709,7 +650,7 @@ class PatchDualPathologyPerceiver(nn.Module):
         }
         if return_attn:
             out["img_attn"] = img_attn
-            out["event_attn"] = event_attn
+            out["ts_attn"] = ts_attn
         return out
 
 
@@ -1150,14 +1091,14 @@ class TeacherModel(nn.Module):
 
         x = (x_ts_list, x_static_list, bin_ends_list)
         duett_in = self.duett.feats_to_input(x, batch_size)
-        ts_tokens, ts_event_grid = self.duett.encode(duett_in)   # [B, T+1, D]
+        ts_tokens = self.duett.encode(duett_in)   # [B, T+1, D]
 
 
         if self.patch_dual_pathology_mode:
             img_cls, img_patches = self.cxr(pixel_values)
             img_patches_proj = self.img_proj(img_patches)
             out = self.perceiver(
-                ts_event_grid,
+                ts_tokens,
                 img_patches_proj,
                 return_attn=return_attn,
             )
@@ -1184,7 +1125,7 @@ class TeacherModel(nn.Module):
                 result["ts_tokens"]     = out["ts_tokens"]
                 result["fusion_tokens"] = out["fusion_tokens"]
                 result["img_attn"]      = out["img_attn"]
-                result["event_attn"]    = out["event_attn"]
+                result["ts_attn"]       = out["ts_attn"]
             return result
 
         # ─── NEW dual: CLS-only + frozen pretrained head + residual fusion ───
@@ -1292,3 +1233,159 @@ class StudentModel(nn.Module):
             raise ValueError(f"unknown pool: {self.pool}")
         logit = self.head(feat).squeeze(-1)
         return logit
+
+
+
+
+
+
+class LocalTrajectoryEncoder(nn.Module):
+    """Encode each variable's 24 h trajectory *before* cross-variable mixing.
+
+    The existing DuETT path ultimately exposes one contextual token per hour to
+    the pathology queries.  This alternative keeps the variable identity alive:
+    a shared GRU first processes every variable independently using value,
+    observation, count, and time-since-observation features.  It then emits one
+    token per (variable, recency window), followed by a single REP token.
+
+    Input
+        ``x_ts_list``: tuple of ``[T, 2*V]`` tensors.  The first V channels are
+        z-scored values and the final V channels are observation counts.
+    Output
+        ``[B, V*W + 1, d_model]`` where W is the number of recency windows and
+        the final token is REP.  ``PatchDualPathologyPerceiver`` can therefore
+        use its existing ``hourly_only`` setting to attend all trajectory tokens
+        while excluding REP.
+    """
+
+    def __init__(
+        self,
+        n_vars: int,
+        n_timesteps: int = 24,
+        d_model: int = 128,
+        n_layers: int = 1,
+        dropout: float = 0.1,
+        recency_windows: tuple[int, ...] = (6, 12, 24),
+    ):
+        super().__init__()
+        if n_vars <= 0 or n_timesteps <= 0 or d_model <= 0:
+            raise ValueError("n_vars, n_timesteps, and d_model must be positive")
+        windows = tuple(sorted(set(int(w) for w in recency_windows)))
+        if not windows or windows[-1] != n_timesteps:
+            raise ValueError(
+                f"recency_windows must end at n_timesteps={n_timesteps}, got {windows}"
+            )
+        if windows[0] <= 0 or windows[-1] > n_timesteps:
+            raise ValueError(f"invalid recency_windows={windows}")
+
+        self.n_vars = n_vars
+        self.n_timesteps = n_timesteps
+        self.d_model = d_model
+        self.recency_windows = windows
+
+        # Per-hour local features:
+        # value, observed flag, log observation count, time since last observed,
+        # and time remaining until the CXR anchor.
+        self.input_proj = nn.Sequential(
+            nn.Linear(5, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
+        self.variable_embedding = nn.Embedding(n_vars, d_model)
+        self.hour_embedding = nn.Embedding(n_timesteps, d_model)
+        self.temporal = nn.GRU(
+            input_size=d_model,
+            hidden_size=d_model,
+            num_layers=n_layers,
+            batch_first=True,
+            dropout=dropout if n_layers > 1 else 0.0,
+        )
+        self.window_embedding = nn.Embedding(len(windows), d_model)
+        self.output_norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.rep_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+    @property
+    def d_representation(self) -> int:
+        return self.d_model
+
+    @staticmethod
+    def _time_since_last_observation(observed: torch.Tensor) -> torch.Tensor:
+        """Return elapsed grid steps before each slot, shape-preserving.
+
+        ``observed`` is ``[B, T, V]``.  The value at an observed slot is the
+        interval since that variable's previous observation; after the slot the
+        counter resets.  Never-observed variables naturally accumulate time.
+        """
+        B, T, V = observed.shape
+        elapsed = torch.zeros((B, V), dtype=torch.float32, device=observed.device)
+        out = torch.empty((B, T, V), dtype=torch.float32, device=observed.device)
+        for t in range(T):
+            elapsed = elapsed + 1.0
+            out[:, t, :] = elapsed
+            elapsed = torch.where(observed[:, t, :], torch.zeros_like(elapsed), elapsed)
+        return out
+
+    def forward(self, x_ts_list, return_padding_mask: bool = False):
+        x = torch.stack(tuple(x_ts_list), dim=0)
+        if x.ndim != 3:
+            raise ValueError(f"x_ts must stack to [B,T,2V], got {tuple(x.shape)}")
+        B, T, C = x.shape
+        if T != self.n_timesteps or C != 2 * self.n_vars:
+            raise ValueError(
+                f"expected [B,{self.n_timesteps},{2*self.n_vars}], got {tuple(x.shape)}"
+            )
+
+        values = x[:, :, :self.n_vars]
+        counts = x[:, :, self.n_vars:].clamp_min(0.0)
+        observed = counts > 0
+        # Do not let a placeholder zero masquerade as a real normal value.
+        values = torch.where(observed, values, torch.zeros_like(values))
+        log_count = torch.log1p(counts) / torch.log(
+            torch.tensor(16.0, device=x.device, dtype=x.dtype)
+        )
+        delta = self._time_since_last_observation(observed).to(x.dtype) / float(T)
+        time_to_cxr = torch.arange(T, 0, -1, device=x.device, dtype=x.dtype)
+        time_to_cxr = time_to_cxr.view(1, T, 1).expand(B, -1, self.n_vars) / float(T)
+
+        local = torch.stack(
+            [values, observed.to(x.dtype), log_count, delta, time_to_cxr], dim=-1
+        )  # [B,T,V,5]
+        local = local.permute(0, 2, 1, 3).reshape(B * self.n_vars, T, 5)
+        h = self.input_proj(local)
+
+        var_ids = torch.arange(self.n_vars, device=x.device)
+        var_emb = self.variable_embedding(var_ids)
+        var_emb = var_emb.unsqueeze(0).expand(B, -1, -1).reshape(B * self.n_vars, 1, self.d_model)
+        hour_emb = self.hour_embedding(torch.arange(T, device=x.device)).unsqueeze(0)
+        h = self.dropout(h + var_emb + hour_emb)
+        h, _ = self.temporal(h)  # each of the B*V sequences is processed independently
+
+        # Non-overlapping windows measured backwards from the CXR anchor:
+        # with (6,12,24), tokens summarize 0-6 h, 6-12 h, and 12-24 h.
+        pooled = []
+        valid_windows = []
+        observed_by_var = observed.permute(0, 2, 1)  # [B,V,T]
+        previous = 0
+        for window_idx, boundary in enumerate(self.recency_windows):
+            start = T - boundary
+            end = T - previous
+            token = h[:, start:end, :].mean(dim=1)
+            token = token + self.window_embedding.weight[window_idx]
+            pooled.append(token)
+            valid_windows.append(observed_by_var[:, :, start:end].any(dim=-1))
+            previous = boundary
+        tokens = torch.stack(pooled, dim=1)
+        tokens = tokens.view(B, self.n_vars, len(self.recency_windows), self.d_model)
+        tokens = self.output_norm(tokens).reshape(B, -1, self.d_model)
+
+        rep = self.rep_token.expand(B, -1, -1)
+        tokens = torch.cat([tokens, rep], dim=1)
+        if not return_padding_mask:
+            return tokens
+
+        valid = torch.stack(valid_windows, dim=2).reshape(B, -1)
+        rep_valid = torch.ones((B, 1), dtype=torch.bool, device=x.device)
+        # MultiheadAttention expects True for positions that must be ignored.
+        padding_mask = ~torch.cat([valid, rep_valid], dim=1)
+        return tokens, padding_mask
